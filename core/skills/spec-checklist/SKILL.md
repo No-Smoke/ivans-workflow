@@ -4,6 +4,13 @@ name: spec-checklist
 description: "Read a specification file, extract acceptance criteria, and generate a verification checklist. Used by Reviewer and Tester to verify spec compliance."
 ---
 
+## Honesty Protocol
+
+- Never inflate language: no "robust", "comprehensive", "seamless", "cutting-edge"
+- State what was actually done, not what was intended
+- If something failed or was skipped, say so explicitly
+- Evidence over claims: link to files, show output, cite line numbers
+
 # Spec Checklist Generator
 
 ## Purpose
@@ -92,3 +99,14 @@ Return the checklist as markdown. Include:
 - Spec has no identifiable acceptance criteria (ask human to clarify)
 - Spec references dependencies not in the project
 - Conflicting requirements within the spec
+
+
+## Definition of Failure
+
+You have FAILED if:
+- You mark items as checked without actually verifying them
+- You skip acceptance criteria that exist in the spec
+- You report "all pass" when any item is unverified
+- You generate a checklist without reading the actual spec file
+
+**On failure:** Report exactly which items could not be verified and why. Do not guess. Do not approximate.

@@ -149,6 +149,15 @@ esac
 TEST_RUNNER="$TEST_RUNNER_DEFAULT"
 LINTER="$LINTER_DEFAULT"
 FORMATTER="$FORMATTER_DEFAULT"
+
+# Derive file extension from language
+case "$LANGUAGE" in
+    typescript) LANG_EXT="ts" ;;
+    javascript) LANG_EXT="js" ;;
+    python)     LANG_EXT="py" ;;
+    *)          LANG_EXT="*" ;;
+esac
+
 TYPECHECK_CMD="$TYPECHECK_DEFAULT"
 TEST_CMD="$TEST_DEFAULT"
 LINT_CMD="$LINT_DEFAULT"
@@ -374,6 +383,13 @@ if [ ! -f "$CLAUDE_MD" ]; then
         -e "s|\${LINT_CMD}|$LINT_CMD|g" \
         -e "s|\${SOURCE_DIR}|$SOURCE_DIR|g" \
         -e "s|\${TESTS_DIR}|$TESTS_DIR|g" \
+        -e "s|\${COVERAGE_THRESHOLD}|$COVERAGE_THRESHOLD|g" \
+        -e "s|\${DEPLOY_CMD}|$DEPLOY_CMD|g" \
+        -e "s|\${DEV_CMD}|$DEV_CMD|g" \
+        -e "s|\${TEST_RUNNER}|$TEST_RUNNER|g" \
+        -e "s|\${LINTER}|$LINTER|g" \
+        -e "s|\${FORMATTER}|$FORMATTER|g" \
+        -e "s|\${HANDOFFS_DIR}|$HANDOFFS_DIR|g" \
         -e "s|\${SCHEMA_ENABLED}|$SCHEMA_ENABLED|g" \
         -e "s|\${SCHEMA_DEFINITIONS}|$SCHEMA_DEFINITIONS|g" \
         -e "s|\${SCHEMA_GENERATED}|$SCHEMA_GENERATED|g" \
@@ -392,6 +408,8 @@ if [ ! -f "$STACK_RULE" ] || [ -L "$STACK_RULE" ]; then
         -e "s|\${RUNTIME}|$RUNTIME|g" \
         -e "s|\${FRAMEWORK}|$FRAMEWORK|g" \
         -e "s|\${LANGUAGE}|$LANGUAGE|g" \
+        -e "s|\${LANG_EXT}|$LANG_EXT|g" \
+        -e "s|\${SOURCE_DIR}|$SOURCE_DIR|g" \
         "$FRAMEWORK_DIR/templates/rules/project-stack.md.tmpl" > "$STACK_RULE"
     echo -e "  ${GREEN}WRITE${NC} $STACK_RULE"
 fi
@@ -400,7 +418,9 @@ fi
 
 DOMAIN_RULE="$CLAUDE_DIR/rules/project-domain.md"
 if [ ! -f "$DOMAIN_RULE" ]; then
-    cp "$FRAMEWORK_DIR/templates/rules/project-domain.md.tmpl" "$DOMAIN_RULE"
+    sed \
+        -e "s|\${PROJECT_NAME}|$PROJECT_NAME|g" \
+        "$FRAMEWORK_DIR/templates/rules/project-domain.md.tmpl" > "$DOMAIN_RULE"
     echo -e "  ${GREEN}WRITE${NC} $DOMAIN_RULE"
 else
     echo -e "  ${YELLOW}SKIP${NC} $DOMAIN_RULE (already exists)"

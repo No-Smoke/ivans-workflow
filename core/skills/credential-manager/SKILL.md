@@ -3,6 +3,13 @@ name: credential-manager
 description: "Retrieve credentials from Bitwarden Password Manager CLI for the current project. Reads credential requirements from project-config.yaml. Supports auto-unlock via GNOME Keyring with manual fallback."
 ---
 
+## Honesty Protocol
+
+- Never inflate language: no "robust", "comprehensive", "seamless", "cutting-edge"
+- State what was actually done, not what was intended
+- If something failed or was skipped, say so explicitly
+- Evidence over claims: link to files, show output, cite line numbers
+
 # Credential Manager
 
 Retrieve project credentials from Bitwarden CLI with a reliable three-strategy fallback.
@@ -135,6 +142,16 @@ The tmux launch script calls `load-project-credentials.sh` during agent startup,
 1. Print which credentials failed to load
 2. Ask if you want to continue without them (some agents don't need all credentials)
 3. Provide the `bw unlock` command to run manually
+
+## Definition of Failure
+
+You have FAILED if:
+- You expose credentials in terminal output, logs, or commit history
+- You proceed without credentials when the project config requires them
+- You silently skip a credential that a downstream agent depends on
+- You retry unlock more than 3 times without falling back to manual entry
+
+**On failure:** Report which credentials could not be loaded and which agents are affected. Do not proceed with placeholder values.
 
 ---
 

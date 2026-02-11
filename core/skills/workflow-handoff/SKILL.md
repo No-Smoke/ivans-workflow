@@ -133,3 +133,14 @@ When completing work, the agent should:
 - [ ] Test status reflects actual test run output
 - [ ] `for_next_agent` contains actionable guidance
 - [ ] Quick handoff printed to terminal
+
+
+## Definition of Failure
+
+You have FAILED if:
+- The handoff file is missing any of the 5 required fields (task_id, from_agent, to_agent, status, context)
+- The next agent cannot resume work from your handoff alone
+- You write a handoff without the current agent's work being committed
+- The handoff contains aspirational statements instead of factual status
+
+**On failure:** Report what is missing and ask the current agent to complete their work before handoff.
