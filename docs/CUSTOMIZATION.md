@@ -186,6 +186,35 @@ Instructions for Claude on how to perform a specific task...
 EOF
 ```
 
+### Required Skill Sections
+
+All skills should include these two sections for consistency with the framework's quality standards:
+
+**Honesty Protocol** — prevents inflated language and ensures factual reporting:
+
+```markdown
+## Honesty Protocol
+
+- Never inflate language: no "robust", "comprehensive", "seamless", "cutting-edge"
+- State what was actually done, not what was intended
+- If something failed or was skipped, say so explicitly
+- Evidence over claims: link to files, show output, cite line numbers
+```
+
+**Definition of Failure** — makes failure conditions explicit so the agent knows when to stop and report rather than guessing:
+
+```markdown
+## Definition of Failure
+
+You have FAILED if:
+- [Condition specific to this skill]
+- [Another condition]
+
+**On failure:** [What the agent should do instead of guessing]
+```
+
+These sections are not optional — the framework audit checks for their presence. Omitting them will be flagged as a compliance gap.
+
 ## Updating the Framework
 
 When Ivan's Workflow gets updates:

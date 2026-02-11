@@ -152,6 +152,27 @@ The standard sequence is: Planner → Builder → Reviewer → Tester → Deploy
 
 ## Installer Issues
 
+### Generated files contain literal `${...}` placeholders
+
+If `CLAUDE.md`, `project-stack.md`, or `project-domain.md` contain unsubstituted `${VARIABLE}` text after installation, the installer's sed block is missing a substitution line for that variable.
+
+**Diagnosis:**
+```bash
+# Check which placeholders remain
+grep -oP '\$\{[A-Z_]+\}' CLAUDE.md
+grep -oP '\$\{[A-Z_]+\}' .claude/rules/project-stack.md
+grep -oP '\$\{[A-Z_]+\}' .claude/rules/project-domain.md
+```
+
+**Fix:** Update your framework (`cd ~/projects/ivans-workflow && git pull`), then delete the affected generated files and re-run the installer. The installer skips files that already exist, so you must remove them first:
+
+```bash
+rm CLAUDE.md .claude/rules/project-stack.md .claude/rules/project-domain.md
+~/projects/ivans-workflow/install.sh
+```
+
+This issue was comprehensively fixed in v1.0.1 — all template variables are now properly substituted.
+
 ### "Symlink target doesn't exist"
 
 The framework directory may have moved. Re-run the installer:

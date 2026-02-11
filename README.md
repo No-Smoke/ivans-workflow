@@ -219,6 +219,7 @@ The installer generates stack-specific rules (e.g., "no Node builtins in Workers
 - [Customization](docs/CUSTOMIZATION.md) — Add agents, rules, hooks, credentials
 - [Agent Reference](docs/AGENT-REFERENCE.md) — Complete reference for all agents
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — Common issues and solutions
+- [Changelog](CHANGELOG.md) — Release history and fixes
 
 ---
 
