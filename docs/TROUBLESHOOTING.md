@@ -206,3 +206,26 @@ git init
 ### Ralph loop runs too many iterations
 
 The ralph-loop command has a max of 50 iterations and stops if the same error repeats 10 times. If it's looping excessively, there may be a fundamental issue that auto-fix can't resolve. Stop it (Ctrl+C) and investigate manually.
+
+
+## Design Decisions & Audit Notes
+
+Some implementation choices may appear as issues during audits but are intentional:
+
+### `set -uo` vs `set -euo` in hooks and launch scripts
+
+The cross-cutting constraint says "all bash scripts use `set -euo pipefail`" but several hooks and scripts intentionally omit `-e`:
+
+- **`classify-risk.sh`, `pre-review-checks.sh`, `verify-work.sh`** — These hooks run multiple check commands where non-zero exit codes indicate "found something" not "script error." With `-e`, the first grep that finds no matches would abort the entire hook.
+- **`launch-tmux-agents.sh`** — The launch script continues launching remaining agents even if one tmux command fails.
+- **`prompt-handoff.sh`** — A non-blocking Stop hook that should never crash the agent session.
+
+Only scripts where failure should abort use `-e`: `install.sh`, `credential-helper.sh`, `builder-guard.sh`.
+
+### Example paths in agent definitions
+
+Agent `.md` files use `src/handlers/auth.ts`, `generated/types.ts`, etc. in their **Output Format** example blocks. These are illustrative examples showing what output looks like, not operational paths. All actual path resolution goes through `project-config.yaml`.
+
+### All runtime rules in project-stack.md
+
+The `project-stack.md` template includes rules for ALL runtimes (cloudflare-workers, node, deno, python) rather than stripping to only the selected runtime. This is intentional — agents can see what constraints apply to their runtime and understand what doesn't. The markdown heading structure (`### cloudflare-workers`, etc.) makes it clear which section applies.

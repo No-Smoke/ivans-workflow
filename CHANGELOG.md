@@ -2,6 +2,17 @@
 
 All notable changes to Ivan's Workflow are documented in this file.
 
+## [1.0.2] — 2026-02-11
+
+### Added
+
+- **Stack installation test suite** (`tests/test-install-stacks.sh`): Automated tests covering 6 stack combinations (cloudflare-workers/hono/typescript, node/express/typescript, node/express/javascript, python/fastapi/python, cloudflare-workers/nextjs/typescript, deno/none/typescript). Validates LANG_EXT derivation, SOURCE_DIR substitution, template variable replacement, generated-by headers, and file non-emptiness across all paths.
+- **Design decisions documentation** added to `docs/TROUBLESHOOTING.md` explaining intentional choices: `set -uo` vs `set -euo` in hooks, example paths in agent definitions, and all-runtimes-included in project-stack.md.
+
+### Fixed
+
+- Added `set -uo pipefail` to `core/scripts/load-project-credentials.sh` — was the only script without error mode flags.
+
 ## [1.0.1] — 2026-02-11
 
 ### Fixed
