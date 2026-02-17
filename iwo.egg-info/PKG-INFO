@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: iwo
+Version: 0.5.0
+Summary: Ivan's Workflow Orchestrator - Automated handoffs for Claude Code multi-agent workflows
+Requires-Python: >=3.11
+Requires-Dist: libtmux>=0.37.0
+Requires-Dist: watchdog>=4.0.0
+Requires-Dist: pydantic>=2.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: rich>=13.0.0; extra == "dev"

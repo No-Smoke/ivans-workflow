@@ -1,0 +1,7 @@
+libtmux>=0.37.0
+watchdog>=4.0.0
+pydantic>=2.0.0
+
+[dev]
+pytest>=8.0.0
+rich>=13.0.0

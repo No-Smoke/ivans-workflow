@@ -1,0 +1,2 @@
+[console_scripts]
+iwo = iwo.daemon:main
