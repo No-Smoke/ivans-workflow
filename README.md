@@ -22,7 +22,7 @@ Three-model consensus design (Claude Opus + GPT-5.2 + Gemini 3 Pro):
 ## Install
 
 ```bash
-cd /home/vanya/Nextcloud/PROJECTS/ivans-agent
+cd /home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .

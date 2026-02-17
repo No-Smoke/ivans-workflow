@@ -11,7 +11,7 @@ class IWOConfig:
     # Paths
     project_root: Path = Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt"
     handoffs_dir: Path = field(default=None)
-    log_dir: Path = Path.home() / "projects/iwo/logs"
+    log_dir: Path = Path.home() / "Nextcloud/PROJECTS/ivans-workflow-orchestrator/logs"
 
     # tmux
     tmux_session_name: str = "claude-agents"

@@ -4,8 +4,8 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=%h/projects/iwo/.venv/bin/python -m iwo.daemon
-WorkingDirectory=%h/projects/iwo
+ExecStart=%h/Nextcloud/PROJECTS/ivans-workflow-orchestrator/.venv/bin/python -m iwo.daemon
+WorkingDirectory=%h/Nextcloud/PROJECTS/ivans-workflow-orchestrator
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
