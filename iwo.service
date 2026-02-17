@@ -1,0 +1,14 @@
+[Unit]
+Description=Ivan's Workflow Orchestrator (IWO)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/projects/iwo/.venv/bin/python -m iwo.daemon
+WorkingDirectory=%h/projects/iwo
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
