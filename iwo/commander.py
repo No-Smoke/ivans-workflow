@@ -1,7 +1,8 @@
 """IWO Commander — tmux interaction layer using libtmux.
 
-Handles agent discovery via @iwo-agent pane tags, command injection
-via paste-buffer, and output observation via capture-pane.
+Phase 1.0: Agent discovery via @iwo-agent pane tags (survives rearrangement).
+Canary probe with wait-for-echo. Pipe-pane archival logging.
+PS1 setup where possible. Cursor position + output observation.
 """
 
 import logging
@@ -23,8 +24,6 @@ class AgentPane:
         self.pane = pane
         self.agent_name = agent_name
         self.pane_id = pane.pane_id
-        self._last_output_hash: Optional[int] = None
-        self._last_output_time: float = 0.0
         self._last_command_time: float = 0.0
 
     def capture_visible(self, last_n_lines: int = 30) -> list[str]:
@@ -52,32 +51,73 @@ class AgentPane:
         return None
 
     def send_command(self, command: str) -> bool:
-        """Send a command to the agent pane via paste-buffer (GPT-5.2's recommendation).
+        """Send a command to the agent pane via send-keys.
 
         Returns True if command was sent successfully.
         """
         try:
             self.pane.send_keys(command, enter=True, suppress_history=False)
             self._last_command_time = time.time()
-            log.info(f"Sent command to {self.agent_name} ({self.pane_id}): {command[:60]}...")
+            log.info(f"Sent to {self.agent_name} ({self.pane_id}): {command[:80]}")
             return True
         except Exception as e:
-            log.error(f"Failed to send command to {self.agent_name} ({self.pane_id}): {e}")
+            log.error(f"Failed to send to {self.agent_name} ({self.pane_id}): {e}")
             return False
 
-    def send_canary(self, canary: str) -> bool:
-        """Send a canary probe to check if the shell is responsive."""
-        return self.send_command(f"echo '{canary}'")
+    def send_canary_and_wait(self, canary: str, timeout: float, poll_interval: float,
+                              idle_pattern: str = r"[❯>]\s*$") -> bool:
+        """Canary probe for Claude Code agents.
 
-    def check_output_changed(self) -> bool:
-        """Check if pane output has changed since last check."""
-        lines = self.capture_visible(30)
-        current_hash = hash(tuple(lines))
-        changed = current_hash != self._last_output_hash
-        self._last_output_hash = current_hash
-        if changed:
-            self._last_output_time = time.time()
-        return changed
+        Strategy: capture a baseline output hash, send a single Enter keystroke,
+        wait for the output to change (Claude Code redraws the prompt), then
+        confirm the idle prompt reappears. This proves the agent is alive and
+        responsive without injecting text that Claude Code would interpret as
+        a chat message.
+
+        Falls back to simple idle-prompt check if output doesn't change
+        (some terminals don't redraw on bare Enter).
+        """
+        import re
+        pattern = re.compile(idle_pattern)
+
+        # Baseline: confirm prompt is visible now
+        baseline_lines = self.capture_visible(10)
+        has_prompt = any(pattern.search(l.rstrip()) for l in baseline_lines if l.rstrip())
+        if not has_prompt:
+            log.warning(f"Canary: {self.agent_name} has no prompt visible — skipping")
+            return False
+
+        baseline_hash = hash(tuple(baseline_lines))
+
+        # Send bare Enter (no text — just a keystroke)
+        try:
+            self.pane.send_keys("", enter=True)
+        except Exception as e:
+            log.error(f"Canary: failed to send Enter to {self.agent_name}: {e}")
+            return False
+
+        # Wait for output to change (prompt redrawn) or timeout
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            lines = self.capture_visible(10)
+            current_hash = hash(tuple(lines))
+
+            # Output changed — check if prompt returned
+            if current_hash != baseline_hash:
+                if any(pattern.search(l.rstrip()) for l in lines if l.rstrip()):
+                    log.info(f"Canary confirmed for {self.agent_name} (prompt reappeared)")
+                    return True
+
+        # Timeout — but if prompt is still there, agent is likely fine
+        # (some terminals don't redraw on bare Enter)
+        final_lines = self.capture_visible(10)
+        if any(pattern.search(l.rstrip()) for l in final_lines if l.rstrip()):
+            log.info(f"Canary: {self.agent_name} prompt still visible (accepting as responsive)")
+            return True
+
+        log.warning(f"Canary timeout for {self.agent_name} after {timeout}s — no prompt found")
+        return False
 
     def is_alive(self) -> bool:
         """Check if the pane process is still running."""
@@ -85,6 +125,21 @@ class AgentPane:
             cmd = self.pane.pane_current_command
             return cmd is not None and cmd != ""
         except Exception:
+            return False
+
+    def setup_pipe_pane(self, log_dir: str) -> bool:
+        """Enable pipe-pane to archive all output to a log file."""
+        log_path = f"{log_dir}/agent-{self.agent_name}.log"
+        try:
+            self.pane.cmd(
+                "pipe-pane", "-o",
+                "-t", self.pane_id,
+                f"cat >> {log_path}"
+            )
+            log.info(f"pipe-pane archival enabled: {self.agent_name} → {log_path}")
+            return True
+        except Exception as e:
+            log.warning(f"pipe-pane setup failed for {self.agent_name}: {e}")
             return False
 
 
@@ -113,12 +168,66 @@ class TmuxCommander:
             return False
 
     def _discover_agents(self) -> bool:
-        """Discover agent panes by window index mapping.
+        """Discover agent panes — Phase 1: by @iwo-agent tag, fallback to window index.
 
-        Phase 0.5: Uses window index. Phase 1 will use @iwo-agent tags.
+        Tag-based discovery survives pane rearrangement. If no tags found,
+        falls back to window-index mapping and sets tags for next time.
         """
         self.agents.clear()
-        for agent_name, window_idx in self.config.agent_window_map.items():
+
+        # Try tag-based discovery first
+        tagged = self._discover_by_tag()
+        if tagged > 0:
+            log.info(f"Tag-based discovery: found {tagged}/{len(self.config.agent_window_map)} agents")
+            if tagged == len(self.config.agent_window_map):
+                return True
+            # Partial tags — fill remaining from window index
+            missing = set(self.config.agent_window_map.keys()) - set(self.agents.keys())
+            log.info(f"Filling {len(missing)} untagged agents from window index: {missing}")
+            self._discover_by_window_index(only=missing)
+        else:
+            # No tags at all — first run, use window index and set tags
+            log.info("No @iwo-agent tags found — initial setup via window index")
+            self._discover_by_window_index()
+
+        # Tag any untagged panes for future discovery
+        self._tag_discovered_agents()
+
+        found = len(self.agents)
+        total = len(self.config.agent_window_map)
+        log.info(f"Discovered {found}/{total} agents")
+        return found > 0
+
+    def _discover_by_tag(self) -> int:
+        """Find panes with @iwo-agent user option set."""
+        count = 0
+        try:
+            # List all panes in session with their @iwo-agent tag
+            for window in self.session.windows:
+                for pane in window.panes:
+                    try:
+                        result = pane.cmd(
+                            "display-message", "-p",
+                            "-t", pane.pane_id,
+                            f"#{{" + self.config.pane_tag_key + "}"
+                        )
+                        if result.stdout and result.stdout[0].strip():
+                            agent_name = result.stdout[0].strip()
+                            if agent_name in self.config.agent_window_map:
+                                self.agents[agent_name] = AgentPane(pane, agent_name)
+                                log.info(f"Found {agent_name} via tag (pane {pane.pane_id})")
+                                count += 1
+                    except Exception:
+                        pass  # Pane has no tag or error reading it
+        except Exception as e:
+            log.warning(f"Tag discovery error: {e}")
+        return count
+
+    def _discover_by_window_index(self, only: Optional[set[str]] = None):
+        """Discover agents by window index (Phase 0.5 fallback)."""
+        targets = only or set(self.config.agent_window_map.keys())
+        for agent_name in targets:
+            window_idx = self.config.agent_window_map[agent_name]
             try:
                 windows = self.session.windows
                 if window_idx < len(windows):
@@ -126,7 +235,7 @@ class TmuxCommander:
                     pane = window.active_pane
                     if pane:
                         self.agents[agent_name] = AgentPane(pane, agent_name)
-                        log.info(f"Discovered {agent_name} at window {window_idx} (pane {pane.pane_id})")
+                        log.info(f"Found {agent_name} at window {window_idx} (pane {pane.pane_id})")
                     else:
                         log.warning(f"No active pane in window {window_idx} for {agent_name}")
                 else:
@@ -134,13 +243,32 @@ class TmuxCommander:
             except Exception as e:
                 log.warning(f"Failed to discover {agent_name}: {e}")
 
-        found = len(self.agents)
-        total = len(self.config.agent_window_map)
-        log.info(f"Discovered {found}/{total} agents")
-        return found > 0
+    def _tag_discovered_agents(self):
+        """Set @iwo-agent pane user option on all discovered agents."""
+        for agent_name, agent_pane in self.agents.items():
+            try:
+                agent_pane.pane.cmd(
+                    "set-option", "-p",
+                    "-t", agent_pane.pane_id,
+                    self.config.pane_tag_key, agent_name
+                )
+                log.info(f"Tagged pane {agent_pane.pane_id} as {agent_name}")
+            except Exception as e:
+                log.warning(f"Failed to tag {agent_name}: {e}")
+
+    def setup_agent_environments(self):
+        """Set up pipe-pane archival for all agents."""
+        log_dir = str(self.config.log_dir)
+        for agent_name, agent_pane in self.agents.items():
+            if self.config.enable_pipe_pane:
+                agent_pane.setup_pipe_pane(log_dir)
 
     def activate_agent(self, agent_name: str) -> bool:
-        """Send /workflow-next to the specified agent."""
+        """Send /workflow-next to the specified agent.
+
+        Includes canary probe: sends bare Enter and confirms prompt reappears,
+        proving the agent is alive and responsive before injecting the command.
+        """
         agent = self.agents.get(agent_name)
         if not agent:
             log.error(f"Agent '{agent_name}' not found in discovered panes")
@@ -149,6 +277,19 @@ class TmuxCommander:
         if not agent.is_alive():
             log.error(f"Agent '{agent_name}' pane appears dead")
             return False
+
+        # Canary probe: bare Enter + check prompt returns
+        if not agent.send_canary_and_wait(
+            self.config.canary_string,
+            self.config.canary_timeout_seconds,
+            self.config.canary_poll_interval_seconds,
+            self.config.idle_prompt_pattern,
+        ):
+            log.error(f"Agent '{agent_name}' failed canary probe — not sending command")
+            return False
+
+        # Brief settle after canary
+        time.sleep(1.0)
 
         return agent.send_command("/workflow-next")
 

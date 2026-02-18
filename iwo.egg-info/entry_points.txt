@@ -1,2 +1,3 @@
 [console_scripts]
 iwo = iwo.daemon:main
+iwo-tui = iwo.tui:main

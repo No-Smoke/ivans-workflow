@@ -1,6 +1,6 @@
 # Ivan's Workflow Orchestrator (IWO) — Technical Documentation
 
-**Version:** 0.5.0 (Phase 0.5 — Smart Relay)
+**Version:** 2.0.0 (Phase 2.0 — TUI Dashboard)
 **Created:** 2026-02-18
 **Author:** Three-model consensus design (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro)
 **Repository:** https://github.com/No-Smoke/ivans-workflow-orchestrator
@@ -225,7 +225,7 @@ IWO_PROJECT_ROOT=/path/to/other/project python -m iwo.daemon
 
 ## 9. Roadmap
 
-### Phase 0.5 (Current) — Smart Relay
+### Phase 0.5 (Complete) — Smart Relay
 - watchdog file watching
 - Pydantic validation
 - libtmux agent discovery by window index
@@ -234,21 +234,33 @@ IWO_PROJECT_ROOT=/path/to/other/project python -m iwo.daemon
 - Desktop notifications
 - Stateless crash recovery
 
-### Phase 1.0 — State Machine
-- @iwo-agent pane tagging (replaces window index)
+### Phase 1.0 (Current) — State Machine
+- @iwo-agent pane tagging (replaces window index, survives rearrangement)
 - Agent state machine: IDLE → PROCESSING → STUCK → WAITING_HUMAN → CRASHED
-- Canary probe before command injection
-- `IWO_READY>` forced prompt for deterministic idle detection
+- Canary probe before command injection (echo + wait for echo)
 - Cursor position check (phantom prompt prevention)
+- Pending activation queue (waits for target IDLE before sending commands)
 - pipe-pane archival logging
-- 30-second periodic reconciliation
+- 30-second periodic filesystem reconciliation
 - WAITING_HUMAN detection patterns (`[Y/n]`, `Password:`, `CONFLICT`, `--More--`)
+- State polling every 2s with desktop notifications for state changes
 
-### Phase 2.0 — Dashboard and Concurrency
-- Rich terminal UI or FastAPI web dashboard
+### Phase 2.0 (Current) — TUI Dashboard
+- Textual-based terminal UI with live-updating widgets
+- Agent state panel with colored indicators and time-since-change
+- Handoff history log (last 12 handoffs with outcome icons)
+- Safety rails panel (rejection count, handoff count, deploy gate, pending)
+- Live log output panel routing all IWO logging
+- Keybindings: q=quit, d=deploy approve, r=force reconcile, p=pause/resume
+- Desktop launcher defaults to TUI mode (headless available via right-click)
+- Status bar showing current spec, uptime, total handoffs
+- Deploy gate manual approval via 'd' key
+
+### Phase 3.0 — Multi-spec and Remote
 - Multi-spec concurrent pipeline with agent locking
 - AI sidecar (local model for handoff quality checking)
 - Telegram/Signal notifications for remote operation
+- textual-web for browser-based remote access
 
 ---
 

@@ -5,6 +5,8 @@ iwo/commander.py
 iwo/config.py
 iwo/daemon.py
 iwo/parser.py
+iwo/state.py
+iwo/tui.py
 iwo.egg-info/PKG-INFO
 iwo.egg-info/SOURCES.txt
 iwo.egg-info/dependency_links.txt
