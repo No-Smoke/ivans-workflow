@@ -1,6 +1,6 @@
 # Ivan's Workflow Orchestrator (IWO) — Architecture Guide
 
-**Version:** 2.3.0 | **Updated:** 2026-02-19
+**Version:** 2.5.1 | **Updated:** 2026-02-19
 **Repository:** [No-Smoke/ivans-workflow-orchestrator](https://github.com/No-Smoke/ivans-workflow-orchestrator)
 
 ## Overview
@@ -35,23 +35,27 @@ IWO is designed for the "Boris Cherny Workflow" — a six-agent development pipe
 │  │ Watchdog  │  │   State   │  │  Tmux    │  │    Memory     │  │
 │  │ Observer  │  │  Machine  │  │Commander │  │  Integration  │  │
 │  │(filesystem│  │(per-agent │  │(pane tags│  │(Qdrant+Neo4j) │  │
-│  │ monitor)  │  │ 5 states) │  │ canary)  │  │              │  │
-│  └─────┬─────┘  └─────┬─────┘  └────┬─────┘  └──────┬───────┘  │
-│        │              │              │               │          │
+│  │ monitor)  │  │ 5 states) │  │canary/   │  │              │  │
+│  └─────┬─────┘  └─────┬─────┘  │respawn)  │  └──────┬───────┘  │
+│        │              │        └────┬─────┘         │          │
 │  ┌─────┴──────────────┴──────────────┴───────────────┴───────┐  │
 │  │                    IWO Daemon Core                         │  │
-│  │  - Handoff parsing & validation (Pydantic)                │  │
+│  │  - Multi-spec pipeline tracking (PipelineManager)         │  │
+│  │  - Per-agent handoff queuing (rejection-first priority)   │  │
 │  │  - Safety rails (rejection loops, handoff limits)         │  │
 │  │  - Human gates (deploy approval)                          │  │
+│  │  - Post-deploy health checks                              │  │
+│  │  - Agent crash recovery (auto-respawn, max 3 attempts)    │  │
 │  │  - Idempotency tracking                                   │  │
-│  │  - Filesystem reconciliation (30s)                        │  │
+│  │  - Filesystem reconciliation (30s, all spec dirs)         │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    TUI Dashboard (Textual)                │  │
-│  │  Agent states │ Handoff log │ Safety rails │ Live log     │  │
-│  │  Keybindings: q=quit d=deploy r=refresh p=pause          │  │
-│  └───────────────────────────────────────────────────────────┘  │
+│  ┌───────────────────┐  ┌────────────────────────────────────┐  │
+│  │  Metrics Collector │  │        TUI Dashboard (Textual)    │  │
+│  │  (Neo4j Cypher    │  │  Agents │ Pipelines │ Metrics      │  │
+│  │   aggregation,    │  │  Memory │ Safety    │ Handoff log  │  │
+│  │   60s cache)      │  │  Keys: q=quit d=deploy r=refresh   │  │
+│  └───────────────────┘  └────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
          │                    │                      │
          ▼                    ▼                      ▼
@@ -75,10 +79,11 @@ iwo/
 ├── __init__.py          # Package init
 ├── config.py            # Central configuration (dataclass)
 ├── parser.py            # Handoff JSON validation (Pydantic models)
-├── commander.py         # tmux interaction (pane tagging, canary, commands)
+├── commander.py         # tmux interaction (pane tagging, canary, respawn)
 ├── state.py             # Agent state machine (5 states, polling)
 ├── pipeline.py          # Multi-spec pipeline tracking + per-agent queuing
-├── daemon.py            # Main orchestrator (watchdog, routing, safety)
+├── metrics.py           # Pipeline performance metrics (Neo4j Cypher queries)
+├── daemon.py            # Main orchestrator (watchdog, routing, safety, health checks)
 ├── memory.py            # Qdrant + Neo4j pipeline history storage
 └── tui.py               # Textual TUI dashboard
 
@@ -86,7 +91,7 @@ scripts/
 └── migrate_patterns_384_to_1024.py  # One-time pattern library migration
 ```
 
-**Total:** ~2,490 lines across 9 Python modules + migration script.
+**Total:** ~3,151 lines across 10 Python modules + migration script.
 
 ## Core Concepts
 
