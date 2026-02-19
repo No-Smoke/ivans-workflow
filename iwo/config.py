@@ -43,6 +43,14 @@ class IWOConfig:
     max_respawn_attempts: int = 3  # per agent, before declaring permanently crashed
     respawn_cooldown_seconds: float = 30.0  # min seconds between respawn attempts
 
+    # --- Post-Deploy Health Check (Phase 2.4.2) ---
+    health_check_urls: list[str] = field(default_factory=lambda: [
+        "https://ebatt.ai/api/health",
+    ])
+    health_check_timeout: int = 10  # seconds per URL
+    health_check_expected_status: int = 200
+    health_check_delay: float = 5.0  # seconds to wait after deploy before checking
+
     # Agents that require human approval before IWO sends the command
     human_gate_agents: set[str] = field(default_factory=lambda: {"deployer"})
 

@@ -271,6 +271,98 @@ class IWODaemon:
         except Exception as e:
             log.warning(f"Memory: crash event log failed: {e}")
 
+    def _run_post_deploy_health_check(self, handoff: Handoff):
+        """Hit production URLs after a successful deploy to verify health.
+
+        Phase 2.4.2: Runs after deployer reports success. Checks each URL
+        for expected HTTP status within timeout. Non-blocking — failures
+        notify but don't halt the pipeline.
+        """
+        import urllib.request
+        import urllib.error
+
+        spec_id = handoff.spec_id
+        delay = self.config.health_check_delay
+        timeout = self.config.health_check_timeout
+        expected = self.config.health_check_expected_status
+
+        log.info(f"Post-deploy health check: {spec_id} — waiting {delay}s for propagation")
+        self._notify(f"🏥 Running post-deploy health check for {spec_id}...")
+        time.sleep(delay)
+
+        results: list[tuple[str, bool, str]] = []  # (url, passed, detail)
+
+        for url in self.config.health_check_urls:
+            try:
+                req = urllib.request.Request(url, method="GET")
+                req.add_header("User-Agent", "IWO-HealthCheck/2.4")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status = resp.status
+                    if status == expected:
+                        results.append((url, True, f"HTTP {status}"))
+                        log.info(f"Health check PASS: {url} → HTTP {status}")
+                    else:
+                        results.append((url, False, f"HTTP {status} (expected {expected})"))
+                        log.warning(f"Health check FAIL: {url} → HTTP {status}")
+            except urllib.error.HTTPError as e:
+                results.append((url, False, f"HTTP {e.code}"))
+                log.warning(f"Health check FAIL: {url} → HTTP {e.code}")
+            except urllib.error.URLError as e:
+                results.append((url, False, f"Connection error: {e.reason}"))
+                log.warning(f"Health check FAIL: {url} → {e.reason}")
+            except Exception as e:
+                results.append((url, False, f"Error: {e}"))
+                log.warning(f"Health check FAIL: {url} → {e}")
+
+        # Summarize
+        passed = sum(1 for _, ok, _ in results if ok)
+        total = len(results)
+
+        if passed == total:
+            msg = f"✅ Post-deploy health check PASSED for {spec_id} ({passed}/{total} URLs)"
+            log.info(msg)
+            self._notify(msg)
+        else:
+            failed_details = [
+                f"  {url}: {detail}" for url, ok, detail in results if not ok
+            ]
+            msg = (
+                f"⚠️ Post-deploy health check FAILED for {spec_id} "
+                f"({passed}/{total} passed)\n" + "\n".join(failed_details)
+            )
+            log.error(msg)
+            self._notify(
+                f"⚠️ HEALTH CHECK FAILED: {spec_id} — {total - passed} URL(s) down. "
+                f"Consider rollback.",
+                critical=True,
+            )
+
+        # Log to memory
+        if self.memory and self.memory._neo4j_driver:
+            try:
+                with self.memory._neo4j_driver.session() as session:
+                    session.run(
+                        """
+                        CREATE (h:HealthCheck {
+                            spec_id: $spec_id,
+                            timestamp: datetime(),
+                            passed: $passed,
+                            total: $total,
+                            all_passed: $all_passed,
+                            details: $details
+                        })
+                        """,
+                        spec_id=spec_id,
+                        passed=passed,
+                        total=total,
+                        all_passed=passed == total,
+                        details=json.dumps(
+                            [{u: d} for u, _, d in results]
+                        ),
+                    )
+            except Exception as e:
+                log.warning(f"Memory: health check logging failed: {e}")
+
     def _process_pending_activations(self):
         """Try to activate agents for queued handoffs whose target is now IDLE.
 
@@ -380,6 +472,12 @@ class IWODaemon:
 
         # 7. Write .active-specs.json for external visibility
         self._write_active_specs()
+
+        # 7.1 Post-deploy health check (Phase 2.4.2)
+        if (handoff.source_agent == "deployer"
+                and handoff.status.outcome == "success"
+                and self.config.health_check_urls):
+            self._run_post_deploy_health_check(handoff)
 
         # 8. Human gate check
         target = handoff.target_agent

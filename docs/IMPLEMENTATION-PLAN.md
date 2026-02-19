@@ -117,24 +117,19 @@ Automatic crash recovery: when state machine detects CRASHED (pane process exite
 
 **Acceptance criteria:** ✅ Agent crash → automatic respawn → agent resumes at idle prompt within 60s. Repeated crashes (3x) escalate to human notification. Crash events stored in Neo4j.
 
-### 2.4.2 — Post-deploy health check
+### 2.4.2 — Post-deploy health check ✅
 
-**Effort:** Medium (2 hr) | **Impact:** Medium
+**Effort:** Medium (2 hr) | **Impact:** Medium | **Completed:** 2026-02-19
 **Files:** `iwo/daemon.py`, `iwo/config.py`
 
-After deploy gate approval and deployer completes:
+After deployer reports success, IWO waits a configurable delay (default 5s for CDN propagation), then hits each configured health check URL. Verifies HTTP 200 within timeout. Results logged to Neo4j as HealthCheck nodes. Failed checks trigger critical notification with rollback suggestion. Uses stdlib urllib — no additional dependencies.
 
-1. IWO waits for deployer's handoff (success/failure)
-2. If success, hit the production URL(s) with a health check
-3. Verify HTTP 200 and expected response content
-4. If health check fails, notify with rollback instructions
+**Implementation (completed):**
+- `daemon.py`: `_run_post_deploy_health_check()` method, hooked into `process_handoff()` when source is deployer + outcome is success
+- `config.py`: `health_check_urls`, `health_check_timeout`, `health_check_expected_status`, `health_check_delay`
+- Results stored in Neo4j as HealthCheck nodes with pass/fail counts and per-URL details
 
-```python
-health_check_urls: list[str] = ["https://ebatt.ai/api/health"]
-health_check_timeout: int = 10
-```
-
-**Acceptance criteria:** Deploy success → automatic health check → green notification or rollback warning.
+**Acceptance criteria:** ✅ Deploy success → automatic health check → green notification or rollback warning. Health check results logged to Neo4j.
 
 ### 2.4.3 — Memory health indicator in TUI ✅
 
