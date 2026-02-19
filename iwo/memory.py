@@ -196,23 +196,32 @@ class IWOMemory:
             f"Spec {handoff.spec_id}: {handoff.source_agent} → {handoff.target_agent}.",
             f"Outcome: {handoff.status.outcome}.",
         ]
-        if hasattr(handoff, 'nextAgent') and handoff.nextAgent:
+        if handoff.nextAgent:
             parts.append(f"Action: {handoff.nextAgent.action}.")
             if handoff.nextAgent.context:
                 parts.append(f"Context: {handoff.nextAgent.context[:200]}.")
-        if hasattr(handoff, 'deliverables') and handoff.deliverables:
+        if handoff.deliverables:
             d = handoff.deliverables
-            if hasattr(d, 'filesCreated') and d.filesCreated:
-                parts.append(f"Files created: {', '.join(d.filesCreated[:10])}.")
-            if hasattr(d, 'testsStatus') and d.testsStatus:
-                ts = d.testsStatus
-                if hasattr(ts, 'passed'):
-                    parts.append(f"Tests: {ts.passed} passed, {ts.failed} failed.")
+            all_files = handoff.files_touched
+            if all_files:
+                parts.append(f"Files ({len(all_files)}): {', '.join(all_files[:8])}.")
+            if d.testsStatus:
+                parts.append(f"Tests: {handoff.test_summary}.")
+            if d.typecheckPassed is not None:
+                parts.append(f"Typecheck: {'passed' if d.typecheckPassed else 'FAILED'}.")
+        if handoff.evidence:
+            if handoff.evidence.securityCheck:
+                parts.append(f"Security: {handoff.evidence.securityCheck[:100]}.")
+        if handoff.status.reviewFindings:
+            rf = handoff.status.reviewFindings
+            parts.append(f"Review: {len(rf.blocking)} blocking, {len(rf.medium)} medium, {len(rf.low)} low.")
+        if handoff.status.deviationsFromPlan:
+            parts.append(f"Deviations: {len(handoff.status.deviationsFromPlan)}.")
         return " ".join(parts)
 
     def _build_metadata(self, handoff: "Handoff", processing_time_ms: float) -> dict:
         """Build structured metadata for storage."""
-        return {
+        meta = {
             "spec_id": handoff.spec_id,
             "sequence": handoff.sequence,
             "source_agent": handoff.source_agent,
@@ -223,6 +232,30 @@ class IWOMemory:
             "idempotency_key": handoff.idempotency_key,
             "stored_at": datetime.now(timezone.utc).isoformat(),
         }
+        # Deliverables metadata
+        if handoff.deliverables:
+            meta["files_count"] = len(handoff.files_touched)
+            meta["typecheck_passed"] = handoff.deliverables.typecheckPassed
+            if handoff.deliverables.testsStatus:
+                ts = handoff.deliverables.testsStatus
+                meta["tests_passed"] = ts.passed
+                meta["tests_failed"] = ts.failed
+                meta["tests_new"] = ts.newTests
+        # Review findings metadata
+        if handoff.status.reviewFindings:
+            rf = handoff.status.reviewFindings
+            meta["blocking_count"] = len(rf.blocking)
+            meta["medium_count"] = len(rf.medium)
+            meta["low_count"] = len(rf.low)
+        # Evidence flags
+        if handoff.evidence:
+            meta["has_security_review"] = handoff.evidence.securityCheck is not None
+            meta["has_code_quality_review"] = handoff.evidence.codeQuality is not None
+        # Deviations and known issues
+        meta["deviations_count"] = len(handoff.status.deviationsFromPlan)
+        meta["known_issues_count"] = len(handoff.nextAgent.knownIssues)
+        meta["goal_met"] = handoff.status.goalMet
+        return meta
 
     def _embed(self, text: str) -> Optional[list[float]]:
         """Get embedding from Ollama. Returns None on failure."""
@@ -266,7 +299,7 @@ class IWOMemory:
     def _store_to_neo4j(self, handoff: "Handoff", metadata: dict, summary: str):
         """Store handoff event and relationships to Neo4j."""
         with self._neo4j_driver.session() as session:
-            # Create HandoffEvent node
+            # Create HandoffEvent node with enriched metadata
             session.run(
                 """
                 MERGE (h:HandoffEvent {idempotency_key: $key})
@@ -279,6 +312,13 @@ class IWOMemory:
                     h.timestamp = $timestamp,
                     h.processing_time_ms = $proc_time,
                     h.summary = $summary,
+                    h.files_count = $files_count,
+                    h.tests_passed = $tests_passed,
+                    h.tests_failed = $tests_failed,
+                    h.typecheck_passed = $typecheck_passed,
+                    h.blocking_count = $blocking_count,
+                    h.deviations_count = $deviations_count,
+                    h.goal_met = $goal_met,
                     h.stored_at = datetime()
                 """,
                 key=metadata["idempotency_key"],
@@ -290,6 +330,13 @@ class IWOMemory:
                 timestamp=metadata["timestamp"],
                 proc_time=metadata["processing_time_ms"],
                 summary=summary,
+                files_count=metadata.get("files_count", 0),
+                tests_passed=metadata.get("tests_passed"),
+                tests_failed=metadata.get("tests_failed"),
+                typecheck_passed=metadata.get("typecheck_passed"),
+                blocking_count=metadata.get("blocking_count", 0),
+                deviations_count=metadata.get("deviations_count", 0),
+                goal_met=metadata.get("goal_met"),
             )
 
             # Link sequential handoffs: previous → current

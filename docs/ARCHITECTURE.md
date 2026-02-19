@@ -1,6 +1,6 @@
 # Ivan's Workflow Orchestrator (IWO) — Architecture Guide
 
-**Version:** 2.1.0 | **Updated:** 2026-02-19
+**Version:** 2.3.0 | **Updated:** 2026-02-19
 **Repository:** [No-Smoke/ivans-workflow-orchestrator](https://github.com/No-Smoke/ivans-workflow-orchestrator)
 
 ## Overview
@@ -77,12 +77,16 @@ iwo/
 ├── parser.py            # Handoff JSON validation (Pydantic models)
 ├── commander.py         # tmux interaction (pane tagging, canary, commands)
 ├── state.py             # Agent state machine (5 states, polling)
+├── pipeline.py          # Multi-spec pipeline tracking + per-agent queuing
 ├── daemon.py            # Main orchestrator (watchdog, routing, safety)
 ├── memory.py            # Qdrant + Neo4j pipeline history storage
 └── tui.py               # Textual TUI dashboard
+
+scripts/
+└── migrate_patterns_384_to_1024.py  # One-time pattern library migration
 ```
 
-**Total:** ~1,750 lines across 8 Python modules.
+**Total:** ~2,490 lines across 9 Python modules + migration script.
 
 ## Core Concepts
 
@@ -102,17 +106,30 @@ Agents communicate via JSON files written to `docs/agent-comms/{SPEC-ID}/`. Each
     "outcome": "success",
     "goalMet": true,
     "unresolvedIssues": [],
-    "deviationsFromPlan": []
+    "deviationsFromPlan": ["Changed implementation approach for..."],
+    "reviewFindings": {
+      "blocking": [],
+      "medium": ["Optional filter not yet implemented"],
+      "low": ["Cosmetic: redundant ternary"]
+    }
   },
   "deliverables": {
     "filesCreated": ["migrations/0003_battery-tables.sql"],
     "filesModified": ["package.json"],
-    "testsStatus": { "passed": 269, "failed": 0 }
+    "filesReviewed": [],
+    "testsStatus": { "passed": 269, "failed": 0, "skipped": 0, "newTests": 33 },
+    "typecheckPassed": true
+  },
+  "evidence": {
+    "reviewAreas": { "sqlSchema": "PASS", "sqlSafety": "PASS" },
+    "securityCheck": "No injection vectors. All user input via parameterized SQL.",
+    "codeQuality": "All functions have explicit return types. No any types."
   },
   "nextAgent": {
     "target": "reviewer",
     "action": "Review Sprint 1 deliverables",
-    "context": "Focus on SQL schema correctness..."
+    "context": "Focus on SQL schema correctness...",
+    "knownIssues": ["Unused schema fields (Sprint 2 scope)"]
   }
 }
 ```
@@ -209,11 +226,12 @@ IWO integrates into a broader memory architecture shared across multiple tools:
 | Collection | Dimensions | Points | Purpose | Access Via |
 |------------|-----------|--------|---------|------------|
 | `iwo_pipeline_history` | 1024 | 0+ | Handoff telemetry, pipeline history | IWO daemon, qdrant-new |
-| `ebatt_pattern_library` | 384 | 56 | Curated implementation patterns | tos-bridge ONLY |
+| `ebatt_patterns_v2` | 1024 | 56 | Curated implementation patterns (migrated from 384-dim) | tos-bridge, qdrant-new |
+| `ebatt_pattern_library` | 384 | 56 | Legacy patterns (backup, read-only) | Direct API only |
 | `project_memory_v2` | 1024 | varies | Session context, decisions | qdrant-new |
-| `boris_workflow_skills` | 1024 | 17 | Workflow patterns | qdrant-new |
+| `boris_workflow_skills` | 1024 | 17 | Workflow patterns | tos-bridge, qdrant-new |
 
-**Important:** `ebatt_pattern_library` uses 384-dim embeddings (legacy). It cannot be searched via qdrant-new (1024-dim). The canonical access path is **tos-bridge**, which has its own 384-dim embedding model.
+**Note:** `ebatt_pattern_library` (384-dim) was migrated to `ebatt_patterns_v2` (1024-dim) on 2026-02-19. The old collection is preserved as backup. All tools now use `ebatt_patterns_v2`.
 
 ### Neo4j Graph (VPS: 74.50.49.35:7687)
 
@@ -250,13 +268,17 @@ Agent writes handoff JSON
 IWO daemon detects file (watchdog)
          │
          ├──▶ Qdrant: embed summary → iwo_pipeline_history
+         │    (includes: file counts, test results, review findings, deviations)
          ├──▶ Neo4j: HandoffEvent node + relationships
+         │    (enriched: tests_passed/failed, blocking_count, goal_met)
          └──▶ Activate next agent
                   │
                   ▼
          Agent runs /workflow-next
                   │
-                  ├──▶ tos-bridge: query pattern library (via Claude Code MCP)
+                  ├──▶ Neo4j: query constraints & ADRs (required for reviewer/deployer)
+                  ├──▶ tos-bridge: query boris_workflow_skills (workflow patterns)
+                  ├──▶ tos-bridge: query ebatt_patterns_v2 (implementation patterns)
                   └──▶ Begin work with historical context
 ```
 
@@ -359,3 +381,4 @@ Check that Ollama is running (`curl http://localhost:11434/api/tags`), Qdrant is
 | 1.0 | 2026-02-18 | State machine, canary probes, pane tagging, reconciliation |
 | 2.0 | 2026-02-18 | TUI dashboard, daemon refactor |
 | 2.1 | 2026-02-19 | Memory integration (Qdrant + Neo4j), bugfixes |
+| 2.2 | 2026-02-19 | Agent intelligence: enriched parser (deliverables, evidence, review findings), pattern library migration 384→1024-dim, workflow-next context loading (tos-bridge + Neo4j queries with mandatory/best-effort split) |

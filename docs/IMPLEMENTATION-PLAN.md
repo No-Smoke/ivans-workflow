@@ -1,17 +1,17 @@
 # IWO Implementation Plan — Phases 2.2–3.0
 
-**Created:** 2026-02-19 | **Status:** Active
+**Created:** 2026-02-19 | **Status:** Active | **Last Updated:** 2026-02-19
 **Context:** Following completion of Phase 2.1 (memory integration). All items below are prioritized improvements discovered during the Phase 1–2.1 build sessions.
 
 ---
 
-## Phase 2.2: Agent Intelligence (High Priority)
+## Phase 2.2: Agent Intelligence ✅ COMPLETE (2026-02-19)
 
-These items directly improve workflow quality by making agents smarter.
+These items directly improve workflow quality by making agents smarter. **All 3 sub-phases completed 2026-02-19.**
 
-### 2.2.1 — Update workflow-next to query tos-bridge
+### 2.2.1 — Update workflow-next to query tos-bridge ✅
 
-**Effort:** Small (30 min) | **Impact:** High
+**Effort:** Small (30 min) | **Impact:** High | **Completed:** 2026-02-19
 **Files:** `ebatt/.claude/commands/workflow-next.md`
 
 Add a step before agents begin work: query tos-bridge for patterns relevant to their role and the current spec. Example: Reviewer queries "common review findings for D1 schemas" before starting review.
@@ -23,11 +23,11 @@ Before beginning work, query the pattern library:
 - Review returned patterns and apply relevant ones to your work
 ```
 
-**Acceptance criteria:** Agent logs show pattern query before starting work. Reviewer cites relevant past patterns in review findings.
+**Acceptance criteria:** ✅ Agent logs show pattern query before starting work. Reviewer cites relevant past patterns in review findings. Three-model consensus (GPT-5.2, Gemini 2.5 Pro, GPT-5.2 Pro) validated approach with structured query facets, mandatory/best-effort split for constraints vs patterns, and top-K limits.
 
-### 2.2.2 — Enrich handoff parser with deliverables
+### 2.2.2 — Enrich handoff parser with deliverables ✅
 
-**Effort:** Small (30 min) | **Impact:** Medium
+**Effort:** Small (30 min) | **Impact:** Medium | **Completed:** 2026-02-19
 **Files:** `iwo/parser.py`, `iwo/memory.py`
 
 The Pydantic `Handoff` model currently only models `metadata`, `status`, and `nextAgent`. Real handoffs also include `deliverables` (files created/modified, test results) and `evidence`. Adding these as optional fields lets the memory module capture richer data.
@@ -45,12 +45,12 @@ class Handoff(BaseModel):
     evidence: Optional[dict] = None
 ```
 
-**Acceptance criteria:** Memory summaries include test counts and file lists. Neo4j HandoffEvent nodes have deliverables metadata.
+**Acceptance criteria:** ✅ Memory summaries include test counts and file lists. Neo4j HandoffEvent nodes have deliverables metadata. Validated against real production handoffs (PRICING-SINGLE-REPORT builder, EBATT-022 reviewer). New Pydantic models: TestsStatus, ReviewFindings, Deliverables, Evidence. Parser 64→140 lines, memory 320→367 lines.
 
-### 2.2.3 — Pattern library dimension migration
+### 2.2.3 — Pattern library dimension migration ✅
 
-**Effort:** Medium (2 hr) | **Impact:** Medium
-**Files:** New migration script
+**Effort:** Medium (2 hr) | **Impact:** Medium | **Completed:** 2026-02-19
+**Files:** New migration script `scripts/migrate_patterns_384_to_1024.py`
 
 The `ebatt_pattern_library` collection uses 384-dim embeddings (legacy). tos-bridge uses 1024-dim (mxbai-embed-large). This means tos-bridge can write to Neo4j Pattern nodes but cannot properly search the Qdrant collection. Options:
 
@@ -65,27 +65,38 @@ The `ebatt_pattern_library` collection uses 384-dim embeddings (legacy). tos-bri
 # Update tos-bridge default collection
 ```
 
-**Acceptance criteria:** tos-bridge:search_with_graph returns results from the 1024-dim collection. Old 384-dim collection preserved as backup.
+**Acceptance criteria:** ✅ tos-bridge:search_with_graph returns results from the 1024-dim collection (verified: 0.83 score for error handling query). Old 384-dim collection preserved as backup. All 56 patterns migrated (3 required truncation to 1200 chars due to mxbai-embed-large 512-token limit). Payload normalized: all points now have `text` field. `workflow-next.md` updated to query `ebatt_patterns_v2` directly.
+
+**Implementation (completed):** Option A — created `ebatt_patterns_v2` (1024-dim), re-embedded all 56 patterns via Ollama, updated workflow-next.md. Migration script is rerunnable.
 
 ---
 
 ## Phase 2.3: Multi-Spec Pipeline (High Priority)
 
-### 2.3.1 — Parallel spec support
+### 2.3.1 — Parallel spec support ✅
 
-**Effort:** Large (4 hr) | **Impact:** High
-**Files:** `iwo/daemon.py`, `iwo/config.py`, `iwo/tui.py`
+**Effort:** Large (4 hr) | **Impact:** High | **Completed:** 2026-02-19
+**Files:** New `iwo/pipeline.py`, `iwo/daemon.py`, `iwo/config.py`, `iwo/tui.py`
 
-Currently IWO tracks one active spec via `.current-spec`. For parallel operation (e.g., Planner starts EBATT-023 while Reviewer finishes EBATT-022):
+Multi-spec pipeline support via `PipelineManager` class. Each spec has its own `SpecPipeline` lifecycle tracker. Agents can only work on one spec at a time — when a handoff arrives for a busy agent, it's queued with rejection-first priority (incomplete work always takes precedence over new spec work).
 
-- Route handoffs by spec ID, not just "next agent"
-- Track per-spec pipeline state (which agent is active for which spec)
-- TUI: show multiple active pipelines with per-spec status
-- Safety rails: per-spec rejection counts and handoff limits
+**Implementation (completed):**
 
-**Key change:** The `HandoffTracker` already tracks per-spec counts. The activation logic in `process_handoff()` needs to check if the target agent is already working on a different spec and queue accordingly.
+- New `iwo/pipeline.py` (287 lines): `PipelineManager`, `SpecPipeline`, `QueuedHandoff` classes
+- `daemon.py` refactored (482→592 lines): pipeline-aware routing in `process_handoff()`, multi-spec `_recover_state()` and `_reconcile_filesystem()` scanning all spec dirs, `_activate_for_handoff()` helper, `_write_active_specs()` for external visibility
+- `config.py`: added `max_concurrent_specs: int = 5`
+- `tui.py` (474→537 lines): new `PipelinePanel` widget showing spec status/current agent, status bar shows pipeline count + queue depth, safety panel shows cross-spec metrics
+- Total codebase: ~2,490 lines across 9 modules
+- `.active-specs.json` written for external tool visibility; `.current-spec` maintained for backward compat
+- All unit tests pass: pipeline CRUD, agent assignment/release, rejection-first queue priority, handoff recording with source agent release, recovery from filesystem, serialization
 
-**Acceptance criteria:** Two specs can progress through the pipeline simultaneously without interference. TUI shows both pipelines.
+**Key design decisions:**
+- The handoff itself is the signal that an agent is becoming available (no explicit "agent finished" signals needed)
+- Rejections (failed outcome) always dequeue before new spec work (FIFO within each priority tier)
+- Legacy `_pending_activations` list auto-migrated to pipeline queue on first check
+- Agent state machines remain per-agent (health tracking), pipelines are per-spec (progress tracking)
+
+**Acceptance criteria:** ✅ Two specs can progress through the pipeline simultaneously without interference. TUI shows both pipelines. Rejected work gets priority over new work. Recovery from restart rebuilds all pipeline state.
 
 ---
 
@@ -214,9 +225,10 @@ If Ollama is unreachable, attempt to start it (`systemctl --user start ollama` o
 ## Implementation Order (Recommended)
 
 ```
-Week 1:  2.2.1 (workflow-next tos-bridge) → 2.2.2 (parser enrichment)
-Week 2:  2.2.3 (pattern migration) → 2.4.3 (memory health TUI)
-Week 3:  2.3.1 (multi-spec pipeline)
+Week 1:  ✅ 2.2.1 (workflow-next tos-bridge) → ✅ 2.2.2 (parser enrichment)
+         ✅ 2.2.3 (pattern migration) — all completed 2026-02-19
+Week 2:  2.4.3 (memory health TUI)
+Week 3:  2.3.1 (multi-spec pipeline) ← NEXT
 Week 4:  2.4.1 (crash recovery) → 2.4.2 (health check)
 Week 5:  2.5.1 (metrics) → 2.5.2 (webhooks)
 Future:  Phase 3.0 items as needed
@@ -226,9 +238,9 @@ Future:  Phase 3.0 items as needed
 
 | Phase | Requires |
 |-------|----------|
-| 2.2.1 | tos-bridge connected to Claude Code ✅ (done 2026-02-19) |
-| 2.2.2 | None |
-| 2.2.3 | Ollama running with mxbai-embed-large |
+| ~~2.2.1~~ | ~~tos-bridge connected to Claude Code~~ ✅ Done |
+| ~~2.2.2~~ | ~~None~~ ✅ Done |
+| ~~2.2.3~~ | ~~Ollama running with mxbai-embed-large~~ ✅ Done |
 | 2.3.1 | Phase 2.1 complete ✅ |
 | 2.4.1 | tmux respawn-pane capability |
 | 2.4.2 | Production URLs configured |
