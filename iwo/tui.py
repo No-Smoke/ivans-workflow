@@ -134,6 +134,30 @@ class PipelinePanel(Container):
             yield Static("", id=f"pipeline-{i}", classes="pipeline-row")
 
 
+class MemoryHealthPanel(Container):
+    """Memory system health indicator: Qdrant, Neo4j, Ollama."""
+
+    DEFAULT_CSS = """
+    MemoryHealthPanel {
+        height: auto;
+        border: solid $accent;
+        padding: 0 1;
+    }
+    MemoryHealthPanel > Static.panel-title {
+        text-style: bold;
+    }
+    MemoryHealthPanel > Static.memory-row {
+        height: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("MEMORY", classes="panel-title")
+        yield Static(" ○ Qdrant", id="mem-qdrant", classes="memory-row")
+        yield Static(" ○ Neo4j", id="mem-neo4j", classes="memory-row")
+        yield Static(" ○ Ollama", id="mem-ollama", classes="memory-row")
+
+
 class SafetyPanel(Container):
     """Safety rails status display."""
 
@@ -262,6 +286,8 @@ class IWOApp(App):
         self._poll_timer: Optional[Timer] = None
         self._recon_timer: Optional[Timer] = None
         self._display_timer: Optional[Timer] = None
+        self._health_timer: Optional[Timer] = None
+        self._memory_health: dict[str, bool] = {"qdrant": False, "neo4j": False, "ollama": False}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -272,6 +298,7 @@ class IWOApp(App):
                 id="agent-panel",
             )
             yield PipelinePanel(id="pipeline-panel")
+            yield MemoryHealthPanel(id="memory-panel")
             yield SafetyPanel(id="safety-panel")
         with Vertical(id="right-col"):
             yield HandoffPanel(id="handoff-panel")
@@ -315,6 +342,10 @@ class IWOApp(App):
         self._poll_timer = self.set_interval(poll_interval, self._poll_states)
         self._recon_timer = self.set_interval(recon_interval, self._reconcile)
         self._display_timer = self.set_interval(1.0, self._update_display)
+        self._health_timer = self.set_interval(60.0, self._check_memory_health)
+
+        # Run initial health check
+        self._check_memory_health()
 
     def _poll_states(self) -> None:
         """Poll agent state machines."""
@@ -333,8 +364,18 @@ class IWOApp(App):
         self._update_status_bar()
         self._update_agents()
         self._update_pipelines()
+        self._update_memory_health()
         self._update_safety()
         self._update_handoffs()
+
+    def _check_memory_health(self) -> None:
+        """Poll memory backends for connectivity. Called every 60s."""
+        if self._paused:
+            return
+        if self.daemon.memory:
+            self._memory_health = self.daemon.memory.health_check()
+        else:
+            self._memory_health = {"qdrant": False, "neo4j": False, "ollama": False}
 
     def _update_status_bar(self) -> None:
         status = self.query_one("#status-bar", StatusBar)
@@ -414,6 +455,20 @@ class IWOApp(App):
                     )
                 else:
                     widget.update("")
+            except Exception:
+                pass
+
+    def _update_memory_health(self) -> None:
+        """Update memory health indicator panel."""
+        for service in ("qdrant", "neo4j", "ollama"):
+            up = self._memory_health.get(service, False)
+            icon = "🟢" if up else "🔴"
+            color = "green" if up else "red"
+            label = service.capitalize()
+            try:
+                self.query_one(f"#mem-{service}", Static).update(
+                    f" {icon} [{color}]{label}[/]"
+                )
             except Exception:
                 pass
 

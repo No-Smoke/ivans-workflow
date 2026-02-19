@@ -88,6 +88,43 @@ class IWOMemory:
             log.warning("Memory integration unavailable — running without persistence")
         return self._available
 
+    def health_check(self) -> dict[str, bool]:
+        """Check connectivity of all memory backends.
+
+        Returns dict with keys 'qdrant', 'neo4j', 'ollama' mapping to bool.
+        Each check has a short timeout to avoid blocking the TUI.
+        """
+        health = {"qdrant": False, "neo4j": False, "ollama": False}
+
+        # Qdrant: list collections as a ping
+        if self._qdrant:
+            try:
+                self._qdrant.get_collections()
+                health["qdrant"] = True
+            except Exception:
+                pass
+
+        # Neo4j: verify connectivity
+        if self._neo4j_driver:
+            try:
+                self._neo4j_driver.verify_connectivity()
+                health["neo4j"] = True
+            except Exception:
+                pass
+
+        # Ollama: check embedding model availability
+        try:
+            import urllib.request
+            url = f"{self.config.ollama_url}/api/tags"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    health["ollama"] = True
+        except Exception:
+            pass
+
+        return health
+
     def store_handoff(self, handoff: "Handoff", processing_time_ms: float = 0):
         """Store a processed handoff to Qdrant and Neo4j.
 
