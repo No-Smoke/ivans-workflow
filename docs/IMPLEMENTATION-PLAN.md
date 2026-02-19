@@ -1,7 +1,7 @@
 # IWO Implementation Plan — Phases 2.2–3.0
 
 **Created:** 2026-02-19 | **Status:** Active | **Last Updated:** 2026-02-19
-**Context:** Following completion of Phase 2.1 (memory integration). Phases 2.2–2.5.1 completed in session 2026-02-19. Remaining: Phase 2.5.2, Phase 3.0.
+**Context:** Following completion of Phase 2.1 (memory integration). Phases 2.2–2.5.2 completed in session 2026-02-19. Remaining: Phase 3.0.
 
 ---
 
@@ -159,9 +159,9 @@ New `MetricsCollector` queries Neo4j HandoffEvent nodes for pipeline performance
 
 **Acceptance criteria:** ✅ TUI panel shows real pipeline performance data when Neo4j has HandoffEvent nodes. Empty state handled gracefully.
 
-### 2.5.2 — Webhook/notification integration
+### 2.5.2 — Webhook/notification integration ✅
 
-**Effort:** Small (1 hr) | **Impact:** Medium
+**Effort:** Small (1 hr) | **Impact:** Medium | **Completed:** 2026-02-19
 **Files:** `iwo/daemon.py`, `iwo/config.py`
 
 Add optional webhook/n8n notification alongside desktop notify-send:
@@ -171,7 +171,15 @@ notification_webhook_url: Optional[str] = None  # e.g., n8n webhook URL
 notification_channels: list[str] = ["desktop"]  # "desktop", "webhook", "both"
 ```
 
-**Acceptance criteria:** IWO events appear in n8n workflow for mobile notifications.
+**Acceptance criteria:** ✅ IWO events appear in n8n workflow for mobile notifications.
+
+**Implementation (completed):**
+- `config.py`: Added `notification_channels` (list, default `["desktop"]`), `notification_webhook_url` (Optional[str]), `notification_webhook_timeout` (int, 10s)
+- `daemon.py`: Refactored `_notify()` into dispatcher checking `notification_channels`, calls `_notify_desktop()` (original notify-send) and/or `_notify_webhook()` (JSON POST via urllib)
+- Webhook payload: `{source, message, critical, timestamp, active_specs, version}` — context-rich for n8n processing/routing
+- Uses stdlib `urllib.request` only — zero new dependencies, consistent with post-deploy health check pattern
+- Graceful degradation: missing URL → debug log skip, network errors → warning log only
+- config.py 122→128 lines, daemon.py 805→846 lines
 
 ---
 

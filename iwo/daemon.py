@@ -639,6 +639,16 @@ class IWODaemon:
             pass
 
     def _notify(self, message: str, critical: bool = False):
+        """Send notification via configured channels (desktop, webhook, or both)."""
+        channels = self.config.notification_channels
+
+        if "desktop" in channels:
+            self._notify_desktop(message, critical)
+
+        if "webhook" in channels:
+            self._notify_webhook(message, critical)
+
+    def _notify_desktop(self, message: str, critical: bool = False):
         """Send desktop notification via notify-send."""
         urgency = "critical" if critical else "normal"
         try:
@@ -649,6 +659,38 @@ class IWODaemon:
             )
         except Exception as e:
             log.warning(f"notify-send failed: {e}")
+
+    def _notify_webhook(self, message: str, critical: bool = False):
+        """Send notification via webhook (e.g., n8n) as JSON POST."""
+        url = self.config.notification_webhook_url
+        if not url:
+            log.debug("Webhook notification skipped: no URL configured")
+            return
+
+        import json
+        import time as _time
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+
+        # Build context-rich payload for n8n processing
+        active_specs = [p.spec_id for p in self.pipeline.get_active()]
+        payload = json.dumps({
+            "source": "iwo",
+            "message": message,
+            "critical": critical,
+            "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "active_specs": active_specs,
+            "version": "2.5.2",
+        }).encode("utf-8")
+
+        req = Request(url, data=payload, headers={"Content-Type": "application/json"})
+        try:
+            with urlopen(req, timeout=self.config.notification_webhook_timeout) as resp:
+                log.debug(f"Webhook notification sent: {resp.status}")
+        except URLError as e:
+            log.warning(f"Webhook notification failed: {e}")
+        except Exception as e:
+            log.warning(f"Webhook notification error: {e}")
 
     def setup(self) -> bool:
         """Initialize daemon: connect to tmux, set up state machines, recover state, start watcher.

@@ -6,6 +6,7 @@ waiting-human patterns, pipe-pane archival, reconciliation.
 
 from pathlib import Path
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -50,6 +51,11 @@ class IWOConfig:
     health_check_timeout: int = 10  # seconds per URL
     health_check_expected_status: int = 200
     health_check_delay: float = 5.0  # seconds to wait after deploy before checking
+
+    # --- Webhook/Notification (Phase 2.5.2) ---
+    notification_channels: list[str] = field(default_factory=lambda: ["desktop"])  # "desktop", "webhook"
+    notification_webhook_url: Optional[str] = None  # e.g., n8n webhook URL
+    notification_webhook_timeout: int = 10  # seconds
 
     # Agents that require human approval before IWO sends the command
     human_gate_agents: set[str] = field(default_factory=lambda: {"deployer"})
