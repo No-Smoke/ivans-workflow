@@ -95,10 +95,24 @@ class IWOMemory:
 
         Returns dict with keys 'qdrant', 'neo4j', 'ollama' mapping to bool.
         Each check has a short timeout to avoid blocking the TUI.
+        If clients are None (init failed), attempts lightweight reconnection.
         """
         health = {"qdrant": False, "neo4j": False, "ollama": False}
 
-        # Qdrant: list collections as a ping
+        # Qdrant: attempt reconnect if client is None
+        if not self._qdrant:
+            try:
+                from qdrant_client import QdrantClient
+                self._qdrant = QdrantClient(
+                    url=self.config.qdrant_url,
+                    api_key=self.config.qdrant_api_key or None,
+                    timeout=5,
+                )
+                self._qdrant.get_collections()
+                log.info("Qdrant reconnected via health check")
+            except Exception:
+                self._qdrant = None
+
         if self._qdrant:
             try:
                 self._qdrant.get_collections()
@@ -106,7 +120,19 @@ class IWOMemory:
             except Exception:
                 pass
 
-        # Neo4j: verify connectivity
+        # Neo4j: attempt reconnect if driver is None
+        if not self._neo4j_driver:
+            try:
+                from neo4j import GraphDatabase
+                self._neo4j_driver = GraphDatabase.driver(
+                    self.config.neo4j_uri,
+                    auth=(self.config.neo4j_user, self.config.neo4j_password),
+                )
+                self._neo4j_driver.verify_connectivity()
+                log.info("Neo4j reconnected via health check")
+            except Exception:
+                self._neo4j_driver = None
+
         if self._neo4j_driver:
             try:
                 self._neo4j_driver.verify_connectivity()
@@ -124,6 +150,9 @@ class IWOMemory:
                     health["ollama"] = True
         except Exception:
             pass
+
+        # Update availability flag
+        self._available = self._qdrant is not None or self._neo4j_driver is not None
 
         return health
 
