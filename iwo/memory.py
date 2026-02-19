@@ -9,6 +9,7 @@ IWO continues orchestrating without interruption.
 
 import json
 import logging
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -34,6 +35,7 @@ class IWOMemory:
         self._neo4j_driver = None
         self._available = False
         self._init_attempted = False
+        self._ollama_restart_attempts = 0  # Phase 3.0.4: track restart attempts
 
     def initialize(self) -> bool:
         """Connect to Qdrant and Neo4j. Returns True if both connected."""
@@ -295,22 +297,80 @@ class IWOMemory:
         return meta
 
     def _embed(self, text: str) -> Optional[list[float]]:
-        """Get embedding from Ollama. Returns None on failure."""
+        """Get embedding from Ollama. Attempts self-healing restart on failure."""
         try:
-            import httpx
-            with httpx.Client(timeout=15) as client:
-                response = client.post(
-                    f"{self.config.ollama_url}/api/embeddings",
-                    json={
-                        "model": self.config.ollama_embed_model,
-                        "prompt": text,
-                    },
-                )
-                response.raise_for_status()
-                return response.json()["embedding"]
+            return self._embed_request(text)
         except Exception as e:
             log.warning(f"Ollama embedding failed: {e}")
+            # Phase 3.0.4: attempt self-healing restart
+            if self._try_restart_ollama():
+                try:
+                    return self._embed_request(text)
+                except Exception as retry_e:
+                    log.warning(f"Ollama embedding failed after restart: {retry_e}")
             return None
+
+    def _embed_request(self, text: str) -> list[float]:
+        """Raw embedding request to Ollama. Raises on failure."""
+        import httpx
+        with httpx.Client(timeout=15) as client:
+            response = client.post(
+                f"{self.config.ollama_url}/api/embeddings",
+                json={
+                    "model": self.config.ollama_embed_model,
+                    "prompt": text,
+                },
+            )
+            response.raise_for_status()
+            return response.json()["embedding"]
+
+    def _try_restart_ollama(self) -> bool:
+        """Attempt to restart Ollama if auto-restart is enabled.
+
+        Returns True if restart succeeded and Ollama is responding.
+        Tracks attempts to avoid infinite restart loops.
+        """
+        if not self.config.ollama_auto_restart:
+            return False
+        if self._ollama_restart_attempts >= self.config.ollama_restart_max_attempts:
+            log.warning(
+                f"Ollama restart skipped: max attempts ({self.config.ollama_restart_max_attempts}) reached"
+            )
+            return False
+
+        self._ollama_restart_attempts += 1
+        log.info(
+            f"Attempting Ollama restart ({self._ollama_restart_attempts}/"
+            f"{self.config.ollama_restart_max_attempts}): {self.config.ollama_restart_command}"
+        )
+
+        try:
+            subprocess.run(
+                self.config.ollama_restart_command.split(),
+                timeout=10,
+                capture_output=True,
+            )
+        except Exception as e:
+            log.warning(f"Ollama restart command failed: {e}")
+            return False
+
+        # Wait for Ollama to come up
+        time.sleep(self.config.ollama_restart_wait_seconds)
+
+        # Verify it's actually responding
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"{self.config.ollama_url}/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status == 200:
+                    log.info("Ollama restart successful — service responding")
+                    self._ollama_restart_attempts = 0  # reset on success
+                    return True
+        except Exception:
+            pass
+
+        log.warning("Ollama restart attempted but service not responding")
+        return False
 
     def _store_to_qdrant(self, summary: str, metadata: dict):
         """Embed and store to Qdrant."""

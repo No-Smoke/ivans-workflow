@@ -211,11 +211,17 @@ Use pipeline history to identify:
 
 Move hardcoded Qdrant/Neo4j credentials from config.py to environment variables loaded from Bitwarden CLI, matching the Boris workflow launch script pattern.
 
-### 3.0.4 — Self-healing Ollama
+### 3.0.4 — Self-healing Ollama ✅
 
-**Effort:** Small (1 hr) | **Impact:** Low
+**Effort:** Small (1 hr) | **Impact:** Low | **Completed:** 2026-02-19
 
-If Ollama is unreachable, attempt to start it (`systemctl --user start ollama` or `ollama serve`). Retry memory operations after Ollama recovers.
+If Ollama is unreachable during embedding, automatically attempt restart and retry the operation.
+
+**Implementation (completed):**
+- `config.py`: Added `ollama_auto_restart` (bool, default True), `ollama_restart_command` (str, default `systemctl --user start ollama`), `ollama_restart_max_attempts` (int, 2), `ollama_restart_wait_seconds` (float, 5.0)
+- `memory.py`: Refactored `_embed()` into `_embed()` (orchestrator with retry) + `_embed_request()` (raw HTTP). New `_try_restart_ollama()` runs restart command, waits, verifies `/api/tags` responds. Attempt counter resets on success, caps at max to prevent loops.
+- Pattern matches Phase 2.4.1 crash recovery: attempt → cooldown → max retries → degrade gracefully
+- config.py 128→133 lines, memory.py 404→463 lines
 
 ---
 

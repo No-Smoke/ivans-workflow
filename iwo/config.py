@@ -57,6 +57,12 @@ class IWOConfig:
     notification_webhook_url: Optional[str] = None  # e.g., n8n webhook URL
     notification_webhook_timeout: int = 10  # seconds
 
+    # --- Self-Healing Ollama (Phase 3.0.4) ---
+    ollama_auto_restart: bool = True  # attempt restart if Ollama unreachable
+    ollama_restart_command: str = "systemctl --user start ollama"
+    ollama_restart_max_attempts: int = 2
+    ollama_restart_wait_seconds: float = 5.0  # wait after restart before retrying
+
     # Agents that require human approval before IWO sends the command
     human_gate_agents: set[str] = field(default_factory=lambda: {"deployer"})
 
