@@ -24,6 +24,7 @@ from .config import IWOConfig
 from .daemon import IWODaemon
 from .state import AgentState
 from .pipeline import SpecPipeline
+from .metrics import MetricsCollector, PipelineMetrics
 
 log = logging.getLogger("iwo.tui")
 
@@ -206,6 +207,35 @@ class HandoffPanel(Container):
             yield Static("", id=f"handoff-{i}", classes="handoff-row")
 
 
+class MetricsPanel(Container):
+    """Pipeline performance metrics from Neo4j."""
+
+    DEFAULT_CSS = """
+    MetricsPanel {
+        height: auto;
+        border: solid $accent;
+        padding: 0 1;
+    }
+    MetricsPanel > Static.panel-title {
+        text-style: bold;
+    }
+    MetricsPanel > Static.metrics-row {
+        height: 1;
+    }
+    """
+
+    MAX_AGENT_ROWS = 6
+
+    def compose(self) -> ComposeResult:
+        yield Static("METRICS", classes="panel-title")
+        yield Static("", id="metrics-summary", classes="metrics-row")
+        yield Static("", id="metrics-throughput", classes="metrics-row")
+        yield Static("", id="metrics-bottleneck", classes="metrics-row")
+        yield Static(" ─── Agent Cycle Times ───", classes="metrics-row")
+        for i in range(self.MAX_AGENT_ROWS):
+            yield Static("", id=f"metrics-agent-{i}", classes="metrics-row")
+
+
 # ── Log Handler ──────────────────────────────────────────────────────
 
 class TUILogHandler(logging.Handler):
@@ -287,7 +317,9 @@ class IWOApp(App):
         self._recon_timer: Optional[Timer] = None
         self._display_timer: Optional[Timer] = None
         self._health_timer: Optional[Timer] = None
+        self._metrics_timer: Optional[Timer] = None
         self._memory_health: dict[str, bool] = {"qdrant": False, "neo4j": False, "ollama": False}
+        self._metrics: Optional[PipelineMetrics] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -301,6 +333,7 @@ class IWOApp(App):
             yield MemoryHealthPanel(id="memory-panel")
             yield SafetyPanel(id="safety-panel")
         with Vertical(id="right-col"):
+            yield MetricsPanel(id="metrics-panel")
             yield HandoffPanel(id="handoff-panel")
         with Container(id="log-panel"):
             yield RichLog(
@@ -343,9 +376,11 @@ class IWOApp(App):
         self._recon_timer = self.set_interval(recon_interval, self._reconcile)
         self._display_timer = self.set_interval(1.0, self._update_display)
         self._health_timer = self.set_interval(60.0, self._check_memory_health)
+        self._metrics_timer = self.set_interval(60.0, self._refresh_metrics)
 
-        # Run initial health check
+        # Run initial health check and metrics
         self._check_memory_health()
+        self._refresh_metrics()
 
     def _poll_states(self) -> None:
         """Poll agent state machines."""
@@ -365,6 +400,7 @@ class IWOApp(App):
         self._update_agents()
         self._update_pipelines()
         self._update_memory_health()
+        self._update_metrics()
         self._update_safety()
         self._update_handoffs()
 
@@ -376,6 +412,13 @@ class IWOApp(App):
             self._memory_health = self.daemon.memory.health_check()
         else:
             self._memory_health = {"qdrant": False, "neo4j": False, "ollama": False}
+
+    def _refresh_metrics(self) -> None:
+        """Refresh pipeline metrics from Neo4j. Called every 60s."""
+        if self._paused:
+            return
+        if self.daemon.metrics:
+            self._metrics = self.daemon.metrics.collect()
 
     def _update_status_bar(self) -> None:
         status = self.query_one("#status-bar", StatusBar)
@@ -469,6 +512,72 @@ class IWOApp(App):
                 self.query_one(f"#mem-{service}", Static).update(
                     f" {icon} [{color}]{label}[/]"
                 )
+            except Exception:
+                pass
+
+    def _update_metrics(self) -> None:
+        """Update pipeline metrics panel."""
+        m = self._metrics
+        if not m or m.total_handoffs == 0:
+            try:
+                self.query_one("#metrics-summary", Static).update(
+                    " [dim]No handoff data yet[/]"
+                )
+                self.query_one("#metrics-throughput", Static).update("")
+                self.query_one("#metrics-bottleneck", Static).update("")
+                for i in range(MetricsPanel.MAX_AGENT_ROWS):
+                    self.query_one(f"#metrics-agent-{i}", Static).update("")
+            except Exception:
+                pass
+            return
+
+        # Summary line
+        rej_pct = round(m.total_rejections / m.total_handoffs * 100) if m.total_handoffs else 0
+        rej_color = "red" if rej_pct > 20 else "yellow" if rej_pct > 10 else "green"
+        try:
+            self.query_one("#metrics-summary", Static).update(
+                f" Handoffs: [cyan]{m.total_handoffs}[/] │ "
+                f"Rejections: [{rej_color}]{m.total_rejections} ({rej_pct}%)[/]"
+            )
+        except Exception:
+            pass
+
+        # Throughput
+        try:
+            self.query_one("#metrics-throughput", Static).update(
+                f" Throughput: [cyan]{m.handoffs_per_hour}/hr[/] (24h avg)"
+            )
+        except Exception:
+            pass
+
+        # Bottleneck
+        try:
+            if m.bottleneck_agent:
+                self.query_one("#metrics-bottleneck", Static).update(
+                    f" Bottleneck: [red]{m.bottleneck_agent}[/]"
+                )
+            else:
+                self.query_one("#metrics-bottleneck", Static).update("")
+        except Exception:
+            pass
+
+        # Per-agent rows (sorted by cycle time, slowest first)
+        agents = sorted(m.agent_metrics, key=lambda a: -a.avg_cycle_minutes)
+        for i in range(MetricsPanel.MAX_AGENT_ROWS):
+            try:
+                widget = self.query_one(f"#metrics-agent-{i}", Static)
+                if i < len(agents):
+                    a = agents[i]
+                    name = a.agent.ljust(10)
+                    cycle = f"{a.avg_cycle_minutes:.0f}m" if a.avg_cycle_minutes else "—"
+                    rej = f"{a.rejection_rate:.0%}" if a.rejection_count else "0%"
+                    r_color = "red" if a.rejection_rate > 0.2 else "dim"
+                    widget.update(
+                        f" {name} [cyan]{cycle:>5}[/] │ "
+                        f"rej: [{r_color}]{rej}[/] │ n={a.handoff_count}"
+                    )
+                else:
+                    widget.update("")
             except Exception:
                 pass
 

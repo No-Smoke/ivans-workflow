@@ -47,6 +47,7 @@ from .commander import TmuxCommander
 from .state import AgentState, AgentStateMachine
 from .memory import IWOMemory
 from .pipeline import PipelineManager
+from .metrics import MetricsCollector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,6 +143,9 @@ class IWODaemon:
         # Phase 2.4.1: Crash recovery tracking
         self._respawn_attempts: dict[str, int] = {}  # agent_name → attempt count
         self._respawn_cooldown: dict[str, float] = {}  # agent_name → last attempt time
+
+        # Phase 2.5.1: Metrics collector (initialized after memory)
+        self.metrics: Optional[MetricsCollector] = None
 
     def _init_state_machines(self):
         """Create state machines for all discovered agents."""
@@ -686,6 +690,10 @@ class IWODaemon:
                 log.info("Memory integration active")
             else:
                 log.warning("Memory integration unavailable — continuing without persistence")
+
+        # 7. Initialize metrics collector (uses memory's Neo4j connection)
+        self.metrics = MetricsCollector(self.memory)
+        log.info("Metrics collector initialized")
 
         self._notify("IWO v1.0 started — state machine active")
         return True

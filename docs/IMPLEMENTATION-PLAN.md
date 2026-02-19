@@ -144,22 +144,20 @@ Added `health_check()` method to IWOMemory: pings Qdrant (list collections), Neo
 
 ## Phase 2.5: Metrics & Observability (Medium Priority)
 
-### 2.5.1 — Pipeline metrics dashboard
+### 2.5.1 — Pipeline metrics dashboard ✅
 
-**Effort:** Medium (3 hr) | **Impact:** Medium
-**Files:** New `iwo/metrics.py`, `iwo/tui.py`
+**Effort:** Medium (3 hr) | **Impact:** Medium | **Completed:** 2026-02-19
+**Files:** New `iwo/metrics.py`, `iwo/daemon.py`, `iwo/tui.py`
 
-Now that memory stores every handoff with timing, add a TUI panel or command showing:
+New `MetricsCollector` queries Neo4j HandoffEvent nodes for pipeline performance data: per-agent cycle times (via NEXT_HANDOFF chain timing), rejection rates per agent, handoffs-per-hour throughput (24h window), and bottleneck identification (slowest agent). Results cached with 60s TTL. TUI MetricsPanel displays summary, throughput, bottleneck indicator, and per-agent rows sorted by cycle time.
 
-- Average cycle time per agent (Builder: 45min, Reviewer: 12min, etc.)
-- Rejection rate per agent pair
-- Specs completed per day/week
-- Current pipeline bottleneck identification
-- Time-to-completion estimates based on historical data
+**Implementation (completed):**
+- New `iwo/metrics.py` (162 lines): `MetricsCollector`, `AgentMetrics`, `PipelineMetrics` dataclasses, Cypher aggregation queries
+- `daemon.py`: MetricsCollector initialized after memory, exposed as `daemon.metrics`
+- `tui.py`: MetricsPanel widget with summary/throughput/bottleneck/per-agent rows, refreshed every 60s
+- Graceful degradation: returns empty metrics if Neo4j unavailable
 
-Data source: Neo4j HandoffEvent nodes via Cypher aggregation queries.
-
-**Acceptance criteria:** `iwo metrics` command or TUI panel shows real pipeline performance data.
+**Acceptance criteria:** ✅ TUI panel shows real pipeline performance data when Neo4j has HandoffEvent nodes. Empty state handled gracefully.
 
 ### 2.5.2 — Webhook/notification integration
 
