@@ -135,19 +135,14 @@ health_check_timeout: int = 10
 
 **Acceptance criteria:** Deploy success → automatic health check → green notification or rollback warning.
 
-### 2.4.3 — Memory health indicator in TUI
+### 2.4.3 — Memory health indicator in TUI ✅
 
-**Effort:** Small (1 hr) | **Impact:** Low
-**Files:** `iwo/tui.py`, `iwo/memory.py`
+**Effort:** Small (1 hr) | **Impact:** Low | **Completed:** 2026-02-19
+**Files:** `iwo/memory.py`, `iwo/tui.py`
 
-Add a status line to TUI showing memory system health:
-- 🟢 Qdrant + Neo4j + Ollama all connected
-- 🟡 Partial (e.g., Ollama down, Neo4j OK)
-- 🔴 All memory systems unavailable
+Added `health_check()` method to IWOMemory: pings Qdrant (list collections), Neo4j (verify_connectivity), and Ollama (API tags endpoint) with short timeouts. New MemoryHealthPanel in TUI with traffic-light indicators polled every 60 seconds.
 
-Periodic health check every 60s.
-
-**Acceptance criteria:** TUI shows memory health status. Color changes within 60s of service up/down.
+**Acceptance criteria:** ✅ TUI shows memory health status. Color changes within 60s of service up/down.
 
 ---
 
