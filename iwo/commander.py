@@ -295,3 +295,77 @@ class TmuxCommander:
 
     def get_agent(self, name: str) -> Optional[AgentPane]:
         return self.agents.get(name)
+
+    def respawn_agent(self, agent_name: str) -> bool:
+        """Respawn a crashed agent pane and re-launch Claude Code.
+
+        Steps:
+        1. tmux respawn-pane to get a fresh shell
+        2. cd to project root and launch 'claude'
+        3. Wait for Claude Code prompt (up to 60s)
+        4. Re-tag the pane for IWO discovery
+
+        Returns True if the pane was respawned and Claude Code started.
+        Does NOT send the agent's skill initialization — that happens
+        separately when the agent becomes IDLE and gets activated.
+        """
+        agent = self.agents.get(agent_name)
+        if not agent:
+            log.error(f"Respawn: agent '{agent_name}' not found")
+            return False
+
+        pane = agent.pane
+
+        # 1. Respawn the pane (kills old process, starts fresh shell)
+        try:
+            pane.cmd("respawn-pane", "-k", "-t", pane.pane_id)
+            log.info(f"Respawn: pane respawned for {agent_name}")
+        except Exception as e:
+            log.error(f"Respawn: respawn-pane failed for {agent_name}: {e}")
+            return False
+
+        time.sleep(2)  # Let shell initialize
+
+        # 2. cd to project and launch Claude Code
+        project_dir = str(self.config.project_root)
+        try:
+            pane.send_keys(f"cd {project_dir} && claude", enter=True)
+            log.info(f"Respawn: launched Claude Code for {agent_name}")
+        except Exception as e:
+            log.error(f"Respawn: failed to launch Claude Code for {agent_name}: {e}")
+            return False
+
+        # 3. Wait for Claude Code prompt (poll for up to 60s)
+        import re
+        prompt_pattern = re.compile(r"(❯|Claude Code|claude-code|╭─|Tips for|/help|Opus|Sonnet)")
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            time.sleep(3)
+            try:
+                lines = pane.cmd("capture-pane", "-p", "-J").stdout
+                text = "\n".join(lines[-30:]) if lines else ""
+                if prompt_pattern.search(text):
+                    log.info(f"Respawn: Claude Code ready for {agent_name}")
+                    break
+            except Exception:
+                pass
+        else:
+            log.warning(f"Respawn: Claude Code not detected for {agent_name} after 60s")
+            return False
+
+        # 4. Re-tag the pane
+        try:
+            pane.cmd(
+                "set-option", "-p",
+                "-t", pane.pane_id,
+                self.config.pane_tag_key, agent_name
+            )
+        except Exception:
+            pass  # Non-fatal
+
+        # 5. Re-enable pipe-pane archival
+        if self.config.enable_pipe_pane:
+            agent.setup_pipe_pane(str(self.config.log_dir))
+
+        log.info(f"Respawn: {agent_name} successfully respawned")
+        return True

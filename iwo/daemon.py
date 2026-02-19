@@ -1,7 +1,13 @@
-"""IWO Daemon — Phase 2.3 'Multi-Spec Pipeline'.
+"""IWO Daemon — Phase 2.4 'Operational Robustness'.
 
 Watches for handoff files, validates them, checks agent state via
 state machine, sends canary probe, and routes to next agent.
+
+Phase 2.4.1 additions:
+- Automatic crash recovery (respawn-pane + re-launch Claude Code)
+- Max 3 respawn attempts with 30s cooldown per agent
+- Crash events logged to Neo4j for pattern analysis
+- Permanently crashed agents escalate to human notification
 
 Phase 2.3 additions:
 - Multi-spec pipeline tracking (PipelineManager)
@@ -19,7 +25,7 @@ Phase 1 foundations:
 - Pane tag-based discovery
 
 Design: Three-model consensus (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro).
-Phase 2.3 design: Claude Opus 4.6 interactive session, 2026-02-19.
+Phase 2.3–2.4 design: Claude Opus 4.6 interactive session, 2026-02-19.
 """
 
 import json
@@ -133,6 +139,10 @@ class IWODaemon:
         # Phase 2.3: Multi-spec pipeline manager
         self.pipeline = PipelineManager(max_concurrent=self.config.max_concurrent_specs)
 
+        # Phase 2.4.1: Crash recovery tracking
+        self._respawn_attempts: dict[str, int] = {}  # agent_name → attempt count
+        self._respawn_cooldown: dict[str, float] = {}  # agent_name → last attempt time
+
     def _init_state_machines(self):
         """Create state machines for all discovered agents."""
         self.state_machines.clear()
@@ -158,12 +168,108 @@ class IWODaemon:
                 )
             elif current == AgentState.CRASHED and prev != AgentState.CRASHED:
                 self._notify(
-                    f"💀 {name} has crashed — pane process exited",
+                    f"💀 {name} has crashed — attempting recovery",
                     critical=True,
                 )
+                self._attempt_respawn(name)
 
         # Check if any pending activations can proceed
         self._process_pending_activations()
+
+    def _attempt_respawn(self, agent_name: str):
+        """Attempt to respawn a crashed agent. Max 3 attempts with 30s cooldown.
+
+        Phase 2.4.1: Auto-recovery for crashed panes.
+        """
+        max_attempts = self.config.max_respawn_attempts
+        cooldown = self.config.respawn_cooldown_seconds
+        now = time.time()
+
+        # Check cooldown
+        last_attempt = self._respawn_cooldown.get(agent_name, 0)
+        if now - last_attempt < cooldown:
+            remaining = int(cooldown - (now - last_attempt))
+            log.info(f"Respawn: {agent_name} in cooldown ({remaining}s remaining)")
+            return
+
+        # Check attempt count
+        attempts = self._respawn_attempts.get(agent_name, 0)
+        if attempts >= max_attempts:
+            msg = (
+                f"💀 {agent_name} permanently crashed — "
+                f"exhausted {max_attempts} respawn attempts. Manual intervention required."
+            )
+            log.error(msg)
+            self._notify(msg, critical=True)
+            return
+
+        # Attempt respawn
+        self._respawn_attempts[agent_name] = attempts + 1
+        self._respawn_cooldown[agent_name] = now
+        attempt_num = attempts + 1
+
+        log.info(f"Respawn: attempting {agent_name} (attempt {attempt_num}/{max_attempts})")
+        self._notify(f"🔄 Respawning {agent_name} (attempt {attempt_num}/{max_attempts})")
+
+        success = self.commander.respawn_agent(agent_name)
+
+        if success:
+            # Reset state machine — agent is fresh, will be detected as IDLE on next poll
+            sm = self.state_machines.get(agent_name)
+            if sm:
+                sm.state = AgentState.UNKNOWN
+                sm._output_stable_since = 0.0
+                sm._cursor_stable_since = 0.0
+                sm._last_output_hash = None
+                sm._last_cursor = None
+
+            self._notify(f"✅ {agent_name} respawned successfully (attempt {attempt_num})")
+            log.info(f"Respawn: {agent_name} recovered on attempt {attempt_num}")
+
+            # Log crash event to memory
+            if self.memory:
+                try:
+                    self._log_crash_event(agent_name, attempt_num, recovered=True)
+                except Exception as e:
+                    log.warning(f"Memory: crash event logging failed: {e}")
+        else:
+            self._notify(
+                f"❌ {agent_name} respawn failed (attempt {attempt_num}/{max_attempts})",
+                critical=True,
+            )
+            log.warning(f"Respawn: {agent_name} failed on attempt {attempt_num}")
+
+            if self.memory:
+                try:
+                    self._log_crash_event(agent_name, attempt_num, recovered=False)
+                except Exception as e:
+                    log.warning(f"Memory: crash event logging failed: {e}")
+
+    def _log_crash_event(self, agent_name: str, attempt: int, recovered: bool):
+        """Store crash event to memory for pattern analysis."""
+        if not self.memory or not self.memory._neo4j_driver:
+            return
+
+        try:
+            with self.memory._neo4j_driver.session() as session:
+                session.run(
+                    """
+                    CREATE (c:CrashEvent {
+                        agent: $agent,
+                        timestamp: datetime(),
+                        attempt: $attempt,
+                        recovered: $recovered,
+                        active_spec: $spec
+                    })
+                    """,
+                    agent=agent_name,
+                    attempt=attempt,
+                    recovered=recovered,
+                    spec=self.pipeline.agent_current_spec(agent_name) or "none",
+                )
+            log.info(f"Memory: crash event logged for {agent_name}")
+        except Exception as e:
+            log.warning(f"Memory: crash event log failed: {e}")
 
     def _process_pending_activations(self):
         """Try to activate agents for queued handoffs whose target is now IDLE.

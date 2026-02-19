@@ -39,6 +39,10 @@ class IWOConfig:
     agent_timeout_seconds: int = 1800  # 30 minutes
     max_concurrent_specs: int = 5  # Phase 2.3: pipeline capacity limit
 
+    # --- Agent Crash Recovery (Phase 2.4.1) ---
+    max_respawn_attempts: int = 3  # per agent, before declaring permanently crashed
+    respawn_cooldown_seconds: float = 30.0  # min seconds between respawn attempts
+
     # Agents that require human approval before IWO sends the command
     human_gate_agents: set[str] = field(default_factory=lambda: {"deployer"})
 

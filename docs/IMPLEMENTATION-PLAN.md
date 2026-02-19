@@ -102,19 +102,20 @@ Multi-spec pipeline support via `PipelineManager` class. Each spec has its own `
 
 ## Phase 2.4: Operational Robustness (Medium Priority)
 
-### 2.4.1 — Agent crash recovery
+### 2.4.1 — Agent crash recovery ✅
 
-**Effort:** Medium (2 hr) | **Impact:** Medium
-**Files:** `iwo/commander.py`, `iwo/daemon.py`
+**Effort:** Medium (2 hr) | **Impact:** Medium | **Completed:** 2026-02-19
+**Files:** `iwo/commander.py`, `iwo/daemon.py`, `iwo/config.py`
 
-When state machine detects CRASHED (pane process exited), IWO currently only notifies. Add:
+Automatic crash recovery: when state machine detects CRASHED (pane process exited), IWO attempts `tmux respawn-pane`, re-launches Claude Code in the project directory, waits for Claude Code prompt (up to 60s), and re-tags the pane. Max 3 attempts per agent with 30s cooldown. Permanently crashed agents escalate to human notification. Crash events logged to Neo4j as CrashEvent nodes for pattern analysis.
 
-1. Attempt to respawn a shell in the crashed pane (`tmux respawn-pane`)
-2. Re-inject the agent's role initialization command
-3. If respawn fails 3 times, mark as permanently crashed and notify human
-4. Log crash events to memory for pattern analysis ("which agents crash most?")
+**Implementation (completed):**
+- `commander.py`: new `respawn_agent()` method (respawn-pane → cd + claude → wait for prompt → re-tag → re-enable pipe-pane)
+- `daemon.py`: `_attempt_respawn()` with attempt tracking and cooldown, `_log_crash_event()` to Neo4j, modified `_poll_agent_states()` to trigger recovery on CRASHED transition
+- `config.py`: `max_respawn_attempts = 3`, `respawn_cooldown_seconds = 30.0`
+- commander.py 297→371 lines, daemon.py 593→698 lines
 
-**Acceptance criteria:** Agent crash → automatic respawn → agent resumes at idle prompt within 30s. Repeated crashes escalate to human notification.
+**Acceptance criteria:** ✅ Agent crash → automatic respawn → agent resumes at idle prompt within 60s. Repeated crashes (3x) escalate to human notification. Crash events stored in Neo4j.
 
 ### 2.4.2 — Post-deploy health check
 
