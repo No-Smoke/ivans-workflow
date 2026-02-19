@@ -1,6 +1,6 @@
 # Ivan's Workflow Orchestrator (IWO) — Architecture Guide
 
-**Version:** 2.5.1 | **Updated:** 2026-02-19
+**Version:** 2.5.2 | **Updated:** 2026-02-19
 **Repository:** [No-Smoke/ivans-workflow-orchestrator](https://github.com/No-Smoke/ivans-workflow-orchestrator)
 
 ## Overview
@@ -46,6 +46,8 @@ IWO is designed for the "Boris Cherny Workflow" — a six-agent development pipe
 │  │  - Human gates (deploy approval)                          │  │
 │  │  - Post-deploy health checks                              │  │
 │  │  - Agent crash recovery (auto-respawn, max 3 attempts)    │  │
+│  │  - Webhook/n8n notifications (multi-channel dispatch)     │  │
+│  │  - Self-healing Ollama (auto-restart on embed failure)    │  │
 │  │  - Idempotency tracking                                   │  │
 │  │  - Filesystem reconciliation (30s, all spec dirs)         │  │
 │  └───────────────────────────────────────────────────────────┘  │
@@ -91,7 +93,7 @@ scripts/
 └── migrate_patterns_384_to_1024.py  # One-time pattern library migration
 ```
 
-**Total:** ~3,151 lines across 10 Python modules + migration script.
+**Total:** ~3,265 lines across 10 Python modules + migration script.
 
 ## Core Concepts
 
@@ -387,3 +389,7 @@ Check that Ollama is running (`curl http://localhost:11434/api/tags`), Qdrant is
 | 2.0 | 2026-02-18 | TUI dashboard, daemon refactor |
 | 2.1 | 2026-02-19 | Memory integration (Qdrant + Neo4j), bugfixes |
 | 2.2 | 2026-02-19 | Agent intelligence: enriched parser (deliverables, evidence, review findings), pattern library migration 384→1024-dim, workflow-next context loading (tos-bridge + Neo4j queries with mandatory/best-effort split) |
+| 2.3 | 2026-02-19 | Multi-spec pipeline: PipelineManager, per-agent queuing, rejection-first priority, .active-specs.json |
+| 2.4 | 2026-02-19 | Operational robustness: crash recovery (auto-respawn), post-deploy health checks, memory health TUI |
+| 2.5 | 2026-02-19 | Metrics & observability: pipeline metrics dashboard (Neo4j Cypher), webhook/n8n notification integration |
+| 2.5.2+ | 2026-02-19 | Self-healing Ollama (auto-restart on embed failure, Phase 3.0.4) |
