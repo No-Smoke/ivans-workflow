@@ -37,6 +37,7 @@ class IWOConfig:
     max_rejection_loops: int = 5
     max_handoffs_per_spec: int = 150
     agent_timeout_seconds: int = 1800  # 30 minutes
+    max_concurrent_specs: int = 5  # Phase 2.3: pipeline capacity limit
 
     # Agents that require human approval before IWO sends the command
     human_gate_agents: set[str] = field(default_factory=lambda: {"deployer"})

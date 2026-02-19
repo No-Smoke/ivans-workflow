@@ -23,6 +23,7 @@ from textual.timer import Timer
 from .config import IWOConfig
 from .daemon import IWODaemon
 from .state import AgentState
+from .pipeline import SpecPipeline
 
 log = logging.getLogger("iwo.tui")
 
@@ -42,17 +43,20 @@ STATE_DISPLAY = {
 # ── Widgets ──────────────────────────────────────────────────────────
 
 class StatusBar(Static):
-    """Top status bar: spec name, uptime, handoff count."""
+    """Top status bar: active pipelines, uptime, handoff count, queue depth."""
 
-    spec = reactive("—")
+    specs_info = reactive("—")
     uptime = reactive("0s")
     handoff_count = reactive(0)
+    queue_depth = reactive(0)
 
     def render(self) -> str:
+        q_str = f" │ Queued: [yellow]{self.queue_depth}[/]" if self.queue_depth else ""
         return (
-            f" Spec: [bold]{self.spec}[/] │ "
+            f" Pipelines: [bold]{self.specs_info}[/] │ "
             f"Uptime: [cyan]{self.uptime}[/] │ "
             f"Handoffs: [yellow]{self.handoff_count}[/]"
+            f"{q_str}"
         )
 
 
@@ -103,6 +107,31 @@ class AgentPanel(Container):
         yield Static("AGENTS", classes="panel-title")
         for name in self._agent_names:
             yield AgentRow(name, id=f"agent-{name}")
+
+
+class PipelinePanel(Container):
+    """Panel showing active spec pipelines and their status."""
+
+    DEFAULT_CSS = """
+    PipelinePanel {
+        height: auto;
+        border: solid $accent;
+        padding: 0 1;
+    }
+    PipelinePanel > Static.panel-title {
+        text-style: bold;
+    }
+    PipelinePanel > Static.pipeline-row {
+        height: 1;
+    }
+    """
+
+    MAX_ROWS = 6
+
+    def compose(self) -> ComposeResult:
+        yield Static("PIPELINES", classes="panel-title")
+        for i in range(self.MAX_ROWS):
+            yield Static("", id=f"pipeline-{i}", classes="pipeline-row")
 
 
 class SafetyPanel(Container):
@@ -242,6 +271,7 @@ class IWOApp(App):
                 list(self.config.agent_window_map.keys()),
                 id="agent-panel",
             )
+            yield PipelinePanel(id="pipeline-panel")
             yield SafetyPanel(id="safety-panel")
         with Vertical(id="right-col"):
             yield HandoffPanel(id="handoff-panel")
@@ -302,21 +332,28 @@ class IWOApp(App):
         """Refresh all display widgets from daemon state."""
         self._update_status_bar()
         self._update_agents()
+        self._update_pipelines()
         self._update_safety()
         self._update_handoffs()
 
     def _update_status_bar(self) -> None:
         status = self.query_one("#status-bar", StatusBar)
 
-        # Current spec
-        spec_file = self.config.handoffs_dir / ".current-spec"
-        if spec_file.exists():
-            try:
-                status.spec = spec_file.read_text().strip()
-            except Exception:
-                status.spec = "—"
+        # Pipeline summary
+        pm = self.daemon.pipeline
+        active = pm.active_count
+        total = len(pm.all_pipelines)
+        if total == 0:
+            status.specs_info = "none"
+        elif active == 1:
+            # Show single spec name for backward-compat feel
+            active_specs = [p for p in pm.all_pipelines if p.status == "active"]
+            status.specs_info = active_specs[0].spec_id if active_specs else "none"
         else:
-            status.spec = "—"
+            status.specs_info = f"{active} active / {total} total"
+
+        # Queue depth
+        status.queue_depth = pm.total_queued()
 
         # Uptime
         elapsed = time.time() - self.daemon._started_at
@@ -354,8 +391,35 @@ class IWOApp(App):
             except Exception:
                 pass
 
+    def _update_pipelines(self) -> None:
+        """Update pipeline status panel."""
+        pipelines = self.daemon.pipeline.all_pipelines
+        status_icons = {
+            "active": "🟢",
+            "queued": "🟡",
+            "halted": "🔴",
+            "completed": "✅",
+        }
+        for i in range(PipelinePanel.MAX_ROWS):
+            try:
+                widget = self.query_one(f"#pipeline-{i}", Static)
+                if i < len(pipelines):
+                    p = pipelines[i]
+                    icon = status_icons.get(p.status, "○")
+                    agent = p.current_agent or "—"
+                    count = f"({p.handoff_count})"
+                    color = "green" if p.status == "active" else "dim"
+                    widget.update(
+                        f" {icon} [{color}]{p.spec_id:<20}[/] {agent:<10} {count}"
+                    )
+                else:
+                    widget.update("")
+            except Exception:
+                pass
+
     def _update_safety(self) -> None:
         tracker = self.daemon.tracker
+        pm = self.daemon.pipeline
 
         # Rejection counts (show max across all pairs)
         max_rej = max(tracker._rejection_counts.values(), default=0)
@@ -367,19 +431,19 @@ class IWOApp(App):
         except Exception:
             pass
 
-        # Total handoffs for current spec
-        spec_file = self.config.handoffs_dir / ".current-spec"
-        spec_id = "—"
-        if spec_file.exists():
-            try:
-                spec_id = spec_file.read_text().strip()
-            except Exception:
-                pass
-        ho_count = tracker._spec_handoff_counts.get(spec_id, 0)
-        ho_color = "red" if ho_count >= self.config.max_handoffs_per_spec - 10 else "green"
+        # Total handoffs across all active specs
+        active_specs = [p for p in pm.all_pipelines if p.status == "active"]
+        if active_specs:
+            max_ho = max(
+                tracker._spec_handoff_counts.get(p.spec_id, 0)
+                for p in active_specs
+            )
+        else:
+            max_ho = 0
+        ho_color = "red" if max_ho >= self.config.max_handoffs_per_spec - 10 else "green"
         try:
             self.query_one("#safety-handoffs", Static).update(
-                f" Handoffs: [{ho_color}]{ho_count}/{self.config.max_handoffs_per_spec}[/]"
+                f" Max handoffs: [{ho_color}]{max_ho}/{self.config.max_handoffs_per_spec}[/]"
             )
         except Exception:
             pass
@@ -392,12 +456,12 @@ class IWOApp(App):
         except Exception:
             pass
 
-        # Pending activations
-        pending = len(self.daemon._pending_activations)
-        p_color = "yellow" if pending > 0 else "dim"
+        # Total queued activations across all agents
+        total_queued = pm.total_queued()
+        q_color = "yellow" if total_queued > 0 else "dim"
         try:
             self.query_one("#safety-pending", Static).update(
-                f" Pending: [{p_color}]{pending}[/]"
+                f" Queued: [{q_color}]{total_queued}[/]"
             )
         except Exception:
             pass

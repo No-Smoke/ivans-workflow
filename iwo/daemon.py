@@ -1,9 +1,16 @@
-"""IWO Daemon — Phase 1.0 'State Machine'.
+"""IWO Daemon — Phase 2.3 'Multi-Spec Pipeline'.
 
 Watches for handoff files, validates them, checks agent state via
 state machine, sends canary probe, and routes to next agent.
 
-Phase 1 additions over 0.5:
+Phase 2.3 additions:
+- Multi-spec pipeline tracking (PipelineManager)
+- Per-agent handoff queuing with rejection-first priority
+- All spec dirs scanned (not just .current-spec)
+- .active-specs.json for external visibility
+- Agent assignment tracking (who's working on what)
+
+Phase 1 foundations:
 - Agent state machine (IDLE/PROCESSING/STUCK/WAITING_HUMAN/CRASHED)
 - Canary probe before command injection
 - Pre-activation state validation
@@ -12,6 +19,7 @@ Phase 1 additions over 0.5:
 - Pane tag-based discovery
 
 Design: Three-model consensus (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro).
+Phase 2.3 design: Claude Opus 4.6 interactive session, 2026-02-19.
 """
 
 import json
@@ -32,6 +40,7 @@ from .parser import Handoff
 from .commander import TmuxCommander
 from .state import AgentState, AgentStateMachine
 from .memory import IWOMemory
+from .pipeline import PipelineManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,6 +130,9 @@ class IWODaemon:
         # Phase 2.1: Memory integration
         self.memory: Optional[IWOMemory] = None
 
+        # Phase 2.3: Multi-spec pipeline manager
+        self.pipeline = PipelineManager(max_concurrent=self.config.max_concurrent_specs)
+
     def _init_state_machines(self):
         """Create state machines for all discovered agents."""
         self.state_machines.clear()
@@ -154,33 +166,50 @@ class IWODaemon:
         self._process_pending_activations()
 
     def _process_pending_activations(self):
-        """Try to activate agents for queued handoffs whose target is now IDLE."""
-        if not self._pending_activations:
-            return
+        """Try to activate agents for queued handoffs whose target is now IDLE.
 
-        still_pending = []
-        for handoff, path in self._pending_activations:
-            target = handoff.target_agent
-            sm = self.state_machines.get(target)
-            if sm and sm.state == AgentState.IDLE:
-                log.info(f"Pending activation: {target} is now IDLE, activating...")
-                success = self.commander.activate_agent(target)
-                if success:
-                    sm.mark_command_sent()
-                    self._notify(f"✅ Activated {target} for {handoff.spec_id} (#{handoff.sequence})")
-                else:
-                    self._notify(f"❌ Failed to activate {target}", critical=True)
-                    still_pending.append((handoff, path))  # Retry later
-            else:
-                state_str = sm.state.value if sm else "unknown"
-                still_pending.append((handoff, path))
+        Phase 2.3: Uses PipelineManager queue with rejection-first priority.
+        Also checks the legacy _pending_activations list for backward compat.
+        """
+        # Legacy pending list (Phase 1 — migrate items to pipeline queue)
+        if self._pending_activations:
+            for handoff, path in self._pending_activations:
+                self.pipeline.enqueue(handoff, path)
+            self._pending_activations.clear()
+            log.info("Migrated legacy pending activations to pipeline queue")
 
-        if len(still_pending) != len(self._pending_activations):
-            log.info(f"Pending activations: {len(still_pending)} remaining")
-        self._pending_activations = still_pending
+        # Check each agent's queue
+        for name, sm in self.state_machines.items():
+            if sm.state != AgentState.IDLE:
+                continue
+            if self.pipeline.is_agent_busy(name):
+                continue  # Agent has an assignment but state shows IDLE — timing gap
+
+            queued = self.pipeline.dequeue(name)
+            if queued:
+                self._activate_for_handoff(name, queued.handoff, queued.path)
+
+    def _activate_for_handoff(self, agent: str, handoff: Handoff, path: Path):
+        """Send activation command to an agent and update pipeline tracking."""
+        log.info(f"Activating {agent} for {handoff.spec_id} #{handoff.sequence}")
+        success = self.commander.activate_agent(agent)
+        if success:
+            sm = self.state_machines.get(agent)
+            if sm:
+                sm.mark_command_sent()
+            self.pipeline.assign_agent(agent, handoff.spec_id)
+            self._notify(f"✅ Activated {agent} for {handoff.spec_id} (#{handoff.sequence})")
+        else:
+            # Re-queue on failure — will retry next poll cycle
+            self.pipeline.enqueue(handoff, path)
+            self._notify(f"❌ Failed to activate {agent}, re-queued", critical=True)
 
     def process_handoff(self, path: Path):
-        """Parse, validate, and route a handoff file."""
+        """Parse, validate, and route a handoff file.
+
+        Phase 2.3: Pipeline-aware routing with per-agent queuing and
+        rejection-first priority.
+        """
         # 1. Parse and validate
         try:
             with open(path) as f:
@@ -211,21 +240,26 @@ class IWODaemon:
             msg = f"HALT: {handoff.spec_id} exceeded {self.config.max_handoffs_per_spec} handoffs"
             log.error(msg)
             self._notify(msg, critical=True)
+            self.pipeline.mark_halted(handoff.spec_id, "handoff limit exceeded")
             return
 
         if self.tracker.check_rejection_loop(handoff, self.config.max_rejection_loops):
             msg = f"HALT: Rejection loop detected in {handoff.spec_id}"
             log.error(msg)
             self._notify(msg, critical=True)
+            self.pipeline.mark_halted(handoff.spec_id, "rejection loop")
             return
 
-        # 4. Mark processed
+        # 4. Mark processed and record in history
         self.tracker.mark_processed(handoff)
         self.handoff_history.insert(0, handoff)
         if len(self.handoff_history) > self._max_history:
             self.handoff_history.pop()
 
-        # 4.1 Store to memory (best-effort, non-blocking)
+        # 5. Pipeline bookkeeping: update spec pipeline, release source agent
+        self.pipeline.record_handoff(handoff)
+
+        # 5.1 Store to memory (best-effort, non-blocking)
         if self.memory:
             try:
                 proc_start = time.monotonic()
@@ -235,10 +269,13 @@ class IWODaemon:
             except Exception as e:
                 log.warning(f"Memory: store failed (non-fatal): {e}")
 
-        # 5. Update LATEST.json symlink
+        # 6. Update LATEST.json symlink
         self._update_latest(path, handoff)
 
-        # 6. Human gate check
+        # 7. Write .active-specs.json for external visibility
+        self._write_active_specs()
+
+        # 8. Human gate check
         target = handoff.target_agent
         if target in self.config.human_gate_agents:
             msg = (
@@ -249,79 +286,113 @@ class IWODaemon:
             self._notify(msg, critical=True)
             return
 
-        # 7. Phase 1: Check target agent state before activating
+        # 9. Route to target agent (pipeline-aware)
         sm = self.state_machines.get(target)
-        if sm:
-            if sm.state == AgentState.IDLE:
-                # Agent is idle — activate immediately
-                log.info(f"Target {target} is IDLE — activating now")
-                time.sleep(1)  # Brief settle
-                success = self.commander.activate_agent(target)
-                if success:
-                    sm.mark_command_sent()
-                    self._notify(f"✅ Activated {target} for {handoff.spec_id} (#{handoff.sequence})")
-                else:
-                    self._notify(f"❌ Failed to activate {target}", critical=True)
-            elif sm.state in (AgentState.PROCESSING, AgentState.UNKNOWN):
-                # Agent is busy or state unknown — queue for later
-                log.info(f"Target {target} is {sm.state.value} — queuing activation")
-                self._pending_activations.append((handoff, path))
-                self._notify(
-                    f"⏸️ Queued {target} activation for {handoff.spec_id} "
-                    f"(agent is {sm.state.value})"
-                )
-            elif sm.state in (AgentState.STUCK, AgentState.WAITING_HUMAN, AgentState.CRASHED):
-                # Agent is in a bad state — notify and queue
-                msg = (
-                    f"⚠️ Target {target} is {sm.state.value} — "
-                    f"cannot activate for {handoff.spec_id}. Queued."
-                )
-                log.warning(msg)
-                self._notify(msg, critical=True)
-                self._pending_activations.append((handoff, path))
-        else:
-            # No state machine (shouldn't happen) — fall back to direct activation
+        if not sm:
             log.warning(f"No state machine for {target}, activating directly")
             time.sleep(2)
-            success = self.commander.activate_agent(target)
-            if success:
-                self._notify(f"✅ Activated {target} for {handoff.spec_id} (#{handoff.sequence})")
-            else:
-                self._notify(f"❌ Failed to activate {target}", critical=True)
+            self._activate_for_handoff(target, handoff, path)
+            return
+
+        agent_busy_with = self.pipeline.agent_current_spec(target)
+        target_idle = sm.state == AgentState.IDLE
+
+        if target_idle and not agent_busy_with:
+            # Agent is idle and free — activate immediately
+            log.info(f"Target {target} is IDLE and free — activating now")
+            time.sleep(1)
+            self._activate_for_handoff(target, handoff, path)
+
+        elif target_idle and agent_busy_with and agent_busy_with != handoff.spec_id:
+            # Agent shows IDLE but pipeline thinks it's on another spec.
+            # This likely means the agent finished but we haven't seen the
+            # handoff yet (timing). Release and activate.
+            log.info(
+                f"Target {target} is IDLE but assigned to {agent_busy_with} — "
+                f"releasing stale assignment, activating for {handoff.spec_id}"
+            )
+            self.pipeline.release_agent(target)
+            time.sleep(1)
+            self._activate_for_handoff(target, handoff, path)
+
+        elif agent_busy_with == handoff.spec_id:
+            # Same spec — could be a re-injection or timing overlap. Activate.
+            log.info(f"Target {target} already assigned to {handoff.spec_id} — activating")
+            time.sleep(1)
+            self._activate_for_handoff(target, handoff, path)
+
+        elif sm.state in (AgentState.PROCESSING, AgentState.UNKNOWN):
+            # Agent is busy (likely with another spec) — queue
+            reason = f"agent is {sm.state.value}"
+            if agent_busy_with:
+                reason += f" on {agent_busy_with}"
+            log.info(f"Target {target} busy ({reason}) — queuing {handoff.spec_id}")
+            self.pipeline.enqueue(handoff, path)
+            self._notify(
+                f"⏸️ Queued {handoff.spec_id} → {target} ({reason})"
+            )
+
+        elif sm.state in (AgentState.STUCK, AgentState.WAITING_HUMAN, AgentState.CRASHED):
+            # Agent in bad state — queue and notify
+            msg = (
+                f"⚠️ Target {target} is {sm.state.value} — "
+                f"queuing {handoff.spec_id}"
+            )
+            log.warning(msg)
+            self._notify(msg, critical=True)
+            self.pipeline.enqueue(handoff, path)
+
+        else:
+            # Fallback: queue it
+            log.info(f"Target {target}: unexpected state, queuing {handoff.spec_id}")
+            self.pipeline.enqueue(handoff, path)
+
+        # 10. After processing, check if the released source agent has queued work
+        source = handoff.source_agent
+        source_sm = self.state_machines.get(source)
+        if source_sm and source_sm.state == AgentState.IDLE:
+            if not self.pipeline.is_agent_busy(source):
+                queued = self.pipeline.dequeue(source)
+                if queued:
+                    log.info(f"Queue drain: {source} freed from {handoff.spec_id}, activating queued work")
+                    self._activate_for_handoff(source, queued.handoff, queued.path)
 
     def _reconcile_filesystem(self):
-        """Periodic scan to catch missed inotify events. Called every 30s."""
-        current_spec_file = self.config.handoffs_dir / ".current-spec"
-        if not current_spec_file.exists():
+        """Periodic scan to catch missed inotify events. Called every 30s.
+
+        Phase 2.3: Scans ALL spec subdirectories, not just .current-spec.
+        """
+        if not self.config.handoffs_dir.exists():
             return
 
-        try:
-            spec_id = current_spec_file.read_text().strip()
-        except Exception:
-            return
+        # Scan all subdirectories that look like spec dirs
+        for spec_dir in sorted(self.config.handoffs_dir.iterdir()):
+            if not spec_dir.is_dir():
+                continue
+            if spec_dir.name.startswith("."):
+                continue  # Skip .current-spec etc.
 
-        spec_dir = self.config.handoffs_dir / spec_id
-        if not spec_dir.exists():
-            return
+            json_files = sorted(spec_dir.glob("*.json"))
+            json_files = [
+                f for f in json_files
+                if f.name != "LATEST.json" and not f.name.endswith(".tmp")
+            ]
 
-        json_files = sorted(spec_dir.glob("*.json"))
-        json_files = [f for f in json_files if f.name != "LATEST.json" and not f.name.endswith(".tmp")]
+            missed = 0
+            for f in json_files:
+                try:
+                    with open(f) as fh:
+                        data = json.load(fh)
+                    handoff = Handoff(**data)
+                    if not self.tracker.already_processed(handoff):
+                        log.info(f"Reconciliation: found missed handoff {f.name}")
+                        self.process_handoff(f)
+                        missed += 1
+                except Exception:
+                    pass
 
-        missed = 0
-        for f in json_files:
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                handoff = Handoff(**data)
-                if not self.tracker.already_processed(handoff):
-                    log.info(f"Reconciliation: found missed handoff {f.name}")
-                    self.process_handoff(f)
-                    missed += 1
-            except Exception:
-                pass
-
-        if missed > 0:
-            log.info(f"Reconciliation: processed {missed} missed handoff(s)")
+            if missed > 0:
+                log.info(f"Reconciliation: processed {missed} missed handoff(s) for {spec_dir.name}")
 
     def _update_latest(self, handoff_path: Path, handoff: Handoff):
         """Update LATEST.json as a symlink to the current handoff."""
@@ -334,6 +405,30 @@ class IWODaemon:
             log.info(f"LATEST.json → {handoff_path.name}")
         except Exception as e:
             log.warning(f"Failed to update LATEST.json: {e}")
+
+    def _write_active_specs(self):
+        """Write .active-specs.json for external visibility (TUI, other tools).
+
+        Also maintains .current-spec for backward compatibility (set to most recent active spec).
+        """
+        try:
+            specs_file = self.config.handoffs_dir / ".active-specs.json"
+            state = self.pipeline.to_dict()
+            with open(specs_file, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            log.warning(f"Failed to write .active-specs.json: {e}")
+
+        # Backward compat: .current-spec = most recently active spec
+        try:
+            active = [
+                p for p in self.pipeline.all_pipelines if p.status == "active"
+            ]
+            if active:
+                current_spec_file = self.config.handoffs_dir / ".current-spec"
+                current_spec_file.write_text(active[0].spec_id)
+        except Exception:
+            pass
 
     def _notify(self, message: str, critical: bool = False):
         """Send desktop notification via notify-send."""
@@ -433,37 +528,53 @@ class IWODaemon:
         self.run_loop()
 
     def _recover_state(self):
-        """Scan filesystem to reconstruct state after restart."""
-        current_spec_file = self.config.handoffs_dir / ".current-spec"
-        if not current_spec_file.exists():
-            log.info("No active spec found")
+        """Scan filesystem to reconstruct state after restart.
+
+        Phase 2.3: Scans ALL spec directories and rebuilds pipeline state.
+        """
+        if not self.config.handoffs_dir.exists():
+            log.info("No handoffs directory found")
             return
 
-        spec_id = current_spec_file.read_text().strip()
-        spec_dir = self.config.handoffs_dir / spec_id
-        if not spec_dir.exists():
-            log.warning(f"Spec dir not found: {spec_dir}")
-            return
+        total_specs = 0
+        total_handoffs = 0
 
-        json_files = sorted(spec_dir.glob("*.json"))
-        json_files = [f for f in json_files if f.name != "LATEST.json"]
-        if not json_files:
-            log.info(f"No handoffs found for {spec_id}")
-            return
+        for spec_dir in sorted(self.config.handoffs_dir.iterdir()):
+            if not spec_dir.is_dir():
+                continue
+            if spec_dir.name.startswith("."):
+                continue
 
-        latest = json_files[-1]
-        log.info(f"Recovery: spec={spec_id}, latest={latest.name}")
+            spec_id = spec_dir.name
+            json_files = sorted(spec_dir.glob("*.json"))
+            json_files = [
+                f for f in json_files
+                if f.name != "LATEST.json" and not f.name.endswith(".tmp")
+            ]
 
-        for f in json_files:
-            try:
-                with open(f) as fh:
-                    data = json.load(fh)
-                handoff = Handoff(**data)
-                self.tracker.mark_processed(handoff)
-            except Exception:
-                pass
+            if not json_files:
+                continue
 
-        log.info(f"Recovery: marked {len(json_files)} existing handoffs as processed")
+            handoffs = []
+            for f in json_files:
+                try:
+                    with open(f) as fh:
+                        data = json.load(fh)
+                    handoff = Handoff(**data)
+                    self.tracker.mark_processed(handoff)
+                    handoffs.append(handoff)
+                except Exception:
+                    pass
+
+            if handoffs:
+                self.pipeline.recover_from_handoffs(spec_id, handoffs)
+                total_specs += 1
+                total_handoffs += len(handoffs)
+
+        log.info(
+            f"Recovery: {total_specs} spec(s), {total_handoffs} handoff(s) recovered"
+        )
+        self._write_active_specs()
 
 
 def main():

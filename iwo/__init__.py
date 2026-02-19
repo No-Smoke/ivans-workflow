@@ -1,6 +1,6 @@
 """IWO — Ivan's Workflow Orchestrator.
 
-Phase 2.0: TUI Dashboard + State Machine + Canary Probes + Tag Discovery.
+Phase 2.3: Multi-Spec Pipeline + TUI Dashboard + State Machine + Canary Probes.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.3.0"
