@@ -314,15 +314,38 @@ Auditor triggers 007 with diagnostic context
 
 ### 3.5 Deliverables
 
-- [ ] Agent 007 CLAUDE.md with safety rails
-- [ ] Agent 007 skill file for diagnosis workflow
-- [ ] IWO integration: tmux pane 7 setup in launch script
-- [ ] Auditor → 007 trigger mechanism in daemon.py
-- [ ] Retry handoff schema (distinct from normal handoffs)
-- [ ] 007 diagnostic report schema
-- [ ] Integration tests: simulate stall → 007 retries → pipeline resumes
-- [ ] Integration tests: simulate code bug → 007 escalates correctly
+- [x] Agent 007 CLAUDE.md with safety rails → `.claude/skills/agent-007-supervisor/SKILL.md` (eBatt repo, commit 848fd77)
+- [ ] Agent 007 skill file for diagnosis workflow → D2, deferred to post-D4 implementation (per GPT-5.2/Gemini peer review)
+- [ ] IWO integration: tmux pane 7 setup in launch script → D3
+- [ ] Auditor → 007 trigger mechanism in daemon.py → D4
+- [x] Retry handoff schema → `iwo/schemas/retry_handoff.json` (IWO repo, commit 8515d89)
+- [x] 007 diagnostic report schema → `iwo/schemas/diagnostic_report.json` (IWO repo, commit 8515d89)
+- [x] 007 completion signal schema → `iwo/schemas/completion_signal.json` (IWO repo, commit 8515d89)
+- [ ] Integration tests: simulate stall → 007 retries → pipeline resumes → D7
+- [ ] Integration tests: simulate code bug → 007 escalates correctly → D8
 - [ ] Documentation update
+
+### 3.6 Implementation Notes for D3/D4 (from interactive session)
+
+**HandoffHandler must skip 007 files:** The file watcher in `daemon.py` (~line 132) triggers on any `.json` in agent-comms directories. Add filter: `if path.name.startswith("007-"): return`. Otherwise 007's retry handoffs hit Pydantic validation errors.
+
+**Completion detection via file:** Daemon watches for `007-complete-*.json` files in `.audit/` (watchdog or poll). Stdout sentinel `007 COMPLETE` is secondary backup.
+
+**Retry history accumulation:** When auditor triggers 007 for a spec with existing retries, it must read `007-*.json` reports from `.audit/` to build retry_history for the activation prompt.
+
+**is_retry_safe classification (static per check type):**
+- agent_liveness: ✅ retry-safe
+- agent_timeout: ✅ retry-safe
+- stale_assignment: ✅ retry-safe
+- pipeline_consistency: ❌ not retry-safe
+- sequence_continuity: ❌ not retry-safe
+- timestamp_sanity: ❌ not retry-safe
+- queue_inflation: ❌ not retry-safe
+- daemon_heartbeat: ❌ not retry-safe
+
+**Activation model: On-demand.** Pane 7 starts as bash shell. Daemon launches `claude --prompt "<context>"` when triggered. 007 runs, reports, exits. Pane returns to idle.
+
+**D2 (diagnosis skill) deferred to after D4.** Per peer-LLM review (Gemini 2.5 Pro + GPT-5.2), D2 should be co-authored after D4 implementation reveals what telemetry is actually available at trigger time.
 
 ---
 
@@ -377,7 +400,7 @@ Auditor triggers 007 with diagnostic context
 |-------|-------------|----------|---------------|------|--------|
 | 1 | Auditor module | 1-2 | None | Zero | ✅ ~95% (E2E test remaining) |
 | 2 | n8n → ntfy notifications | 1 | Phase 1 | Low | ✅ Complete |
-| 3 | Agent 007 (AI supervisor) | 2-3 | Phases 1+2 | Medium | Not started |
+| 3 | Agent 007 (AI supervisor) | 2-3 | Phases 1+2 | Medium | 🔶 D1/D5/D6/D6a complete, D2-D4/D7-D8 pending |
 | 4 | SmythOS dashboard | TBD | Phases 1-3 stable | Low-High | Future |
 
 ## Design Principles
