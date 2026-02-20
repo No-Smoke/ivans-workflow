@@ -63,8 +63,20 @@ class IWOConfig:
     ollama_restart_max_attempts: int = 2
     ollama_restart_wait_seconds: float = 5.0  # wait after restart before retrying
 
+    # --- Agent 007 (Phase 3) ---
+    agent_007_window: int = 6
+    agent_007_max_retries: int = 3
+    agent_007_timeout_seconds: int = 600  # 10 min max runtime per activation
+    agent_007_budget_usd: float = 5.0  # max API spend per activation
+    agent_007_project_root: Path = Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt"
+
     # Agents that require human approval before IWO sends the command
     human_gate_agents: set[str] = field(default_factory=lambda: {"deployer"})
+
+    # Auto-approve deploys when handoff declares no infrastructure changes
+    # (noNewMigrations=true, noNewSecrets=true, noNewWranglerVars=true).
+    # When False, ALL deploys require manual 'd' key approval.
+    auto_approve_safe_deploys: bool = True
 
     # Debounce: seconds to wait after file creation before reading
     file_debounce_seconds: float = 1.5
@@ -84,7 +96,7 @@ class IWOConfig:
     # NOTE: IWO_READY> was the consensus design, but Claude Code manages its
     # own prompt. Default matches Claude Code's actual `> ` prompt.
     # Override if using a custom shell with PS1='IWO_READY> '.
-    idle_prompt_pattern: str = r"[❯>]\s*$"  # Claude Code uses ❯, fallback matches >
+    idle_prompt_pattern: str = r"[❯>$%#]\s*$"  # Claude Code uses ❯, bash uses $, zsh uses %, root uses #
 
     # Patterns indicating agent needs human input
     waiting_human_patterns: list[str] = field(default_factory=lambda: [

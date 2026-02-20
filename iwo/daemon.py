@@ -48,6 +48,7 @@ from .state import AgentState, AgentStateMachine
 from .memory import IWOMemory
 from .pipeline import PipelineManager
 from .metrics import MetricsCollector
+from .auditor import Auditor, AuditorConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,18 +59,47 @@ log = logging.getLogger("iwo.daemon")
 
 
 class HandoffTracker:
-    """Tracks processed handoffs to prevent duplicates (GPT-5.2's idempotency key)."""
+    """Tracks processed handoffs to prevent duplicates (GPT-5.2's idempotency key).
+
+    Phase 2.7: Supports supersede — if a newer file arrives with the same
+    idempotency key, it replaces the original (e.g., Reviewer redoes work).
+    """
 
     def __init__(self):
         self._processed: set[str] = set()
+        self._processed_paths: dict[str, Path] = {}  # key → path for supersede check
         self._spec_handoff_counts: dict[str, int] = {}
         self._rejection_counts: dict[str, int] = {}  # key: "spec:agent_pair"
 
-    def already_processed(self, handoff: Handoff) -> bool:
-        return handoff.idempotency_key in self._processed
+    def already_processed(self, handoff: Handoff, path: Optional[Path] = None) -> bool:
+        """Check if handoff was already processed.
 
-    def mark_processed(self, handoff: Handoff):
+        If path is provided and a previous file with the same key exists,
+        allow supersede if the new file is different (newer version from
+        the same agent at the same sequence).
+        """
+        key = handoff.idempotency_key
+        if key not in self._processed:
+            return False
+
+        # Same key exists — check for supersede
+        if path and key in self._processed_paths:
+            prev_path = self._processed_paths[key]
+            if path != prev_path:
+                log.info(
+                    f"Supersede: {key} has newer file {path.name} "
+                    f"(replacing {prev_path.name})"
+                )
+                # Allow re-processing — caller will process the newer version
+                self._processed.discard(key)
+                return False
+
+        return True
+
+    def mark_processed(self, handoff: Handoff, path: Optional[Path] = None):
         self._processed.add(handoff.idempotency_key)
+        if path:
+            self._processed_paths[handoff.idempotency_key] = path
         spec = handoff.spec_id
         self._spec_handoff_counts[spec] = self._spec_handoff_counts.get(spec, 0) + 1
 
@@ -106,6 +136,9 @@ class HandoffHandler(FileSystemEventHandler):
         if path.name == "LATEST.json":
             return
         if path.name.endswith(".tmp"):
+            return
+        if path.name.startswith("007-"):
+            log.debug(f"Skipping 007 file: {path.name}")
             return
         log.info(f"New handoff detected: {path.name}")
         time.sleep(self.daemon.config.file_debounce_seconds)
@@ -146,6 +179,9 @@ class IWODaemon:
 
         # Phase 2.5.1: Metrics collector (initialized after memory)
         self.metrics: Optional[MetricsCollector] = None
+
+        # Phase 3.0: Auditor module (Agent 007 Phase 1)
+        self.auditor: Optional[Auditor] = None
 
     def _init_state_machines(self):
         """Create state machines for all discovered agents."""
@@ -406,6 +442,56 @@ class IWODaemon:
             self.pipeline.enqueue(handoff, path)
             self._notify(f"❌ Failed to activate {agent}, re-queued", critical=True)
 
+    def _should_auto_approve_deploy(self, path: Path, handoff: Handoff) -> bool:
+        """Check if a deploy handoff can bypass the human gate.
+
+        Auto-approves when the handoff explicitly declares no infrastructure
+        changes (no new migrations, secrets, or wrangler vars). If the flags
+        are absent or any flag indicates changes, requires human approval.
+
+        Reads the raw JSON because these fields are in deploymentInstructions
+        which is not part of the Pydantic Handoff model.
+
+        Industry best practice: auto-deploy for low-risk (code-only) changes,
+        require human approval for high-risk (infra/DB/secrets) changes.
+        """
+        if not self.config.auto_approve_safe_deploys:
+            return False  # Feature disabled — always gate
+
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+        except Exception:
+            log.warning("Auto-approve: cannot read raw handoff, requiring manual approval")
+            return False
+
+        # Check deploymentInstructions block (used by Planner/Tester handoffs)
+        deploy_info = raw.get("deploymentInstructions", {})
+
+        no_migrations = deploy_info.get("noNewMigrations", False)
+        no_secrets = deploy_info.get("noNewSecrets", False)
+        no_vars = deploy_info.get("noNewWranglerVars", False)
+
+        # All three must be explicitly True for auto-approval
+        if no_migrations and no_secrets and no_vars:
+            log.info(
+                f"Auto-approve check: migrations={no_migrations}, "
+                f"secrets={no_secrets}, vars={no_vars} → SAFE"
+            )
+            return True
+
+        # Log which flags are missing or false
+        flags = {
+            "noNewMigrations": no_migrations,
+            "noNewSecrets": no_secrets,
+            "noNewWranglerVars": no_vars,
+        }
+        missing = [k for k, v in flags.items() if not v]
+        log.info(
+            f"Auto-approve check: UNSAFE — missing or false: {missing}"
+        )
+        return False
+
     def process_handoff(self, path: Path):
         """Parse, validate, and route a handoff file.
 
@@ -432,8 +518,8 @@ class IWODaemon:
             f"[{handoff.status.outcome}] ({handoff.spec_id})"
         )
 
-        # 2. Idempotency check
-        if self.tracker.already_processed(handoff):
+        # 2. Idempotency check (with supersede support for same-sequence redos)
+        if self.tracker.already_processed(handoff, path):
             log.info(f"Already processed {handoff.idempotency_key}, skipping")
             return
 
@@ -453,7 +539,7 @@ class IWODaemon:
             return
 
         # 4. Mark processed and record in history
-        self.tracker.mark_processed(handoff)
+        self.tracker.mark_processed(handoff, path)
         self.handoff_history.insert(0, handoff)
         if len(self.handoff_history) > self._max_history:
             self.handoff_history.pop()
@@ -474,6 +560,18 @@ class IWODaemon:
         # 6. Update LATEST.json symlink
         self._update_latest(path, handoff)
 
+        # 6.1 Stamp canonical received_at time (agents fabricate timestamps)
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+            raw.setdefault("metadata", {})["received_at"] = (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            )
+            with open(path, "w") as f:
+                json.dump(raw, f, indent=2)
+        except Exception as e:
+            log.warning(f"Could not stamp received_at on {path.name}: {e}")
+
         # 7. Write .active-specs.json for external visibility
         self._write_active_specs()
 
@@ -483,15 +581,41 @@ class IWODaemon:
                 and self.config.health_check_urls):
             self._run_post_deploy_health_check(handoff)
 
-        # 8. Human gate check
+        # 8. Human gate check (conditional: auto-approve if no infrastructure changes)
         target = handoff.target_agent
         if target in self.config.human_gate_agents:
-            msg = (
-                f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
-                f"Action: {handoff.nextAgent.action[:100]}"
+            if self._should_auto_approve_deploy(path, handoff):
+                log.info(
+                    f"Deploy auto-approved for {handoff.spec_id}: "
+                    f"no migrations, secrets, or wrangler vars"
+                )
+                self._notify(
+                    f"✅ AUTO-DEPLOY: {handoff.spec_id} → {target} "
+                    f"(no infra changes, bypassing gate)"
+                )
+                # Fall through to step 9 routing instead of returning
+            else:
+                msg = (
+                    f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
+                    f"Infrastructure changes detected — manual approval required. "
+                    f"Action: {handoff.nextAgent.action[:100]}"
+                )
+                log.info(msg)
+                self._notify(msg, critical=True)
+                return
+
+        # 8.5 Terminal targets — pipeline complete, no activation needed
+        if target in ("human", "none"):
+            self.pipeline.mark_completed(handoff.spec_id)
+            self._write_active_specs()
+            self._notify(
+                f"🏁 {handoff.spec_id} → {target} (pipeline complete, "
+                f"{handoff.source_agent} was final agent)"
             )
-            log.info(msg)
-            self._notify(msg, critical=True)
+            log.info(
+                f"Pipeline complete: {handoff.spec_id} → {target} "
+                f"(terminal target, no activation)"
+            )
             return
 
         # 9. Route to target agent (pipeline-aware)
@@ -565,6 +689,13 @@ class IWODaemon:
                     log.info(f"Queue drain: {source} freed from {handoff.spec_id}, activating queued work")
                     self._activate_for_handoff(source, queued.handoff, queued.path)
 
+        # 11. Auditor: post-handoff invariant checks (best-effort)
+        if self.auditor:
+            try:
+                self.auditor.post_handoff_checks(handoff)
+            except Exception as e:
+                log.warning(f"Auditor post-handoff check failed (non-fatal): {e}")
+
     def _reconcile_filesystem(self):
         """Periodic scan to catch missed inotify events. Called every 30s.
 
@@ -583,7 +714,9 @@ class IWODaemon:
             json_files = sorted(spec_dir.glob("*.json"))
             json_files = [
                 f for f in json_files
-                if f.name != "LATEST.json" and not f.name.endswith(".tmp")
+                if f.name != "LATEST.json"
+                and not f.name.endswith(".tmp")
+                and not f.name.startswith("007-")
             ]
 
             missed = 0
@@ -737,6 +870,21 @@ class IWODaemon:
         self.metrics = MetricsCollector(self.memory)
         log.info("Metrics collector initialized")
 
+        # 8. Initialize auditor module (Agent 007 Phase 1)
+        try:
+            self.auditor = Auditor(self, AuditorConfig(
+                webhook_url=self.config.notification_webhook_url,
+            ))
+            log.info("Auditor module initialized")
+
+            # Check if Agent 007 is already running on startup
+            if not self.commander.check_agent_007_idle():
+                self.auditor._007_active = True
+                log.info("Agent 007 appears active on startup — marking as running")
+        except Exception as e:
+            log.warning(f"Auditor initialization failed (non-fatal): {e}")
+            self.auditor = None
+
         self._notify("IWO v1.0 started — state machine active")
         return True
 
@@ -759,6 +907,16 @@ class IWODaemon:
 
                 if tick % recon_every == 0:
                     self._reconcile_filesystem()
+
+                # Auditor periodic checks (self-throttles to 5-min intervals)
+                if self.auditor:
+                    try:
+                        self.auditor.periodic_checks()
+                        completion = self.auditor.check_007_completion()
+                        if completion:
+                            log.info(f"Agent 007 completed: {completion.get('outcome')}")
+                    except Exception as e:
+                        log.warning(f"Auditor check failed (non-fatal): {e}")
 
         except KeyboardInterrupt:
             log.info("Shutting down...")
@@ -803,31 +961,99 @@ class IWODaemon:
             json_files = sorted(spec_dir.glob("*.json"))
             json_files = [
                 f for f in json_files
-                if f.name != "LATEST.json" and not f.name.endswith(".tmp")
+                if f.name != "LATEST.json"
+                and not f.name.endswith(".tmp")
+                and not f.name.startswith("007-")
             ]
 
             if not json_files:
                 continue
 
-            handoffs = []
+            handoff_pairs: list[tuple[Handoff, Path]] = []
             for f in json_files:
                 try:
                     with open(f) as fh:
                         data = json.load(fh)
                     handoff = Handoff(**data)
-                    self.tracker.mark_processed(handoff)
-                    handoffs.append(handoff)
+                    self.tracker.mark_processed(handoff, f)
+                    handoff_pairs.append((handoff, f))
                 except Exception:
                     pass
+
+            handoffs = [h for h, _ in handoff_pairs]
 
             if handoffs:
                 self.pipeline.recover_from_handoffs(spec_id, handoffs)
                 total_specs += 1
                 total_handoffs += len(handoffs)
 
+                # Check if pipeline reached a terminal state
+                latest_handoff, latest_path = handoff_pairs[-1]
+                target = latest_handoff.target_agent
+
+                if target in ("human", "none"):
+                    # Pipeline is complete — mark it and skip unrouted check
+                    self.pipeline.mark_completed(spec_id)
+                    log.info(
+                        f"Recovery: {spec_id} pipeline complete "
+                        f"(target={target})"
+                    )
+                    continue
+
+                # Phase 2.6: Detect unrouted handoffs — the latest handoff
+                # for this spec may never have been dispatched to the target
+                # agent (e.g., if IWO restarted after the file was written
+                # but before routing occurred). Check if the target agent
+                # has produced a subsequent handoff; if not, queue it.
+                #
+                # Note: we already checked if the LATEST handoff targets
+                # human/none above (marks pipeline complete). For multi-sprint
+                # specs, earlier sprints may have targeted human but the
+                # current sprint is active — that's fine, only the latest
+                # handoff matters for unrouted detection.
+
+                target_responded = any(
+                    h.source_agent == target
+                    and h.sequence > latest_handoff.sequence
+                    for h in handoffs
+                )
+                if not target_responded:
+                    # Only queue if the handoff file is recent (last 24h).
+                    # Old unrouted handoffs from abandoned specs should not
+                    # be force-dispatched on every restart.
+                    file_age_hours = (
+                        time.time() - latest_path.stat().st_mtime
+                    ) / 3600
+                    if file_age_hours > 24:
+                        log.info(
+                            f"Recovery: {spec_id} has unrouted handoff "
+                            f"#{latest_handoff.sequence} but file is "
+                            f"{file_age_hours:.0f}h old — skipping"
+                        )
+                        continue
+
+                    # Remove from tracker so process_handoff won't skip it
+                    self.tracker._processed.discard(
+                        latest_handoff.idempotency_key
+                    )
+                    self._pending_activations.append(
+                        (latest_handoff, latest_path)
+                    )
+                    log.info(
+                        f"Recovery: {spec_id} has UNROUTED handoff "
+                        f"#{latest_handoff.sequence} "
+                        f"{latest_handoff.source_agent}→{target} "
+                        f"— queuing for activation"
+                    )
+
         log.info(
             f"Recovery: {total_specs} spec(s), {total_handoffs} handoff(s) recovered"
         )
+        if self._pending_activations:
+            log.info(
+                f"Recovery: {len(self._pending_activations)} unrouted "
+                f"handoff(s) queued for activation"
+            )
         self._write_active_specs()
 
 

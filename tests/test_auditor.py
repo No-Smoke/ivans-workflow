@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from iwo.auditor import Auditor, AuditorConfig, AuditEvent, Severity
+from iwo.auditor import Auditor, AuditorConfig, AuditEvent, RETRY_SAFE_CHECKS, Severity
 from iwo.parser import (
     Handoff,
     HandoffMetadata,
@@ -145,6 +145,30 @@ class MockConfig:
             "deployer": 4,
             "docs": 5,
         }
+        # Agent 007 config
+        self.agent_007_window = 6
+        self.agent_007_max_retries = 3
+        self.agent_007_timeout_seconds = 600
+        self.agent_007_budget_usd = 5.0
+
+
+class MockCommander:
+    """Minimal TmuxCommander stand-in for 007 tests."""
+    def __init__(self):
+        self._007_idle: bool = True
+        self._007_launched: bool = False
+        self._last_prompt_file: Optional[Path] = None
+
+    def launch_agent_007(self, prompt_file: Path) -> bool:
+        if not self._007_idle:
+            return False
+        self._007_launched = True
+        self._007_idle = False
+        self._last_prompt_file = prompt_file
+        return True
+
+    def check_agent_007_idle(self) -> bool:
+        return self._007_idle
 
 
 class MockDaemon:
@@ -152,6 +176,7 @@ class MockDaemon:
     def __init__(self, tmp_path: Path):
         self.config = MockConfig(tmp_path)
         self.pipeline = MockPipelineManager()
+        self.commander = MockCommander()
         self.state_machines: dict[str, MockStateMachine] = {
             name: MockStateMachine()
             for name in self.config.agent_window_map
@@ -556,3 +581,203 @@ class TestGetStatus:
         )
         auditor._emit(event)
         assert auditor.get_status()["events_emitted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Test: Agent 007 — RETRY_SAFE_CHECKS constant
+# ---------------------------------------------------------------------------
+
+class TestRetrySafeChecks:
+    def test_retry_safe_checks_match_plan(self):
+        assert RETRY_SAFE_CHECKS == frozenset({
+            "agent_liveness",
+            "agent_timeout",
+            "stale_assignment",
+        })
+
+
+# ---------------------------------------------------------------------------
+# Test: Agent 007 — _should_trigger_007 guard logic
+# ---------------------------------------------------------------------------
+
+class TestShouldTrigger007:
+    def _make_event(
+        self,
+        severity: Severity = Severity.CRITICAL,
+        check: str = "agent_liveness",
+        spec_id: str = "TEST-SPEC",
+    ) -> AuditEvent:
+        return AuditEvent(
+            timestamp="2026-02-21T04:00:00Z",
+            check=check,
+            severity=severity,
+            spec_id=spec_id,
+            details={"agent": "builder", "minutes_idle": 65},
+            action_taken=None,
+            recommended_action="investigate",
+        )
+
+    def test_triggers_on_critical_retry_safe(self, auditor):
+        event = self._make_event(Severity.CRITICAL, "agent_liveness")
+        assert auditor._should_trigger_007(event) is True
+
+    def test_blocks_on_critical_not_retry_safe(self, auditor):
+        event = self._make_event(Severity.CRITICAL, "pipeline_consistency")
+        assert auditor._should_trigger_007(event) is False
+
+    def test_blocks_on_warning_severity(self, auditor):
+        event = self._make_event(Severity.WARNING, "agent_liveness")
+        assert auditor._should_trigger_007(event) is False
+
+    def test_blocks_when_already_active(self, auditor):
+        auditor._007_active = True
+        event = self._make_event(Severity.CRITICAL, "agent_liveness")
+        assert auditor._should_trigger_007(event) is False
+
+    def test_blocks_during_cooldown(self, auditor):
+        auditor._007_last_triggered = time.monotonic()  # Just triggered
+        event = self._make_event(Severity.CRITICAL, "agent_timeout")
+        assert auditor._should_trigger_007(event) is False
+
+
+# ---------------------------------------------------------------------------
+# Test: Agent 007 — _build_activation_prompt structure
+# ---------------------------------------------------------------------------
+
+class TestBuildActivationPrompt:
+    def _make_event(self, spec_id: str = "TEST-SPEC") -> AuditEvent:
+        return AuditEvent(
+            timestamp="2026-02-21T04:00:00Z",
+            check="agent_timeout",
+            severity=Severity.CRITICAL,
+            spec_id=spec_id,
+            details={"agent": "builder", "minutes_idle": 65},
+            action_taken=None,
+            recommended_action="investigate",
+        )
+
+    def test_prompt_structure(self, auditor):
+        event = self._make_event()
+        prompt = auditor._build_activation_prompt(event)
+
+        # Must start with the SKILL.md instruction
+        assert prompt.startswith("Read .claude/skills/agent-007-supervisor/SKILL.md")
+
+        # Must contain the JSON diagnostic block
+        assert '"trigger": "agent_007_activation"' in prompt
+        assert '"check": "agent_timeout"' in prompt
+        assert '"severity": "critical"' in prompt
+        assert '"spec_id": "TEST-SPEC"' in prompt
+        assert '"retry_history"' in prompt
+        assert '"max_retries": 3' in prompt
+
+    def test_prompt_includes_retry_history(self, auditor, daemon):
+        # Write a fake 007 diagnostic report for this spec
+        audit_dir = daemon.config.handoffs_dir / ".audit"
+        report = {
+            "timestamp": "2026-02-21T03:00:00Z",
+            "anomaly": {"spec_id": "TEST-SPEC"},
+            "classification": "transient",
+            "outcome": "retry_initiated",
+        }
+        report_path = audit_dir / "007-2026-02-21T03-00-00Z.json"
+        report_path.write_text(json.dumps(report))
+
+        event = self._make_event("TEST-SPEC")
+        prompt = auditor._build_activation_prompt(event)
+
+        # Parse the JSON portion out
+        json_start = prompt.index("{")
+        block = json.loads(prompt[json_start:])
+        assert len(block["retry_history"]) == 1
+        assert block["retry_history"][0]["classification"] == "transient"
+
+
+# ---------------------------------------------------------------------------
+# Test: Agent 007 — completion detection
+# ---------------------------------------------------------------------------
+
+class TestAgent007Completion:
+    def test_completion_detection(self, auditor, daemon):
+        # Simulate 007 being active
+        auditor._007_active = True
+        auditor._007_last_triggered = time.monotonic()
+
+        # Write a completion file
+        audit_dir = daemon.config.handoffs_dir / ".audit"
+        completion = {
+            "completed_at": "2026-02-21T04:15:00Z",
+            "trigger_timestamp": "2026-02-21T04:00:00Z",
+            "outcome": "retry_initiated",
+            "report_path": "docs/agent-comms/.audit/007-report.json",
+        }
+        comp_path = audit_dir / "007-complete-2026-02-21T04-15-00Z.json"
+        comp_path.write_text(json.dumps(completion))
+
+        result = auditor.check_007_completion()
+        assert result is not None
+        assert result["outcome"] == "retry_initiated"
+        assert auditor._007_active is False
+
+
+# ---------------------------------------------------------------------------
+# Test: Agent 007 — max retries escalation
+# ---------------------------------------------------------------------------
+
+class TestAgent007MaxRetries:
+    def test_max_retries_escalates(self, auditor, daemon):
+        # Write 3 fake 007 reports to simulate exhausted retries
+        audit_dir = daemon.config.handoffs_dir / ".audit"
+        for i in range(3):
+            report = {
+                "timestamp": f"2026-02-21T0{i}:00:00Z",
+                "anomaly": {"spec_id": "TEST-SPEC"},
+                "classification": "transient",
+                "outcome": "retry_initiated",
+            }
+            path = audit_dir / f"007-2026-02-21T0{i}-00-00Z.json"
+            path.write_text(json.dumps(report))
+
+        event = AuditEvent(
+            timestamp="2026-02-21T04:00:00Z",
+            check="agent_timeout",
+            severity=Severity.CRITICAL,
+            spec_id="TEST-SPEC",
+            details={"agent": "builder", "minutes_idle": 65},
+            action_taken=None,
+            recommended_action="investigate",
+        )
+
+        result = auditor.trigger_agent_007(event)
+        assert result is False  # Should NOT launch — max retries exceeded
+
+        # Verify FATAL event was emitted
+        fatal_files = list(audit_dir.glob("*agent_007_max_retries*.json"))
+        assert len(fatal_files) >= 1
+
+        # 007 should NOT have been launched
+        assert daemon.commander._007_launched is False
+
+
+# ---------------------------------------------------------------------------
+# Test: Agent 007 — _emit triggers 007 on critical retry-safe events
+# ---------------------------------------------------------------------------
+
+class TestEmitTriggers007:
+    def test_emit_triggers_007_on_critical_retry_safe(self, auditor, daemon):
+        event = AuditEvent(
+            timestamp="2026-02-21T04:00:00Z",
+            check="agent_liveness",
+            severity=Severity.CRITICAL,
+            spec_id="TEST-SPEC",
+            details={"agent": "builder", "minutes_idle": 65},
+            action_taken=None,
+            recommended_action="investigate",
+        )
+
+        auditor._emit(event)
+
+        # 007 should have been launched
+        assert daemon.commander._007_launched is True
+        assert auditor._007_active is True
+        assert auditor._007_trigger_count == 1

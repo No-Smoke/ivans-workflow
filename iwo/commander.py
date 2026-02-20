@@ -8,6 +8,7 @@ PS1 setup where possible. Cursor position + output observation.
 import logging
 import re
 import time
+from pathlib import Path
 from typing import Optional
 
 import libtmux
@@ -295,6 +296,92 @@ class TmuxCommander:
 
     def get_agent(self, name: str) -> Optional[AgentPane]:
         return self.agents.get(name)
+
+    def launch_agent_007(self, prompt_file: Path) -> bool:
+        """Launch Agent 007 in window 6 by piping a prompt file into claude -p.
+
+        Window 6 starts as an idle bash shell. This method pipes the activation
+        prompt into claude, which runs, reports, exits, returning the pane to idle.
+
+        Returns True if the command was sent successfully.
+        """
+        if not self.session:
+            log.error("Agent 007: no tmux session connected")
+            return False
+
+        windows = self.session.windows
+        window_idx = self.config.agent_007_window
+        if window_idx >= len(windows):
+            log.error(f"Agent 007: window {window_idx} does not exist")
+            return False
+
+        window = windows[window_idx]
+        pane = window.active_pane
+        if not pane:
+            log.error("Agent 007: no active pane in window 6")
+            return False
+
+        # Verify pane is at a bash prompt (not already running claude)
+        if not self.check_agent_007_idle():
+            log.warning("Agent 007: pane is not idle — already active or not at bash prompt")
+            return False
+
+        # Build launch command — pipe from file to avoid shell escaping issues
+        budget = self.config.agent_007_budget_usd
+        cmd = (
+            f"cat {prompt_file} | claude -p "
+            f"--dangerously-skip-permissions "
+            f"--no-session-persistence "
+            f"--max-budget-usd {budget}"
+        )
+
+        try:
+            pane.send_keys(cmd, enter=True)
+            log.info(f"Agent 007: launched with prompt from {prompt_file}")
+            return True
+        except Exception as e:
+            log.error(f"Agent 007: failed to launch: {e}")
+            return False
+
+    def check_agent_007_idle(self) -> bool:
+        """Check if Agent 007's pane (window 6) is at a bash prompt.
+
+        Returns True if the pane shows a bash prompt and no Claude Code indicators,
+        meaning 007 has exited (or was never launched).
+        """
+        if not self.session:
+            return False
+
+        windows = self.session.windows
+        window_idx = self.config.agent_007_window
+        if window_idx >= len(windows):
+            return False
+
+        window = windows[window_idx]
+        pane = window.active_pane
+        if not pane:
+            return False
+
+        try:
+            lines = pane.cmd("capture-pane", "-p", "-J").stdout
+            last_lines = lines[-10:] if len(lines) > 10 else lines
+            text = "\n".join(last_lines)
+
+            # Claude Code indicators — if present, 007 is still running
+            claude_patterns = re.compile(r"(❯|Claude Code|claude-code|╭─|Tips for|/help|Opus|Sonnet)")
+            if claude_patterns.search(text):
+                return False
+
+            # Check for bash prompt at end of output
+            bash_prompt = re.compile(r"[$#]\s*$", re.MULTILINE)
+            if bash_prompt.search(text):
+                return True
+
+            # No recognizable prompt — ambiguous, assume not idle
+            return False
+        except Exception as e:
+            log.warning(f"Agent 007: idle check failed: {e}")
+            return False
 
     def respawn_agent(self, agent_name: str) -> bool:
         """Respawn a crashed agent pane and re-launch Claude Code.
