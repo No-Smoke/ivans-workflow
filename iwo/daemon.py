@@ -437,6 +437,22 @@ class IWODaemon:
                 sm.mark_command_sent()
             self.pipeline.assign_agent(agent, handoff.spec_id)
             self._notify(f"✅ Activated {agent} for {handoff.spec_id} (#{handoff.sequence})")
+            # Emit INFO audit event for phone notification of successful handoffs
+            if self.auditor:
+                from iwo.auditor import AuditEvent, Severity
+                self.auditor._emit(AuditEvent(
+                    timestamp=self.auditor._now_iso(),
+                    check="handoff_success",
+                    severity=Severity.INFO,
+                    spec_id=handoff.spec_id,
+                    details={
+                        "agent": agent,
+                        "sequence": handoff.sequence,
+                        "message": f"✅ {agent} activated for {handoff.spec_id} (#{handoff.sequence})",
+                    },
+                    action_taken=f"activated_{agent}",
+                    recommended_action=None,
+                ))
         else:
             # Re-queue on failure — will retry next poll cycle
             self.pipeline.enqueue(handoff, path)

@@ -218,8 +218,8 @@ class Auditor:
         # 2. Write to audit trail (best-effort)
         self._write_audit_file(event)
 
-        # 3. Send webhook for warnings and above
-        if event.severity in (Severity.WARNING, Severity.CRITICAL, Severity.FATAL):
+        # 3. Send webhook for info and above (info = success notifications, warning+ = problems)
+        if event.severity in (Severity.INFO, Severity.WARNING, Severity.CRITICAL, Severity.FATAL):
             self._send_webhook(event)
 
         # 4. Desktop notification for critical and above
