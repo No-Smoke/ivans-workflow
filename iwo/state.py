@@ -134,17 +134,40 @@ class AgentStateMachine:
         return self.state
 
     def _check_idle_prompt(self, lines: list[str]) -> bool:
-        """Check if any visible line matches the idle prompt pattern.
+        """Check if the agent is truly idle at its input prompt.
 
-        Claude Code's prompt (❯) is NOT the last non-empty line — there's a
-        status bar below it showing path and token count. So we search all
-        lines from bottom up, stopping at the first match.
+        Claude Code's layout: the ❯ prompt sits above a status bar showing
+        path and token count. So the prompt is typically the 2nd or 3rd
+        non-empty line from the bottom, not the very last.
+
+        To avoid false positives during active processing (where ❯ may appear
+        in the interface chrome higher up), we also check that no spinner or
+        activity indicators are present in the bottom lines.
+
+        Bug 1 refinement (2026-02-21): Tightened from "any line" to "bottom 5
+        lines" + processing indicator exclusion.
         """
-        for line in reversed(lines):
-            stripped = line.rstrip()
-            if stripped and self._idle_pattern.search(stripped):
-                return True
-        return False
+        # Check bottom 5 non-empty lines for prompt
+        non_empty = [l.rstrip() for l in reversed(lines) if l.rstrip()][:5]
+        if not non_empty:
+            return False
+
+        prompt_found = any(self._idle_pattern.search(line) for line in non_empty)
+        if not prompt_found:
+            return False
+
+        # Reject if active processing indicators are visible
+        # These appear when Claude Code is mid-generation or running tools
+        bottom_text = " ".join(non_empty)
+        processing_indicators = (
+            "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",  # braille spinner
+            "⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷",  # dots spinner
+            "Thinking…", "thinking…",
+        )
+        if any(ind in bottom_text for ind in processing_indicators):
+            return False
+
+        return True
 
     def _check_waiting_human(self, lines: list[str]) -> bool:
         """Check last few lines for patterns that need human input."""

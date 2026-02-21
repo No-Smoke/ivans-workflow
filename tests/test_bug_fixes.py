@@ -32,13 +32,16 @@ class TestStateMachineBug1:
         return sm, pane
 
     def test_idle_when_prompt_visible_despite_output_change(self):
-        """If prompt ❯ is visible, output changes should not force PROCESSING."""
+        """If prompt ❯ is visible at bottom with no spinners, output changes
+        should not force PROCESSING."""
         from iwo.state import AgentState
 
         sm, pane = self._make_sm()
 
-        # First poll: establish baseline
-        pane.capture_visible.return_value = ["some output", "❯ "]
+        # First poll: establish baseline — prompt at bottom, status bar below
+        pane.capture_visible.return_value = [
+            "some output", "❯ ", "~/projects/ebatt  tokens: 100"
+        ]
         pane.get_cursor_position.return_value = (2, 10)
         sm.poll()
 
@@ -46,13 +49,36 @@ class TestStateMachineBug1:
         sm._output_stable_since = time.time() - 5
         sm._cursor_stable_since = time.time() - 5
 
-        # Second poll: output hash changes (status bar update) but prompt still visible
-        pane.capture_visible.return_value = ["some output", "tokens: 1234", "❯ "]
+        # Second poll: status bar updates (token count changes) but prompt still visible
+        pane.capture_visible.return_value = [
+            "some output", "❯ ", "~/projects/ebatt  tokens: 1234"
+        ]
         pane.get_cursor_position.return_value = (2, 11)  # cursor moved slightly
         state = sm.poll()
 
-        # Should be IDLE, not PROCESSING — prompt is visible
+        # Should be IDLE, not PROCESSING — prompt is visible, no spinners
         assert state == AgentState.IDLE
+
+    def test_processing_when_spinner_visible_with_prompt(self):
+        """Even if prompt char is in output, spinners mean PROCESSING."""
+        from iwo.state import AgentState
+
+        sm, pane = self._make_sm()
+
+        # First poll
+        pane.capture_visible.return_value = ["❯ ", "⠋ Thinking…"]
+        pane.get_cursor_position.return_value = (0, 5)
+        sm.poll()
+        sm._output_stable_since = time.time() - 10
+        sm._cursor_stable_since = time.time() - 10
+
+        # Poll again with spinner still present
+        pane.capture_visible.return_value = ["❯ ", "⠙ Thinking…"]
+        pane.get_cursor_position.return_value = (0, 5)
+        state = sm.poll()
+
+        # Spinner present → NOT idle
+        assert state != AgentState.IDLE
 
     def test_processing_when_no_prompt_and_output_changes(self):
         """Without prompt visible, output changes should still mean PROCESSING."""
