@@ -1,12 +1,14 @@
 # IWO — TUI Dashboard User Manual
 
-**Ivan's Workflow Orchestrator v2.0** | Single-Page Reference
+**Ivan's Workflow Orchestrator v2.8.5** | Single-Page Reference
 
 ---
 
 ## Overview
 
-The IWO TUI Dashboard is a live terminal interface that monitors and controls your 6-agent Claude Code workflow. It watches for handoff JSON files, validates them, checks agent readiness via canary probes, and automatically dispatches `/workflow-next` to the correct agent. The dashboard shows agent states, handoff history, and safety rail status in real time.
+The IWO TUI Dashboard is a live terminal interface that monitors and controls your 6-agent Claude Code workflow. It watches for handoff JSON files, validates them, checks agent readiness via canary probes, and automatically dispatches a rich activation prompt to the correct agent. The dashboard shows agent states, handoff history, and safety rail status in real time.
+
+**Important:** Agent states shown in the dashboard (IDLE/PROCESSING/STUCK) are for display purposes only. Dispatch decisions use the canary probe exclusively — the state machine is NOT in the dispatch critical path. False PROCESSING is common and expected due to Claude Code TUI status bar redraws.
 
 ## Launching
 
@@ -39,8 +41,8 @@ The IWO TUI Dashboard is a live terminal interface that monitors and controls yo
 │ Deploy gate: ACTIVE         │                           │
 │ Pending: 0                  │                           │
 ├──────────────────────────────┴────────────────────────────┤
-│ 14:23:05 iwo.state │ [builder] IDLE → PROCESSING         │
-│ 14:23:07 iwo.cmd   │ Sent to builder: /workflow-next     │
+│ 14:23:05 iwo.daemon │ Canary probe on builder for EBATT-006A...     │
+│ 14:23:07 iwo.cmd    │ Canary passed for builder — dispatching       │
 ├───────────────────────────────────────────────────────────┤
 │ q Quit │ d Deploy Approve │ r Reconcile │ p Pause/Resume │
 └───────────────────────────────────────────────────────────┘
@@ -94,4 +96,4 @@ The IWO TUI Dashboard is a live terminal interface that monitors and controls yo
 
 ---
 
-*IWO v2.0.0 | Three-model consensus design (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro) | github.com/No-Smoke/ivans-workflow-orchestrator | 2026-02-18*
+*IWO v2.8.5 | Canary-based dispatch (Option A+B) | github.com/No-Smoke/ivans-workflow-orchestrator | 2026-02-21*

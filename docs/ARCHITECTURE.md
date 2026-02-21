@@ -1,13 +1,13 @@
 # Ivan's Workflow Orchestrator (IWO) — Architecture Guide
 
-**Version:** 2.5.2 | **Updated:** 2026-02-19
+**Version:** 2.8.5 | **Updated:** 2026-02-21
 **Repository:** [No-Smoke/ivans-workflow-orchestrator](https://github.com/No-Smoke/ivans-workflow-orchestrator)
 
 ## Overview
 
 Ivan's Workflow Orchestrator (IWO) is a Python daemon that automates handoffs between multiple Claude Code AI agents running in tmux sessions. It monitors for handoff JSON files, validates them, checks agent readiness via a state machine, and routes work to the next agent in a software development pipeline.
 
-IWO is designed for the "Boris Cherny Workflow" — a six-agent development pipeline where each agent has a specialized role and strict separation of concerns.
+IWO is designed for Ivan's Workflow — a six-agent development pipeline where each agent has a specialized role and strict separation of concerns.
 
 ```
 ┌─────────┐    ┌─────────┐    ┌──────────┐    ┌────────┐    ┌──────────┐    ┌──────┐
@@ -145,9 +145,9 @@ Agents communicate via JSON files written to `docs/agent-comms/{SPEC-ID}/`. Each
 
 **LATEST.json** is a symlink to the most recent handoff, updated by IWO after processing.
 
-### Agent State Machine
+### Agent State Machine (Display Only — Not Used for Dispatch)
 
-Each agent runs a 5-state machine, polled every 2 seconds:
+Each agent runs a 5-state machine, polled every 2 seconds. As of v2.8.5, this is used **only** for the TUI dashboard and auditor alerts. It is NOT in the dispatch critical path — the canary probe is the sole gate for activation decisions.
 
 ```
                  ┌──────────┐
@@ -189,7 +189,9 @@ Each agent runs a 5-state machine, polled every 2 seconds:
 - **Agent timeout:** 30 minutes of no output triggers STUCK notification
 - **Idempotency:** Each handoff has a unique key (`{specId}:{sequence}:{source}:{target}`) — duplicates are silently ignored
 
-### Agent Activation Flow
+### Agent Activation Flow (Option A — Canary-Based Dispatch)
+
+As of v2.8.5, the state machine is **NOT** in the dispatch critical path. The canary probe is the sole gate for agent activation. The state machine remains for TUI dashboard display and auditor alerts only.
 
 When IWO detects a new handoff file:
 
@@ -198,14 +200,27 @@ When IWO detects a new handoff file:
 2. Check idempotency (skip if already processed)
 3. Check safety rails (rejection loops, handoff limits)
 4. Store to memory (Qdrant + Neo4j, best-effort)
-5. Update LATEST.json symlink
-6. Check human gate (deployer → wait for approval)
-7. Check target agent state:
-   - IDLE → canary probe → send /workflow-next → mark PROCESSING
-   - PROCESSING/UNKNOWN → queue for later (pending activations)
-   - STUCK/CRASHED/WAITING_HUMAN → queue + notify
-8. Pending activations checked every 2s during state polling
+5. Update LATEST.json symlink (IWO owns this, not agents)
+6. Stamp received_at in handoff JSON metadata
+7. Check human gate (deployer → wait for approval)
+8. DIRECT DISPATCH (Layer 1):
+   a. Get target agent's tmux pane
+   b. Release any stale pipeline assignment on target
+   c. Run canary probe (send Enter, wait for prompt in bottom 5 lines)
+   d. If canary passes → send rich activation prompt → assign agent
+   e. If canary fails → queue handoff for retry
+9. QUEUE RETRY (Layer 2, every ~2s poll cycle):
+   a. For each agent with queued work:
+   b. Skip if pipeline says agent is currently assigned
+   c. If queue age < 30s: skip if state machine says PROCESSING
+   d. If queue age ≥ 30s: always try canary (override state machine)
+   e. If queue age > 120s: send desktop/phone notification
+   f. On canary pass → dequeue and activate
 ```
+
+**Rich activation prompt:** Instead of bare `/workflow-next`, IWO sends a natural language instruction: `"You are the {role} agent. Read the handoff at docs/agent-comms/{spec}/{file} (spec: X, sequence #N, from: Y). Your task: {action}. Execute /workflow-next now — read LATEST.json, activate your role, and begin working immediately. Do NOT just summarize — START EXECUTING."` This is more reliable than slash commands, which Claude Code sometimes silently ignores under context pressure (e.g., when CLAUDE.md exceeds 40k chars).
+
+**Session-based staleness (Option B):** On daemon startup, IWO records `_started_at = time.time()`. During recovery, any handoff file with mtime older than `_started_at` gets its pipeline marked `stale` with no agent assignment. This prevents stale work from previous sessions blocking new dispatches. File mtime is used only for this comparison — it's unreliable for time-based thresholds because reconciliation, agent reads, and other operations touch files.
 
 ### Memory Integration
 
@@ -361,24 +376,95 @@ python3 -m iwo.daemon
 
 ## Troubleshooting
 
+### Dispatch Debugging Decision Tree
+
+When an agent doesn't pick up a handoff, follow these steps in order:
+
+**Step 1: Did IWO process the file?**
+```bash
+python3 -c "import json; d=json.load(open('docs/agent-comms/SPEC/LATEST.json')); print(d.get('metadata',{}).get('received_at','NOT STAMPED'))"
+```
+- `received_at` present → IWO's watchdog fired and `process_handoff()` ran. Go to Step 2.
+- NOT STAMPED → Watchdog didn't fire. Check: Is IWO running (`ps aux | grep iwo`)? Is the file a `.json` (not `.tmp`)? Was it **created** (not moved/renamed) in the watched directory? Check `config.handoffs_dir` matches the actual path.
+
+**Step 2: Is LATEST.json correct?**
+```bash
+readlink docs/agent-comms/SPEC/LATEST.json
+ls -t docs/agent-comms/SPEC/*.json | grep -v LATEST | head -1
+```
+- If they match → Symlink correct. Go to Step 3.
+- If divergent → IWO's symlink update in `on_created()` failed. Check logs for "Failed to update LATEST.json".
+
+**Step 3: Was the canary probe attempted?**
+Check TUI log panel for `"Canary probe on {agent} for {spec}..."`. If no canary log:
+- `commander.get_agent(target)` returned None → agent pane not discovered. Check tmux session name (`config.tmux_session_name`) and window mapping (`config.agent_window_map`). Verify tmux session exists: `tmux has-session -t claude-agents`.
+- Handoff may have been filtered (LATEST.json, .tmp files, 007- prefix, .audit directory are all skipped).
+
+**Step 4: Did canary pass or fail?**
+- `"Canary passed"` → Dispatch attempted. Look for `"✅ Activated"` or `"❌ Failed to activate"`. Go to Step 5.
+- `"Canary failed"` → Agent not at prompt. Handoff queued. After 30s the retry loop should try again regardless of state machine state. After 2min a notification is sent. If no retry occurs → check `pipeline.is_agent_busy(target)` — if True, a stale assignment is blocking queue drain. Fix: `pipeline.release_agent(target)` or restart IWO.
+
+**Step 5: Did the agent execute the command?**
+The rich activation prompt should be visible in the agent's tmux pane. If the text appeared but the agent produced no output:
+- Agent's CLAUDE.md may be too large (>40k chars causes unreliable behavior)
+- Agent's skill file may not be loaded (check pane for "AGENT INITIALIZED" message)
+- Agent may have hit Claude Code's context limit
+- Try sending the instruction manually in the tmux pane
+
+**Step 6: Pipeline state inspection**
+```bash
+# Check what the pipeline manager thinks:
+# (from within IWO or via daemon object)
+pipeline.agent_current_spec("reviewer")   # What spec is agent assigned to?
+pipeline.queue_depth("reviewer")          # How many items queued?
+pipeline.get_pipeline("SPEC-ID").status   # active/stale/halted/completed?
+```
+
 ### Agent shows STUCK (red ⏳) when actually idle
 
-The `idle_prompt_pattern` may not match the agent's prompt. Claude Code uses `❯ ` (Unicode U+276F). Check with:
+The `idle_prompt_pattern` may not match the agent's prompt. Claude Code uses `❯` (Unicode U+276F). Check with:
 ```bash
 tmux capture-pane -t claude-agents:0 -p | tail -5 | cat -A
 ```
+Note: As of v2.8.5, STUCK state does NOT block dispatch — the canary probe is the definitive check. STUCK only affects the TUI display and auditor alerts.
+
+### Agent shows PROCESSING when actually idle
+
+The state machine detects output changes (cursor movement, status bar redraws, token counter updates) as "activity." Claude Code's TUI continuously updates these elements even when idle. The `_check_idle_prompt()` function mitigates this by checking only the bottom 5 non-empty lines and rejecting if spinner characters (⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷) or "Thinking…" are visible. However, false PROCESSING is common and expected — this is why the state machine is not used for dispatch.
 
 ### Canary probe times out
 
-IWO sends a bare Enter keystroke and checks if the prompt reappears. If the agent is in a state where Enter triggers an action (e.g., confirmation dialog), the canary may behave unexpectedly. Check the agent manually.
+IWO sends a bare Enter keystroke and checks if the prompt (`❯` or `>`) reappears in the bottom 5 lines within 10 seconds. Possible causes of timeout:
+- Agent is genuinely busy (processing a command)
+- Agent is at a confirmation dialog or password prompt
+- Agent's Claude Code process has crashed but the pane still exists
+- Agent is still initializing (loading CLAUDE.md, skills)
+Check the agent pane manually via `tmux select-window -t claude-agents:{N}`.
 
 ### Handoff not detected
 
-IWO uses watchdog inotify. If the file was written before IWO started, use filesystem reconciliation (runs every 30s) or restart IWO to trigger recovery scan.
+IWO uses watchdog inotify. If the file was written before IWO started, the recovery scan runs on startup (checks all spec dirs, reconstructs pipeline state). Filesystem reconciliation also runs every 30 seconds. If a file is still missed, restart IWO or press `r` in TUI for manual refresh.
+
+### Stale pipeline blocking new work
+
+If an agent is assigned to a spec from a previous session, the queue retry loop will skip it. On startup, IWO marks pipelines with handoff mtime older than daemon start time as "stale" and releases the agent. If this fails (e.g., file was touched during reconciliation), manually restart IWO — the fresh `_started_at` timestamp will correctly partition old vs new work.
+
+### /workflow-next silently ignored
+
+Claude Code's slash command processing can silently fail when CLAUDE.md exceeds ~40k characters. As of v2.8.5, IWO sends a rich natural language prompt instead of bare `/workflow-next`. If the agent still doesn't act, the LLM may be hitting context limits. Check CLAUDE.md size: `wc -c .claude/CLAUDE.md` (target: under 40,000 chars).
 
 ### Memory storage failing
 
-Check that Ollama is running (`curl http://localhost:11434/api/tags`), Qdrant is reachable (`curl http://74.50.49.35:6333/collections`), and Neo4j is up (`curl http://74.50.49.35:7474`). Memory failures are non-fatal — IWO logs warnings and continues.
+Check services: Ollama (`curl http://localhost:11434/api/tags`), Qdrant (`curl http://74.50.49.35:6333/collections`), Neo4j (`curl http://74.50.49.35:7474`). Memory failures are non-fatal — IWO logs warnings and continues orchestrating.
+
+### No IWO log file for post-mortem
+
+Currently, IWO daemon logs go only to the TUI log panel (Textual RichLog widget). There is no file-based log. For post-mortem debugging, use:
+- `received_at` timestamps in handoff JSON files (proves IWO processed them)
+- LATEST.json symlink state (proves symlink update worked)
+- tmux pane output (`tmux capture-pane -t claude-agents:{N} -p`)
+- File modification times: `stat` on handoff files
+- **TODO:** Add file handler to IWO logging for persistent post-mortem access.
 
 ## Version History
 
@@ -393,3 +479,5 @@ Check that Ollama is running (`curl http://localhost:11434/api/tags`), Qdrant is
 | 2.4 | 2026-02-19 | Operational robustness: crash recovery (auto-respawn), post-deploy health checks, memory health TUI |
 | 2.5 | 2026-02-19 | Metrics & observability: pipeline metrics dashboard (Neo4j Cypher), webhook/n8n notification integration |
 | 2.5.2+ | 2026-02-19 | Self-healing Ollama (auto-restart on embed failure, Phase 3.0.4) |
+| 2.8.0 | 2026-02-21 | Agent 007 auditor module (Phase 3.0 — constitution, schemas, trigger mechanism) |
+| 2.8.5 | 2026-02-21 | **Dispatch architecture overhaul:** Option A (canary-based dispatch, state machine removed from critical path), Option B (session-timestamp staleness), rich activation prompt (replaces bare /workflow-next), queue retry with 30s override, 8 bugs fixed |
