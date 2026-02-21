@@ -330,7 +330,7 @@ class TmuxCommander:
         budget = self.config.agent_007_budget_usd
         cmd = (
             f"cat {prompt_file} | claude -p "
-            f"--dangerously-skip-permissions "
+            f"--permission-mode bypassPermissions "
             f"--no-session-persistence "
             f"--max-budget-usd {budget}"
         )
