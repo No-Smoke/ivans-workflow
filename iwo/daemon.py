@@ -430,12 +430,10 @@ class IWODaemon:
         """Fallback: try to activate agents for queued handoffs.
 
         Phase 2.3 + Option A: Uses canary probe as the definitive idle check.
-        State machine state is consulted only as a hint — if it shows PROCESSING
-        or STUCK, we skip the canary probe to avoid unnecessary tmux interaction.
-        If state is IDLE or UNKNOWN, we try the canary.
-
-        This method runs every poll cycle (~2s) as a safety net for handoffs
-        that were queued because the canary failed during initial dispatch.
+        State machine state is consulted as a soft hint — if it shows PROCESSING,
+        we still try the canary if the handoff has been queued for a while
+        (queue_retry_seconds). This prevents permanently stuck queues when
+        the state machine is wrong about an agent being busy.
         """
         # Legacy pending list (Phase 1 — migrate items to pipeline queue)
         if self._pending_activations:
@@ -444,20 +442,32 @@ class IWODaemon:
             self._pending_activations.clear()
             log.info("Migrated legacy pending activations to pipeline queue")
 
+        now = time.time()
+
         # Check each agent's queue
         for name, sm in self.state_machines.items():
             # Skip agents with no queued work
             if self.pipeline.queue_depth(name) == 0:
                 continue
-            # Skip if pipeline thinks agent is busy
+            # Skip if pipeline thinks agent is busy on a CURRENT spec
             if self.pipeline.is_agent_busy(name):
                 continue
-            # Use state machine as a hint: skip canary if clearly busy
-            if sm.state in (AgentState.PROCESSING, AgentState.STUCK,
-                            AgentState.WAITING_HUMAN, AgentState.CRASHED):
-                continue
 
-            # State looks promising (IDLE or UNKNOWN) — try canary
+            # Check queue age — how long has the oldest item been waiting?
+            queued = self.pipeline.peek_queue(name)
+            if not queued:
+                continue
+            queue_age = now - queued.queued_at
+
+            # Soft hint from state machine: skip canary only if agent is
+            # clearly busy AND the handoff hasn't been waiting long.
+            # After 30s in queue, always try canary regardless of state.
+            if queue_age < 30.0:
+                if sm.state in (AgentState.PROCESSING, AgentState.STUCK,
+                                AgentState.WAITING_HUMAN, AgentState.CRASHED):
+                    continue
+
+            # Try canary probe
             agent = self.commander.get_agent(name)
             if not agent:
                 continue
@@ -471,8 +481,17 @@ class IWODaemon:
             if canary_ok:
                 queued = self.pipeline.dequeue(name)
                 if queued:
+                    log.info(
+                        f"Queue drain: {name} canary passed after "
+                        f"{queue_age:.0f}s in queue — dispatching"
+                    )
                     time.sleep(1)
                     self._activate_for_handoff(name, queued.handoff, queued.path)
+            elif queue_age > 30.0:
+                log.info(
+                    f"Queue retry: {name} canary failed, "
+                    f"handoff queued for {queue_age:.0f}s — will retry next cycle"
+                )
 
     def _activate_for_handoff(self, agent: str, handoff: Handoff, path: Path):
         """Send activation command to an agent and update pipeline tracking."""
