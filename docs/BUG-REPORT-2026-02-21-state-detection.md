@@ -27,6 +27,20 @@ Manually send `/workflow-next` to agents. IWO dispatch is bypassed but the pipel
 
 ---
 
+## Bug 4: Pipeline agents pause for permission prompts (FIXED)
+
+### Symptoms
+- Both Planner and Builder paused early in their work to request folder access permissions
+- Agents could not run unattended — required human intervention to approve access
+
+### Root Cause
+The launch script (`scripts/boris-workflow/launch-tmux-agents-v5.sh` in eBatt repo) started Claude Code with bare `claude` command, which runs in interactive permission mode by default.
+
+### Fix Applied
+Added `--dangerously-skip-permissions` flag to all 6 pipeline agent launch commands. Agent 007 already had this flag in `commander.py`. Commit `220b4ae` in eBatt repo (v5.5.1).
+
+---
+
 ## Bug 2: LATEST.json symlink not updated by Planner
 
 ### Symptoms

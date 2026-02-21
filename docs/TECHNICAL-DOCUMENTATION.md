@@ -1,6 +1,6 @@
 # Ivan's Workflow Orchestrator (IWO) — Technical Documentation
 
-**Version:** 2.8.2 (Phase 3 — Agent 007 Schemas + Constitution)
+**Version:** 2.8.3 (Agent 007 + launch script fixes)
 **Created:** 2026-02-18
 **Updated:** 2026-02-21
 **Author:** Three-model consensus design (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro)
