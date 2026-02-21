@@ -77,3 +77,39 @@ Add a staleness threshold — if a pipeline's last_handoff_at is older than N ho
 
 ### Workaround
 Manually send `/workflow-next` to the target agent.
+
+
+---
+
+## Resolution Summary (2026-02-21, commits c1cf05a → 849413c)
+
+### Bug 1: RESOLVED via Option A (canary-based dispatch)
+State machine no longer controls dispatch decisions. Handoff routing now uses
+direct canary probe (send Enter, wait for prompt) as the definitive idle check.
+State machine remains for dashboard display and auditor alerts only.
+Additionally, `_check_idle_prompt()` tightened: checks bottom 5 lines, rejects
+if spinner characters visible.
+
+### Bug 2: RESOLVED via HandoffHandler symlink ownership
+IWO now updates LATEST.json symlink whenever a new handoff file arrives.
+Agents no longer need to manage the symlink. Commit c1cf05a.
+
+### Bug 3: RESOLVED via Option B (session-based staleness)
+On daemon startup, any handoff file with mtime predating the current session
+is marked stale — no agent assignment. Replaces unreliable hours-based threshold
+that failed when file mtimes were touched during reconciliation. Commit 849413c.
+
+### Bug 4: RESOLVED (commit 220b4ae, then 68e2e1d)
+`--permission-mode bypassPermissions` in all launch commands.
+
+### Bugs 5-7: RESOLVED (commits 05f3970, cc028ec, b11ab20)
+Info-level webhooks, audit file filtering, permissions refinement.
+
+### Architectural Decision
+Based on multi-model consensus (Gemini 2.5 Pro, GPT 5.2):
+- **Option A (dispatch on file arrival):** Canary probe is the definitive idle
+  test. Bypasses unreliable TUI screen-scraping state machine for routing.
+- **Option B (session timestamp):** Daemon start time partitions current vs stale
+  work. No need for UUID embedding in handoff files.
+- **Option C (done files):** Deferred. Would require SKILL.md changes across all
+  6 agents and doesn't eliminate need for canary probe.
