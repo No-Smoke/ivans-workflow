@@ -145,6 +145,32 @@ class PipelineManager:
     def is_agent_busy(self, agent: str) -> bool:
         return agent in self._agent_spec and self._agent_spec[agent] is not None
 
+    # ── Staleness cleanup (Bug 3 fix) ───────────────────────────────
+
+    def release_stale_pipelines(self, stale_threshold_seconds: float) -> list[str]:
+        """Release agent assignments from pipelines with no recent activity.
+
+        Returns list of spec_ids that were marked stale.
+        Called periodically from daemon poll loop.
+        """
+        released = []
+        for spec_id, pipeline in list(self._pipelines.items()):
+            if pipeline.status != "active":
+                continue
+            if pipeline.idle_seconds > stale_threshold_seconds:
+                # Release any agent assigned to this stale pipeline
+                for agent, sid in list(self._agent_spec.items()):
+                    if sid == spec_id:
+                        self.release_agent(agent)
+                pipeline.status = "stale"
+                released.append(spec_id)
+                log.info(
+                    f"Pipeline stale: {spec_id} "
+                    f"(no activity for {pipeline.idle_seconds:.0f}s, "
+                    f"threshold {stale_threshold_seconds:.0f}s)"
+                )
+        return released
+
     # ── Handoff queue ────────────────────────────────────────────────
 
     def enqueue(self, handoff: Handoff, path: Path):
@@ -197,10 +223,19 @@ class PipelineManager:
 
         Called after validation/idempotency checks pass.
         Updates the source agent's pipeline and increments counters.
+        Reactivates completed pipelines for multi-sprint specs.
         """
         pipeline = self.get_or_create_pipeline(handoff.spec_id)
         pipeline.handoff_count += 1
         pipeline.last_handoff_at = time.time()
+
+        # Reactivate if a new sprint starts on a completed pipeline
+        if pipeline.status == "completed":
+            pipeline.status = "active"
+            log.info(
+                f"Pipeline reactivated: {handoff.spec_id} "
+                f"(new handoff from {handoff.source_agent})"
+            )
 
         # Source agent is done with their stage of this spec
         source = handoff.source_agent
@@ -255,11 +290,16 @@ class PipelineManager:
 
     # ── Recovery ─────────────────────────────────────────────────────
 
-    def recover_from_handoffs(self, spec_id: str, handoffs: list[Handoff]):
+    def recover_from_handoffs(self, spec_id: str, handoffs: list[Handoff],
+                               latest_mtime: float = 0.0,
+                               stale_threshold_seconds: float = 14400.0):
         """Reconstruct pipeline state from a list of existing handoffs.
 
         Called during daemon startup to rebuild state from filesystem.
         Handoffs should be in chronological order (by sequence number).
+
+        If latest_mtime is provided and older than stale_threshold_seconds,
+        the pipeline is marked stale and no agent assignment is made (Bug 3 fix).
         """
         if not handoffs:
             return
@@ -268,11 +308,25 @@ class PipelineManager:
         pipeline.handoff_count = len(handoffs)
 
         latest = handoffs[-1]
-        pipeline.last_handoff_at = pipeline.started_at  # approximate
+        pipeline.last_handoff_at = latest_mtime if latest_mtime else pipeline.started_at
+
+        # Check staleness — don't assign agents to old pipelines
+        if latest_mtime and (time.time() - latest_mtime > stale_threshold_seconds):
+            pipeline.status = "stale"
+            pipeline.current_agent = None
+            log.info(
+                f"Recovered pipeline {spec_id} as STALE: "
+                f"{pipeline.handoff_count} handoffs, "
+                f"last activity {time.time() - latest_mtime:.0f}s ago"
+            )
+            return
 
         # The latest handoff tells us who should be working now
         target = latest.target_agent
-        if latest.status.outcome != "failed":
+        if target in ("human", "none"):
+            # Terminal target — no agent assignment needed
+            pipeline.current_agent = target
+        elif latest.status.outcome != "failed":
             pipeline.current_agent = target
             self._agent_spec[target] = spec_id
         else:

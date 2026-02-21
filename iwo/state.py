@@ -78,7 +78,10 @@ class AgentStateMachine:
         output_changed = current_hash != self._last_output_hash
         if output_changed:
             self._last_output_hash = current_hash
-            self._output_stable_since = now
+            # Only reset stability timer if prompt is NOT visible.
+            # Status bar redraws change the hash but shouldn't reset idle detection.
+            if not self._check_idle_prompt(lines):
+                self._output_stable_since = now
         elif self._output_stable_since == 0.0:
             self._output_stable_since = now
 
@@ -86,7 +89,8 @@ class AgentStateMachine:
         cursor_moved = cursor != self._last_cursor
         if cursor_moved:
             self._last_cursor = cursor
-            self._cursor_stable_since = now
+            if not self._check_idle_prompt(lines):
+                self._cursor_stable_since = now
         elif self._cursor_stable_since == 0.0:
             self._cursor_stable_since = now
 
@@ -95,17 +99,28 @@ class AgentStateMachine:
             return self._transition(AgentState.WAITING_HUMAN)
 
         # 6. If output or cursor is changing → PROCESSING
+        #    UNLESS the idle prompt is visible — status bar redraws and cursor
+        #    blinks cause hash/cursor changes even when the agent is genuinely
+        #    idle. If prompt is visible, the agent is idle regardless of cosmetic
+        #    output changes (Bug 1 fix: 2026-02-21).
         if output_changed or cursor_moved:
-            return self._transition(AgentState.PROCESSING)
+            if not self._check_idle_prompt(lines):
+                return self._transition(AgentState.PROCESSING)
+            # Prompt visible despite output/cursor change — cosmetic redraw.
+            # Fall through to IDLE check below.
 
         # 7. Calculate stability duration
         output_stable_dur = now - self._output_stable_since
         cursor_stable_dur = now - self._cursor_stable_since
 
         # 8. Check for IDLE: prompt visible + stable output + stable cursor
-        if (output_stable_dur >= self.config.output_stable_seconds
-                and cursor_stable_dur >= self.config.output_stable_seconds
-                and self._check_idle_prompt(lines)):
+        #    Fast path: if prompt is visible, require only 2s stability (not full
+        #    output_stable_seconds). Prompt visibility is the strongest IDLE signal.
+        prompt_visible = self._check_idle_prompt(lines)
+        min_stable = 2.0 if prompt_visible else self.config.output_stable_seconds
+        if (output_stable_dur >= min_stable
+                and cursor_stable_dur >= min_stable
+                and prompt_visible):
             return self._transition(AgentState.IDLE)
 
         # 9. Check for STUCK: stable but no prompt for too long

@@ -144,6 +144,16 @@ class HandoffHandler(FileSystemEventHandler):
         if ".audit" in path.parts:
             log.debug(f"Skipping audit file: {path.name}")
             return
+        # Update LATEST.json symlink — IWO is the authority, not agents (Bug 2 fix)
+        spec_dir = path.parent
+        latest = spec_dir / "LATEST.json"
+        try:
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(path.name)
+            log.info(f"Updated LATEST.json → {path.name}")
+        except Exception as e:
+            log.warning(f"Failed to update LATEST.json for {path.name}: {e}")
         log.info(f"New handoff detected: {path.name}")
         time.sleep(self.daemon.config.file_debounce_seconds)
         self.daemon.process_handoff(path)
@@ -219,6 +229,12 @@ class IWODaemon:
 
         # Check if any pending activations can proceed
         self._process_pending_activations()
+
+        # Periodic staleness cleanup (Bug 3 fix) — release agents from idle pipelines
+        stale_threshold = self.config.stale_pipeline_hours * 3600
+        released = self.pipeline.release_stale_pipelines(stale_threshold)
+        if released:
+            self._notify(f"🧹 Released {len(released)} stale pipeline(s): {', '.join(released)}")
 
     def _attempt_respawn(self, agent_name: str):
         """Attempt to respawn a crashed agent. Max 3 attempts with 30s cooldown.
@@ -1003,7 +1019,15 @@ class IWODaemon:
             handoffs = [h for h, _ in handoff_pairs]
 
             if handoffs:
-                self.pipeline.recover_from_handoffs(spec_id, handoffs)
+                # Pass latest file mtime and staleness threshold for Bug 3 fix
+                latest_file = json_files[-1]
+                latest_mtime = latest_file.stat().st_mtime
+                stale_threshold = self.config.stale_pipeline_hours * 3600
+                self.pipeline.recover_from_handoffs(
+                    spec_id, handoffs,
+                    latest_mtime=latest_mtime,
+                    stale_threshold_seconds=stale_threshold,
+                )
                 total_specs += 1
                 total_handoffs += len(handoffs)
 
