@@ -1,0 +1,65 @@
+# IWO Bug Report: Agent State Detection Issues
+
+**Filed:** 2026-02-21
+**Severity:** Medium (functional workaround exists, but degrades IWO auto-dispatch)
+**Affects:** IWO v2.8.2, state machine in `iwo/commander.py`
+
+---
+
+## Bug 1: Agents stuck in PROCESSING when actually IDLE
+
+### Symptoms
+- All 6 pipeline agents show PROCESSING in TUI after startup
+- Agents are actually sitting at idle Claude Code prompts
+- State cycles `stuck → processing` repeatedly in logs
+- IWO does not auto-dispatch handoffs because it thinks agents are busy
+
+### Root Cause
+The state machine tracks output activity independently from the canary probe. When agents initialize Claude Code on startup, they emit output (loading CLAUDE.md, skills, rules), setting state to PROCESSING. The state machine then keeps detecting pane activity (cursor blinks, prompt redraws) and resets the idle timer, preventing transition to IDLE.
+
+The canary probe (which checks for a visible prompt) would correctly identify these agents as idle, but the state machine doesn't incorporate canary results.
+
+### Fix Required
+The state machine should incorporate canary probe results: if the canary detects a clean prompt, transition to IDLE regardless of recent output activity. The canary is the ground truth; raw output activity is a heuristic.
+
+### Workaround
+Manually send `/workflow-next` to agents. IWO dispatch is bypassed but the pipeline works.
+
+---
+
+## Bug 2: LATEST.json symlink not updated by Planner
+
+### Symptoms
+- Planner wrote handoff 019-planner-*.json but LATEST.json still pointed to 018-docs-*.json
+- IWO never detected the new handoff
+- Builder sat idle for 1+ hour
+- No phone notification (007 not triggered — no agent was assigned to the pipeline)
+
+### Root Cause
+The Planner agent wrote its handoff JSON file but did not update the LATEST.json symlink. The `/workflow-next` hook either didn't fire or didn't complete the symlink update. IWO relies on LATEST.json to determine pipeline state.
+
+### Fix Required
+Two-part fix:
+1. **Defensive:** Add a "dangling handoff" detector to the auditor — compare highest-numbered JSON file against LATEST.json target for active pipelines. If they diverge, emit a WARNING.
+2. **Root cause:** Investigate why the Planner's post-handoff hook didn't update the symlink. Check `.claude/hooks.json` for the handoff hook configuration.
+
+### Workaround
+Manually fix symlink: `ln -sf 019-planner-*.json LATEST.json` then press `r` in TUI.
+
+---
+
+## Bug 3: Stale pipeline assignments blocking dispatch
+
+### Symptoms
+- Builder assigned to SERVER-SIDE-API (stale, from previous session)
+- AI-INFRASTRUCTURE handoff queued but never dispatched
+- Queue depth of 13, mostly stale work
+
+### Root Cause
+IWO scans existing handoff directories on startup and reconstructs pipeline state, but it has no way to distinguish "active work in progress" from "leftover from a previous session that was never cleaned up." Stale pipelines hold agent assignments, preventing new work from being dispatched.
+
+### Fix Required
+Add a staleness threshold — if a pipeline's last_handoff_at is older than N hours (configurable, e.g. 4h), auto-mark it as `stale` and release the agent assignment. Or add a TUI command to bulk-clear stale pipelines.
+
+### Workaround
+Manually send `/workflow-next` to the target agent.
