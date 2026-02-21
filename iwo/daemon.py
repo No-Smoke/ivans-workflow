@@ -178,8 +178,11 @@ class IWODaemon:
         self.handoff_history: list[Handoff] = []
         self._max_history: int = 50
 
-        # Startup timestamp
+        # Startup timestamp — used for session-based staleness (Option B)
+        # Any handoff file older than this timestamp is from a previous session
+        # and should NOT cause agent assignments during recovery.
         self._started_at: float = time.time()
+        self._session_id: str = time.strftime("%Y%m%d-%H%M%S")
 
         # Phase 2.1: Memory integration
         self.memory: Optional[IWOMemory] = None
@@ -424,10 +427,15 @@ class IWODaemon:
                 log.warning(f"Memory: health check logging failed: {e}")
 
     def _process_pending_activations(self):
-        """Try to activate agents for queued handoffs whose target is now IDLE.
+        """Fallback: try to activate agents for queued handoffs.
 
-        Phase 2.3: Uses PipelineManager queue with rejection-first priority.
-        Also checks the legacy _pending_activations list for backward compat.
+        Phase 2.3 + Option A: Uses canary probe as the definitive idle check.
+        State machine state is consulted only as a hint — if it shows PROCESSING
+        or STUCK, we skip the canary probe to avoid unnecessary tmux interaction.
+        If state is IDLE or UNKNOWN, we try the canary.
+
+        This method runs every poll cycle (~2s) as a safety net for handoffs
+        that were queued because the canary failed during initial dispatch.
         """
         # Legacy pending list (Phase 1 — migrate items to pipeline queue)
         if self._pending_activations:
@@ -438,14 +446,33 @@ class IWODaemon:
 
         # Check each agent's queue
         for name, sm in self.state_machines.items():
-            if sm.state != AgentState.IDLE:
+            # Skip agents with no queued work
+            if self.pipeline.queue_depth(name) == 0:
                 continue
+            # Skip if pipeline thinks agent is busy
             if self.pipeline.is_agent_busy(name):
-                continue  # Agent has an assignment but state shows IDLE — timing gap
+                continue
+            # Use state machine as a hint: skip canary if clearly busy
+            if sm.state in (AgentState.PROCESSING, AgentState.STUCK,
+                            AgentState.WAITING_HUMAN, AgentState.CRASHED):
+                continue
 
-            queued = self.pipeline.dequeue(name)
-            if queued:
-                self._activate_for_handoff(name, queued.handoff, queued.path)
+            # State looks promising (IDLE or UNKNOWN) — try canary
+            agent = self.commander.get_agent(name)
+            if not agent:
+                continue
+
+            canary_ok = agent.send_canary_and_wait(
+                self.config.canary_string,
+                self.config.canary_timeout_seconds,
+                self.config.canary_poll_interval_seconds,
+                self.config.idle_prompt_pattern,
+            )
+            if canary_ok:
+                queued = self.pipeline.dequeue(name)
+                if queued:
+                    time.sleep(1)
+                    self._activate_for_handoff(name, queued.handoff, queued.path)
 
     def _activate_for_handoff(self, agent: str, handoff: Handoff, path: Path):
         """Send activation command to an agent and update pipeline tracking."""
@@ -654,76 +681,69 @@ class IWODaemon:
             )
             return
 
-        # 9. Route to target agent (pipeline-aware)
-        sm = self.state_machines.get(target)
-        if not sm:
-            log.warning(f"No state machine for {target}, activating directly")
-            time.sleep(2)
-            self._activate_for_handoff(target, handoff, path)
-            return
-
-        agent_busy_with = self.pipeline.agent_current_spec(target)
-        target_idle = sm.state == AgentState.IDLE
-
-        if target_idle and not agent_busy_with:
-            # Agent is idle and free — activate immediately
-            log.info(f"Target {target} is IDLE and free — activating now")
-            time.sleep(1)
-            self._activate_for_handoff(target, handoff, path)
-
-        elif target_idle and agent_busy_with and agent_busy_with != handoff.spec_id:
-            # Agent shows IDLE but pipeline thinks it's on another spec.
-            # This likely means the agent finished but we haven't seen the
-            # handoff yet (timing). Release and activate.
-            log.info(
-                f"Target {target} is IDLE but assigned to {agent_busy_with} — "
-                f"releasing stale assignment, activating for {handoff.spec_id}"
-            )
-            self.pipeline.release_agent(target)
-            time.sleep(1)
-            self._activate_for_handoff(target, handoff, path)
-
-        elif agent_busy_with == handoff.spec_id:
-            # Same spec — could be a re-injection or timing overlap. Activate.
-            log.info(f"Target {target} already assigned to {handoff.spec_id} — activating")
-            time.sleep(1)
-            self._activate_for_handoff(target, handoff, path)
-
-        elif sm.state in (AgentState.PROCESSING, AgentState.UNKNOWN):
-            # Agent is busy (likely with another spec) — queue
-            reason = f"agent is {sm.state.value}"
-            if agent_busy_with:
-                reason += f" on {agent_busy_with}"
-            log.info(f"Target {target} busy ({reason}) — queuing {handoff.spec_id}")
+        # 9. Route to target agent — DIRECT DISPATCH via canary probe
+        #    Option A: bypass state machine for dispatch decisions.
+        #    The canary probe (send Enter, wait for prompt) is the definitive
+        #    test of whether an agent is idle and responsive.
+        #    State machine is still used for dashboard/alerts, NOT for dispatch.
+        agent = self.commander.get_agent(target)
+        if not agent:
+            log.warning(f"No agent pane for {target}, queuing {handoff.spec_id}")
             self.pipeline.enqueue(handoff, path)
-            self._notify(
-                f"⏸️ Queued {handoff.spec_id} → {target} ({reason})"
-            )
-
-        elif sm.state in (AgentState.STUCK, AgentState.WAITING_HUMAN, AgentState.CRASHED):
-            # Agent in bad state — queue and notify
-            msg = (
-                f"⚠️ Target {target} is {sm.state.value} — "
-                f"queuing {handoff.spec_id}"
-            )
-            log.warning(msg)
-            self._notify(msg, critical=True)
-            self.pipeline.enqueue(handoff, path)
-
+            self._notify(f"⏸️ Queued {handoff.spec_id} → {target} (no pane found)")
         else:
-            # Fallback: queue it
-            log.info(f"Target {target}: unexpected state, queuing {handoff.spec_id}")
-            self.pipeline.enqueue(handoff, path)
+            # Release any stale assignment on the target agent before dispatching
+            stale_spec = self.pipeline.agent_current_spec(target)
+            if stale_spec and stale_spec != handoff.spec_id:
+                log.info(
+                    f"Releasing stale assignment: {target} was on {stale_spec}, "
+                    f"now dispatching {handoff.spec_id}"
+                )
+                self.pipeline.release_agent(target)
+
+            # Direct canary probe — the definitive idle check
+            log.info(f"Canary probe on {target} for {handoff.spec_id}...")
+            canary_ok = agent.send_canary_and_wait(
+                self.config.canary_string,
+                self.config.canary_timeout_seconds,
+                self.config.canary_poll_interval_seconds,
+                self.config.idle_prompt_pattern,
+            )
+
+            if canary_ok:
+                log.info(f"Canary passed for {target} — dispatching immediately")
+                time.sleep(1)  # brief settle after canary
+                self._activate_for_handoff(target, handoff, path)
+            else:
+                # Canary failed — agent is busy or unresponsive. Queue for retry.
+                log.info(
+                    f"Canary failed for {target} — queuing {handoff.spec_id} "
+                    f"(will retry when agent becomes available)"
+                )
+                self.pipeline.enqueue(handoff, path)
+                self._notify(
+                    f"⏸️ {handoff.spec_id} → {target}: agent busy, queued "
+                    f"(canary probe failed)"
+                )
 
         # 10. After processing, check if the released source agent has queued work
+        #     Use canary probe for source agent too (consistent with Option A)
         source = handoff.source_agent
-        source_sm = self.state_machines.get(source)
-        if source_sm and source_sm.state == AgentState.IDLE:
-            if not self.pipeline.is_agent_busy(source):
-                queued = self.pipeline.dequeue(source)
-                if queued:
-                    log.info(f"Queue drain: {source} freed from {handoff.spec_id}, activating queued work")
-                    self._activate_for_handoff(source, queued.handoff, queued.path)
+        source_agent = self.commander.get_agent(source)
+        if source_agent and not self.pipeline.is_agent_busy(source):
+            queued = self.pipeline.peek_queue(source)
+            if queued:
+                canary_ok = source_agent.send_canary_and_wait(
+                    self.config.canary_string,
+                    self.config.canary_timeout_seconds,
+                    self.config.canary_poll_interval_seconds,
+                    self.config.idle_prompt_pattern,
+                )
+                if canary_ok:
+                    queued = self.pipeline.dequeue(source)
+                    if queued:
+                        log.info(f"Queue drain: {source} freed, activating queued work")
+                        self._activate_for_handoff(source, queued.handoff, queued.path)
 
         # 11. Auditor: post-handoff invariant checks (best-effort)
         if self.auditor:
@@ -1019,15 +1039,33 @@ class IWODaemon:
             handoffs = [h for h, _ in handoff_pairs]
 
             if handoffs:
-                # Pass latest file mtime and staleness threshold for Bug 3 fix
+                # Option B: Use daemon start time for staleness, not file mtime.
+                # Any handoff from before this session started is stale.
+                # We pass started_at as the threshold — files older than this
+                # get no agent assignment. File mtime is unreliable (gets touched
+                # by reconciliation, agents reading files, etc.)
                 latest_file = json_files[-1]
                 latest_mtime = latest_file.stat().st_mtime
-                stale_threshold = self.config.stale_pipeline_hours * 3600
                 self.pipeline.recover_from_handoffs(
                     spec_id, handoffs,
                     latest_mtime=latest_mtime,
-                    stale_threshold_seconds=stale_threshold,
+                    stale_threshold_seconds=0.0,  # not used; we override below
                 )
+                # Override: mark stale if file predates this daemon session
+                pipeline = self.pipeline.get_pipeline(spec_id)
+                if pipeline and latest_mtime < self._started_at:
+                    if pipeline.status == "active":
+                        # Release any agent assigned during recovery
+                        for agent_name, sid in list(self.pipeline._agent_spec.items()):
+                            if sid == spec_id:
+                                self.pipeline.release_agent(agent_name)
+                        pipeline.status = "stale"
+                        pipeline.current_agent = None
+                        log.info(
+                            f"Recovery: {spec_id} marked stale "
+                            f"(file predates session start by "
+                            f"{self._started_at - latest_mtime:.0f}s)"
+                        )
                 total_specs += 1
                 total_handoffs += len(handoffs)
 
