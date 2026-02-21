@@ -497,7 +497,7 @@ class IWODaemon:
     def _activate_for_handoff(self, agent: str, handoff: Handoff, path: Path):
         """Send activation command to an agent and update pipeline tracking."""
         log.info(f"Activating {agent} for {handoff.spec_id} #{handoff.sequence}")
-        success = self.commander.activate_agent(agent)
+        success = self.commander.activate_agent(agent, handoff=handoff, handoff_path=path)
         if success:
             sm = self.state_machines.get(agent)
             if sm:

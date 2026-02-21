@@ -9,11 +9,14 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import libtmux
 
 from .config import IWOConfig
+
+if TYPE_CHECKING:
+    from .parser import Handoff
 
 log = logging.getLogger("iwo.commander")
 
@@ -264,11 +267,16 @@ class TmuxCommander:
             if self.config.enable_pipe_pane:
                 agent_pane.setup_pipe_pane(log_dir)
 
-    def activate_agent(self, agent_name: str) -> bool:
-        """Send /workflow-next to the specified agent.
+    def activate_agent(self, agent_name: str, handoff: Optional["Handoff"] = None,
+                       handoff_path: Optional[Path] = None) -> bool:
+        """Send activation command to the specified agent.
 
-        Includes canary probe: sends bare Enter and confirms prompt reappears,
-        proving the agent is alive and responsive before injecting the command.
+        If a Handoff object is provided, sends a rich prompt with the handoff
+        path and action summary inlined. This is more reliable than bare
+        /workflow-next because Claude Code sometimes silently ignores slash
+        commands (especially under large CLAUDE.md context pressure).
+
+        Falls back to /workflow-next if no handoff context is available.
         """
         agent = self.agents.get(agent_name)
         if not agent:
@@ -292,7 +300,26 @@ class TmuxCommander:
         # Brief settle after canary
         time.sleep(1.0)
 
-        return agent.send_command("/workflow-next")
+        # Build activation command
+        if handoff and handoff_path:
+            # Rich prompt: inline the handoff details so the agent doesn't
+            # need to discover them via slash command machinery
+            rel_path = handoff_path.name
+            spec_dir = handoff_path.parent.name
+            action = handoff.nextAgent.action[:200] if handoff.nextAgent.action else "Continue workflow"
+            cmd = (
+                f"You are the {agent_name} agent. Read the handoff at "
+                f"docs/agent-comms/{spec_dir}/{rel_path} "
+                f"(spec: {handoff.spec_id}, sequence #{handoff.sequence}, "
+                f"from: {handoff.source_agent}). "
+                f"Your task: {action}. "
+                f"Execute /workflow-next now — read LATEST.json, activate your role, "
+                f"and begin working immediately. Do NOT just summarize — START EXECUTING."
+            )
+        else:
+            cmd = "/workflow-next"
+
+        return agent.send_command(cmd)
 
     def get_agent(self, name: str) -> Optional[AgentPane]:
         return self.agents.get(name)
