@@ -487,10 +487,11 @@ class IWODaemon:
                     )
                     time.sleep(1)
                     self._activate_for_handoff(name, queued.handoff, queued.path)
-            elif queue_age > 30.0:
-                log.info(
-                    f"Queue retry: {name} canary failed, "
-                    f"handoff queued for {queue_age:.0f}s — will retry next cycle"
+            elif queue_age > 120.0:
+                # Only notify after 2+ minutes stuck — initial failures are expected
+                self._notify(
+                    f"⚠️ {name} canary failing for {queue_age:.0f}s — "
+                    f"handoff queued, check agent"
                 )
 
     def _activate_for_handoff(self, agent: str, handoff: Handoff, path: Path):
@@ -734,16 +735,14 @@ class IWODaemon:
                 time.sleep(1)  # brief settle after canary
                 self._activate_for_handoff(target, handoff, path)
             else:
-                # Canary failed — agent is busy or unresponsive. Queue for retry.
+                # Canary failed — agent is busy or still loading. Queue for retry.
+                # Don't notify — this is expected during agent initialization.
+                # The fallback retry loop will pick it up within 30s.
                 log.info(
                     f"Canary failed for {target} — queuing {handoff.spec_id} "
                     f"(will retry when agent becomes available)"
                 )
                 self.pipeline.enqueue(handoff, path)
-                self._notify(
-                    f"⏸️ {handoff.spec_id} → {target}: agent busy, queued "
-                    f"(canary probe failed)"
-                )
 
         # 10. After processing, check if the released source agent has queued work
         #     Use canary probe for source agent too (consistent with Option A)
