@@ -140,6 +140,10 @@ class HandoffHandler(FileSystemEventHandler):
         if path.name.startswith("007-"):
             log.debug(f"Skipping 007 file: {path.name}")
             return
+        # Ignore audit trail files (written by auditor, not handoffs)
+        if ".audit" in path.parts:
+            log.debug(f"Skipping audit file: {path.name}")
+            return
         log.info(f"New handoff detected: {path.name}")
         time.sleep(self.daemon.config.file_debounce_seconds)
         self.daemon.process_handoff(path)
