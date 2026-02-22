@@ -14,7 +14,7 @@ Supports two dispatch modes depending on pane state:
 
 Idle detection is dual-mode:
   - pane_current_command ∈ IDLE_SHELLS → bash idle (headless dispatch)
-  - pane_current_command == "claude" + `>` prompt visible → interactive idle
+  - pane_current_command ∈ CLAUDE_COMMANDS + `❯` prompt visible → interactive idle
 
 Design: Three-model consensus (Claude Opus 4.6, GPT-5.2, Gemini 3 Pro).
 """
@@ -53,6 +53,17 @@ CLAUDE_COMMANDS = frozenset(("claude", "node"))
 # capture-pane -p -J does NOT strip ANSI codes, so prompt matching
 # like `stripped == ">"` fails when the prompt has colour codes.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]")
+
+# Claude Code prompt characters.  The TUI uses ❯ (U+276F "HEAVY RIGHT-POINTING
+# ANGLE QUOTATION MARK ORNAMENT") rather than ASCII >.  Match both to be safe.
+_PROMPT_CHARS = frozenset(("❯", ">"))
+
+# Claude Code status chrome — lines belonging to the bottom status bar
+# that must be skipped when scanning for the prompt.  Patterns:
+#   ⏵⏵  = permission mode bar      (U+23F5 BLACK MEDIUM RIGHT-POINTING TRIANGLE)
+#   ───  = box-drawing divider      (U+2500 BOX DRAWINGS LIGHT HORIZONTAL)
+#   token counter / path bar        (contains " tokens" or "@" agent-node)
+_CHROME_INDICATORS = ("⏵", "─", " tokens", "current:", "latest:")
 
 # Strip CLAUDECODE env var to avoid "nested session" detection when
 # claude -p is launched from inside an existing Claude Code session.
@@ -242,29 +253,50 @@ class HeadlessCommander:
             return False
 
     def _is_interactive_prompt(self, agent: AgentPane) -> bool:
-        """Check if an interactive Claude Code session is at its `>` prompt.
+        """Check if an interactive Claude Code session is at its ``❯`` prompt.
 
-        Captures the last few visible lines from the pane and looks for
-        the Claude Code input prompt pattern: a line starting with `>`.
-        This indicates the session is idle and waiting for user input.
+        Claude Code's TUI layout (bottom to top):
+            [empty / version info]
+            ⏵⏵ bypass permissions on ...         ← permission bar (chrome)
+            vanya@host:/path/...  123456 tokens  ← path/token bar (chrome)
+            ────────────────────────────────────  ← divider        (chrome)
+            ❯ /workflow-next                      ← THE PROMPT
+            ────────────────────────────────────  ← divider        (chrome)
+            ... output content above ...
+
+        We scan the last ~20 lines from the bottom, skip empty lines
+        and Claude Code status chrome, then look for the prompt character
+        ``❯`` (U+276F) or ``>`` (ASCII fallback).
+
+        We use 20 lines because Claude Code may leave significant blank
+        space below the status bar (e.g. after screen resize or compact
+        output), pushing the prompt further up from the pane bottom.
 
         Note: capture-pane -p -J does NOT strip ANSI escape codes, so we
-        must strip them before matching the prompt character.
+        must strip them before matching.
         """
         try:
-            lines = agent.capture_visible(last_n_lines=5)
+            lines = agent.capture_visible(last_n_lines=20)
             for line in reversed(lines):
                 # Strip ANSI escape codes THEN whitespace
                 cleaned = _ANSI_ESCAPE_RE.sub("", line)
                 stripped = cleaned.strip()
                 if not stripped:
                     continue
-                # Claude Code prompt: line is just ">" or starts with "> "
-                # Also matches "> /workflow-next" (partially typed command)
-                if stripped == ">" or stripped.startswith("> "):
+                # Skip Claude Code status chrome (status bar, dividers, etc.)
+                if any(stripped.startswith(ind) for ind in _CHROME_INDICATORS):
+                    continue
+                # Also skip lines that look like the path/token status bar
+                # e.g. "vanya@agent-node:/path/to/project   123456 tokens"
+                if "@" in stripped and ("tokens" in stripped or ":" in stripped[:40]):
+                    continue
+                # Check for Claude Code prompt: ❯ or > (with optional text after)
+                first_char = stripped[0]
+                if first_char in _PROMPT_CHARS:
+                    # Bare prompt or prompt with typed text (e.g. "❯ /workflow-next")
                     log.debug(f"[{agent.agent_name}] interactive prompt detected")
                     return True
-                # Any non-empty, non-prompt line means Claude is outputting
+                # Non-chrome, non-prompt content → agent is outputting
                 log.debug(
                     f"[{agent.agent_name}] not at prompt, last line: {stripped[:60]!r}"
                 )
