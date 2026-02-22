@@ -512,7 +512,7 @@ class Auditor:
                             if severity == Severity.WARNING
                             else self.config.timeout_critical_minutes
                         ),
-                        "state_machine_state": sm.state.value,
+                        "agent_state": state.value,
                         "tmux_pane_responsive": pane_responsive,
                     },
                     action_taken=None,
