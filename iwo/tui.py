@@ -650,29 +650,31 @@ class IWOApp(App):
     # ── Actions ──────────────────────────────────────────────────────
 
     def action_deploy_approve(self) -> None:
-        """Manually approve deploy gate — dispatch the pending deploy handoff."""
+        """Manually approve deploy gate — dispatch the oldest pending deploy (FIFO)."""
         rich_log = self.query_one("#log-output", RichLog)
         pending = self.daemon._deploy_gate_pending
         if not pending:
             rich_log.write("[bold red]Deploy gate: no pending deploy to approve[/]")
             return
 
-        handoff, path = pending
+        # Pop oldest from FIFO queue
+        handoff, path = pending.pop(0)
+        target = handoff.target_agent
+        remaining = len(pending)
         rich_log.write(
-            f"[bold yellow]Deploy gate: approving {handoff.spec_id}...[/]"
+            f"[bold yellow]Deploy gate: approving {handoff.spec_id} → {target}...[/]"
         )
-        # Clear pending BEFORE dispatching to prevent double-approval
-        self.daemon._deploy_gate_pending = None
-        self.daemon._activate_for_handoff("deployer", handoff, path)
+        self.daemon._activate_for_handoff(target, handoff, path)
 
         # Check if activation actually succeeded
         from .state import AgentState
-        if self.daemon.agent_states.get("deployer") == AgentState.PROCESSING:
-            rich_log.write("[bold green]Deploy gate: deployer activated![/]")
+        suffix = f" ({remaining} still queued)" if remaining else ""
+        if self.daemon.agent_states.get(target) == AgentState.PROCESSING:
+            rich_log.write(f"[bold green]Deploy gate: {target} activated!{suffix}[/]")
         else:
             rich_log.write(
-                "[bold red]Deploy gate: deployer NOT idle — "
-                "handoff re-queued, will dispatch when idle[/]"
+                f"[bold red]Deploy gate: {target} NOT idle — "
+                f"handoff re-queued, will dispatch when idle{suffix}[/]"
             )
 
     def action_force_reconcile(self) -> None:

@@ -52,10 +52,17 @@ class IWOConfig:
     health_check_expected_status: int = 200
     health_check_delay: float = 5.0  # seconds to wait after deploy before checking
 
-    # --- Webhook/Notification (Phase 2.5.2) ---
-    notification_channels: list[str] = field(default_factory=lambda: ["desktop"])  # "desktop", "webhook"
+    # --- Notification (Phase 2.5.2) ---
+    notification_channels: list[str] = field(default_factory=lambda: ["ntfy"])  # "ntfy", "desktop", "webhook"
     notification_webhook_url: Optional[str] = None  # e.g., n8n webhook URL
     notification_webhook_timeout: int = 10  # seconds
+
+    # ntfy push notifications (mobile) — https://ntfy.sh
+    ntfy_server: str = "https://ntfy.sh"
+    ntfy_topic: str = "ebatt-ai"  # unique topic name — subscribe in ntfy app
+    ntfy_timeout: int = 10  # seconds
+    ntfy_priority_normal: int = 3  # ntfy: 1=min, 2=low, 3=default, 4=high, 5=urgent
+    ntfy_priority_critical: int = 5  # used for deploy gates, failures, crashes
 
     # --- Self-Healing Ollama (Phase 3.0.4) ---
     ollama_auto_restart: bool = True  # attempt restart if Ollama unreachable
