@@ -262,10 +262,10 @@ class IWOApp(App):
     SUB_TITLE = "Phase 2 Dashboard"
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("d", "deploy_approve", "Deploy Approve"),
-        Binding("r", "force_reconcile", "Reconcile"),
-        Binding("p", "pause_toggle", "Pause/Resume"),
+        Binding("q", "quit", "Quit", priority=True),
+        Binding("d", "deploy_approve", "Deploy Approve", priority=True),
+        Binding("r", "force_reconcile", "Reconcile", priority=True),
+        Binding("p", "pause_toggle", "Pause/Resume", priority=True),
     ]
 
     CSS = """
