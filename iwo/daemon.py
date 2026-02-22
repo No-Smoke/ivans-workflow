@@ -180,8 +180,8 @@ class IWODaemon:
         self._respawn_attempts: dict[str, int] = {}  # agent_name → attempt count
         self._respawn_cooldown: dict[str, float] = {}  # agent_name → last attempt time
 
-        # Phase 3: Deploy gate — stores gated handoff for TUI approval
-        self._deploy_gate_pending: Optional[tuple[Handoff, Path]] = None
+        # Phase 3: Deploy gate — FIFO queue of gated handoffs for TUI approval
+        self._deploy_gate_pending: list[tuple[Handoff, Path]] = []
 
         # Phase 2.5.1: Metrics collector (initialized after memory)
         self.metrics: Optional[MetricsCollector] = None
@@ -497,31 +497,41 @@ class IWODaemon:
             self.pipeline.enqueue(handoff, path)
             self._notify(f"❌ Failed to activate {agent}, re-queued", critical=True)
 
-    def _should_auto_approve_deploy(self, path: Path, handoff: Handoff) -> bool:
+    def _should_auto_approve_deploy(
+        self, path: Path, handoff: Handoff
+    ) -> tuple[bool, str]:
         """Check if a deploy handoff can bypass the human gate.
 
+        Returns (approved, reason) where *reason* is a human-readable string
+        explaining why auto-approval succeeded or failed.  The caller uses
+        *reason* in both the log and the TUI notification so the operator
+        knows exactly what to check before pressing 'd'.
+
         Auto-approves when the handoff explicitly declares no infrastructure
-        changes (no new migrations, secrets, or wrangler vars). If the flags
-        are absent or any flag indicates changes, requires human approval.
+        changes (noNewMigrations, noNewSecrets, noNewWranglerVars all True).
 
-        Reads the raw JSON because these fields are in deploymentInstructions
+        Reads the raw JSON because these fields live in deploymentInstructions
         which is not part of the Pydantic Handoff model.
-
-        Industry best practice: auto-deploy for low-risk (code-only) changes,
-        require human approval for high-risk (infra/DB/secrets) changes.
         """
         if not self.config.auto_approve_safe_deploys:
-            return False  # Feature disabled — always gate
+            return False, "auto-approve disabled in config"
 
         try:
             with open(path) as f:
                 raw = json.load(f)
         except Exception:
             log.warning("Auto-approve: cannot read raw handoff, requiring manual approval")
-            return False
+            return False, "could not read handoff JSON"
 
         # Check deploymentInstructions block (used by Planner/Tester handoffs)
-        deploy_info = raw.get("deploymentInstructions", {})
+        deploy_info = raw.get("deploymentInstructions")
+
+        if deploy_info is None:
+            return (
+                False,
+                "no deploymentInstructions block in handoff — "
+                "safety flags not provided by source agent",
+            )
 
         no_migrations = deploy_info.get("noNewMigrations", False)
         no_secrets = deploy_info.get("noNewSecrets", False)
@@ -533,19 +543,18 @@ class IWODaemon:
                 f"Auto-approve check: migrations={no_migrations}, "
                 f"secrets={no_secrets}, vars={no_vars} → SAFE"
             )
-            return True
+            return True, "all safety flags True (no infra changes)"
 
-        # Log which flags are missing or false
+        # Build specific reason listing which flags are missing/false
         flags = {
             "noNewMigrations": no_migrations,
             "noNewSecrets": no_secrets,
             "noNewWranglerVars": no_vars,
         }
         missing = [k for k, v in flags.items() if not v]
-        log.info(
-            f"Auto-approve check: UNSAFE — missing or false: {missing}"
-        )
-        return False
+        reason = f"infrastructure flags missing or false: {', '.join(missing)}"
+        log.info(f"Auto-approve check: UNSAFE — {reason}")
+        return False, reason
 
     def process_handoff(self, path: Path):
         """Parse, validate, and route a handoff file.
@@ -639,26 +648,27 @@ class IWODaemon:
         # 8. Human gate check (conditional: auto-approve if no infrastructure changes)
         target = handoff.target_agent
         if target in self.config.human_gate_agents:
-            if self._should_auto_approve_deploy(path, handoff):
+            approved, reason = self._should_auto_approve_deploy(path, handoff)
+            if approved:
                 log.info(
-                    f"Deploy auto-approved for {handoff.spec_id}: "
-                    f"no migrations, secrets, or wrangler vars"
+                    f"Deploy auto-approved for {handoff.spec_id}: {reason}"
                 )
                 self._notify(
                     f"✅ AUTO-DEPLOY: {handoff.spec_id} → {target} "
-                    f"(no infra changes, bypassing gate)"
+                    f"({reason})"
                 )
                 # Fall through to step 9 routing instead of returning
             else:
                 msg = (
                     f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
-                    f"Infrastructure changes detected — manual approval required. "
+                    f"Reason: {reason}. "
+                    f"Press 'd' to approve. "
                     f"Action: {handoff.nextAgent.action[:100]}"
                 )
                 log.info(msg)
                 self._notify(msg, critical=True)
-                # Store for TUI 'd' key approval
-                self._deploy_gate_pending = (handoff, path)
+                # Append to pending queue (FIFO — 'd' key approves oldest first)
+                self._deploy_gate_pending.append((handoff, path))
                 return
 
         # 8.5 Terminal targets — pipeline complete, no activation needed
