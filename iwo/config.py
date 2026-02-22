@@ -59,7 +59,7 @@ class IWOConfig:
 
     # ntfy push notifications (mobile) — https://ntfy.sh
     ntfy_server: str = "https://ntfy.sh"
-    ntfy_topic: str = "iwo-vanya"  # unique topic name — subscribe in ntfy app
+    ntfy_topic: str = "ebatt-ai"  # unique topic name — subscribe in ntfy app
     ntfy_timeout: int = 10  # seconds
     ntfy_priority_normal: int = 3  # ntfy: 1=min, 2=low, 3=default, 4=high, 5=urgent
     ntfy_priority_critical: int = 5  # used for deploy gates, failures, crashes
