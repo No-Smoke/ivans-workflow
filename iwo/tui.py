@@ -664,7 +664,16 @@ class IWOApp(App):
         # Clear pending BEFORE dispatching to prevent double-approval
         self.daemon._deploy_gate_pending = None
         self.daemon._activate_for_handoff("deployer", handoff, path)
-        rich_log.write("[bold green]Deploy gate: deployer activated![/]")
+
+        # Check if activation actually succeeded
+        from .state import AgentState
+        if self.daemon.agent_states.get("deployer") == AgentState.PROCESSING:
+            rich_log.write("[bold green]Deploy gate: deployer activated![/]")
+        else:
+            rich_log.write(
+                "[bold red]Deploy gate: deployer NOT idle — "
+                "handoff re-queued, will dispatch when idle[/]"
+            )
 
     def action_force_reconcile(self) -> None:
         """Force an immediate filesystem reconciliation."""

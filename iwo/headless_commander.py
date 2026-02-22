@@ -20,6 +20,7 @@ Design: Three-model consensus (Claude Opus 4.6, GPT-5.2, Gemini 3 Pro).
 """
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -43,6 +44,15 @@ SKILL_DIR_MAP: dict[str, str] = {
 
 # Shell names that indicate an idle pane (no claude process running)
 IDLE_SHELLS = frozenset(("bash", "zsh", "sh", "fish"))
+
+# Claude Code process names — "claude" is the binary name, but Claude Code
+# is a Node.js app so tmux may report "node" as pane_current_command.
+CLAUDE_COMMANDS = frozenset(("claude", "node"))
+
+# Regex to strip ANSI escape sequences from captured pane output.
+# capture-pane -p -J does NOT strip ANSI codes, so prompt matching
+# like `stripped == ">"` fails when the prompt has colour codes.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]")
 
 # Strip CLAUDECODE env var to avoid "nested session" detection when
 # claude -p is launched from inside an existing Claude Code session.
@@ -214,17 +224,21 @@ class HeadlessCommander:
         """
         agent = self._agents.get(agent_name)
         if not agent:
+            log.debug(f"[{agent_name}] not in _agents — cannot check idle")
             return False
         try:
             cmd = agent.pane.pane_current_command
+            log.debug(f"[{agent_name}] pane_current_command = {cmd!r}")
             # Mode 1: bash/shell idle — ready for headless claude -p
             if cmd in IDLE_SHELLS:
                 return True
             # Mode 2: interactive Claude session at `>` prompt
-            if cmd == "claude" and agent_name not in self._active_agents:
+            # Claude Code is Node.js, so tmux may report "node" or "claude"
+            if cmd in CLAUDE_COMMANDS and agent_name not in self._active_agents:
                 return self._is_interactive_prompt(agent)
             return False
-        except Exception:
+        except Exception as e:
+            log.warning(f"[{agent_name}] pane read failed: {e}")
             return False
 
     def _is_interactive_prompt(self, agent: AgentPane) -> bool:
@@ -233,18 +247,27 @@ class HeadlessCommander:
         Captures the last few visible lines from the pane and looks for
         the Claude Code input prompt pattern: a line starting with `>`.
         This indicates the session is idle and waiting for user input.
+
+        Note: capture-pane -p -J does NOT strip ANSI escape codes, so we
+        must strip them before matching the prompt character.
         """
         try:
             lines = agent.capture_visible(last_n_lines=5)
             for line in reversed(lines):
-                stripped = line.strip()
+                # Strip ANSI escape codes THEN whitespace
+                cleaned = _ANSI_ESCAPE_RE.sub("", line)
+                stripped = cleaned.strip()
                 if not stripped:
                     continue
                 # Claude Code prompt: line is just ">" or starts with "> "
                 # Also matches "> /workflow-next" (partially typed command)
                 if stripped == ">" or stripped.startswith("> "):
+                    log.debug(f"[{agent.agent_name}] interactive prompt detected")
                     return True
                 # Any non-empty, non-prompt line means Claude is outputting
+                log.debug(
+                    f"[{agent.agent_name}] not at prompt, last line: {stripped[:60]!r}"
+                )
                 return False
         except Exception as e:
             log.debug(f"Interactive prompt check failed for {agent.agent_name}: {e}")
@@ -290,7 +313,7 @@ class HeadlessCommander:
             log.error(f"[{agent_name}] Cannot read pane_current_command")
             return False
 
-        if cmd == "claude":
+        if cmd in CLAUDE_COMMANDS:
             return self._dispatch_interactive(agent_name, agent, handoff)
         else:
             return self._dispatch_headless(agent_name, agent, handoff, handoff_path)
@@ -497,7 +520,7 @@ Action: {handoff.nextAgent.action}
             cmd = agent.pane.pane_current_command
             if cmd in IDLE_SHELLS:
                 return True
-            if cmd == "claude":
+            if cmd in CLAUDE_COMMANDS:
                 return self._is_interactive_prompt(agent)
             return False
         except Exception:
