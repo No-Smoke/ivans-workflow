@@ -1,31 +1,19 @@
-"""IWO Daemon — Phase 2.4 'Operational Robustness'.
+"""IWO Daemon — Headless dispatch orchestrator.
 
-Watches for handoff files, validates them, checks agent state via
-state machine, sends canary probe, and routes to next agent.
+Watches for handoff files, validates them, and dispatches to agents
+via HeadlessCommander (deterministic ``claude -p`` subprocess invocation).
 
-Phase 2.4.1 additions:
+Key capabilities:
+- HeadlessCommander dispatch (Phase 3): deterministic idle detection via
+  pane_current_command, no canary probes or regex prompt matching
+- Multi-spec pipeline tracking (PipelineManager) with rejection-first priority
 - Automatic crash recovery (respawn-pane + re-launch Claude Code)
-- Max 3 respawn attempts with 30s cooldown per agent
-- Crash events logged to Neo4j for pattern analysis
-- Permanently crashed agents escalate to human notification
-
-Phase 2.3 additions:
-- Multi-spec pipeline tracking (PipelineManager)
-- Per-agent handoff queuing with rejection-first priority
-- All spec dirs scanned (not just .current-spec)
-- .active-specs.json for external visibility
-- Agent assignment tracking (who's working on what)
-
-Phase 1 foundations:
-- Agent state machine (IDLE/PROCESSING/STUCK/WAITING_HUMAN/CRASHED)
-- Canary probe before command injection
-- Pre-activation state validation
+- Deploy gate with TUI manual approval flow
+- Post-deploy health checks
 - 30-second filesystem reconciliation
 - Pipe-pane archival logging
-- Pane tag-based discovery
 
 Design: Three-model consensus (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro).
-Phase 2.3–2.4 design: Claude Opus 4.6 interactive session, 2026-02-19.
 """
 
 import json
@@ -194,6 +182,9 @@ class IWODaemon:
         # Phase 2.4.1: Crash recovery tracking
         self._respawn_attempts: dict[str, int] = {}  # agent_name → attempt count
         self._respawn_cooldown: dict[str, float] = {}  # agent_name → last attempt time
+
+        # Phase 3: Deploy gate — stores gated handoff for TUI approval
+        self._deploy_gate_pending: Optional[tuple[Handoff, Path]] = None
 
         # Phase 2.5.1: Metrics collector (initialized after memory)
         self.metrics: Optional[MetricsCollector] = None
@@ -669,6 +660,8 @@ class IWODaemon:
                 )
                 log.info(msg)
                 self._notify(msg, critical=True)
+                # Store for TUI 'd' key approval
+                self._deploy_gate_pending = (handoff, path)
                 return
 
         # 8.5 Terminal targets — pipeline complete, no activation needed

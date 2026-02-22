@@ -650,20 +650,21 @@ class IWOApp(App):
     # ── Actions ──────────────────────────────────────────────────────
 
     def action_deploy_approve(self) -> None:
-        """Manually approve deploy gate — send /workflow-next to deployer."""
-        deployer = self.daemon.commander.get_agent("deployer")
+        """Manually approve deploy gate — dispatch the pending deploy handoff."""
         rich_log = self.query_one("#log-output", RichLog)
-        if deployer:
-            rich_log.write("[bold yellow]Deploy gate: manually approving...[/]")
-            success = self.daemon.commander.activate_agent("deployer")
-            if success:
-                self.daemon.agent_states["deployer"] = AgentState.PROCESSING
-                self.daemon._state_changed_at["deployer"] = time.time()
-                rich_log.write("[bold green]Deploy gate: deployer activated![/]")
-            else:
-                rich_log.write("[bold red]Deploy gate: failed to activate deployer[/]")
-        else:
-            rich_log.write("[bold red]Deployer agent not found[/]")
+        pending = self.daemon._deploy_gate_pending
+        if not pending:
+            rich_log.write("[bold red]Deploy gate: no pending deploy to approve[/]")
+            return
+
+        handoff, path = pending
+        rich_log.write(
+            f"[bold yellow]Deploy gate: approving {handoff.spec_id}...[/]"
+        )
+        # Clear pending BEFORE dispatching to prevent double-approval
+        self.daemon._deploy_gate_pending = None
+        self.daemon._activate_for_handoff("deployer", handoff, path)
+        rich_log.write("[bold green]Deploy gate: deployer activated![/]")
 
     def action_force_reconcile(self) -> None:
         """Force an immediate filesystem reconciliation."""
