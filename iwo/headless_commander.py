@@ -485,6 +485,15 @@ Action: {handoff.nextAgent.action}
         return self._active_agents.copy()
 
     @property
+    def agents(self) -> dict[str, "AgentPane"]:
+        """All discovered agent panes (name → AgentPane).
+
+        Used by daemon._init_agent_states() and tui agent count display.
+        Returns a shallow copy to prevent external mutation.
+        """
+        return dict(self._agents)
+
+    @property
     def discovered_agents(self) -> list[str]:
         """List of all discovered agent names."""
         return list(self._agents.keys())

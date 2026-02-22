@@ -470,7 +470,7 @@ class Auditor:
         """Check if activated agents have produced a handoff within the liveness window."""
         events = []
 
-        for agent_name, sm in self.daemon.state_machines.items():
+        for agent_name, state in self.daemon.agent_states.items():
             assigned_spec = self.daemon.pipeline.agent_current_spec(agent_name)
             if not assigned_spec:
                 continue  # Agent not assigned — nothing to check
@@ -483,7 +483,7 @@ class Auditor:
             elapsed_minutes = pipeline_info.idle_seconds / 60
 
             if elapsed_minutes >= self.config.liveness_warning_minutes:
-                pane_responsive = sm.state not in (
+                pane_responsive = state not in (
                     AgentState.CRASHED,
                     AgentState.STUCK,
                 )

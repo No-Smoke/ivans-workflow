@@ -456,14 +456,15 @@ class IWOApp(App):
 
     def _update_agents(self) -> None:
         now = time.time()
-        for name, sm in self.daemon.state_machines.items():
+        for name, state in self.daemon.agent_states.items():
             try:
                 row = self.query_one(f"#agent-{name}", AgentRow)
-                row.state = sm.state
+                row.state = state
 
-                # Calculate time since output last changed
-                if sm._output_stable_since > 0:
-                    age = now - sm._output_stable_since
+                # Calculate time since last state change
+                changed_at = self.daemon._state_changed_at.get(name, 0)
+                if changed_at > 0:
+                    age = now - changed_at
                     if age < 60:
                         row.state_age = f"{int(age)}s ago"
                     elif age < 3600:
@@ -656,9 +657,8 @@ class IWOApp(App):
             rich_log.write("[bold yellow]Deploy gate: manually approving...[/]")
             success = self.daemon.commander.activate_agent("deployer")
             if success:
-                sm = self.daemon.state_machines.get("deployer")
-                if sm:
-                    sm.mark_command_sent()
+                self.daemon.agent_states["deployer"] = AgentState.PROCESSING
+                self.daemon._state_changed_at["deployer"] = time.time()
                 rich_log.write("[bold green]Deploy gate: deployer activated![/]")
             else:
                 rich_log.write("[bold red]Deploy gate: failed to activate deployer[/]")

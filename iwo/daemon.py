@@ -43,8 +43,8 @@ from watchdog.events import FileSystemEventHandler, FileCreatedEvent
 
 from .config import IWOConfig
 from .parser import Handoff
-from .commander import TmuxCommander
-from .state import AgentState, AgentStateMachine
+from .headless_commander import HeadlessCommander
+from .state import AgentState
 from .memory import IWOMemory
 from .pipeline import PipelineManager
 from .metrics import MetricsCollector
@@ -164,12 +164,13 @@ class IWODaemon:
 
     def __init__(self, config: Optional[IWOConfig] = None):
         self.config = config or IWOConfig()
-        self.commander = TmuxCommander(self.config)
+        self.commander = HeadlessCommander(self.config)
         self.tracker = HandoffTracker()
         self.observer: Optional[Observer] = None
 
-        # Phase 1: state machines per agent
-        self.state_machines: dict[str, AgentStateMachine] = {}
+        # Agent state tracking (Phase 2 headless — replaces AgentStateMachine)
+        self.agent_states: dict[str, AgentState] = {}
+        self._state_changed_at: dict[str, float] = {}
 
         # Pending activations: handoffs waiting for target agent to become IDLE
         self._pending_activations: list[tuple[Handoff, Path]] = []
@@ -200,35 +201,58 @@ class IWODaemon:
         # Phase 3.0: Auditor module (Agent 007 Phase 1)
         self.auditor: Optional[Auditor] = None
 
-    def _init_state_machines(self):
-        """Create state machines for all discovered agents."""
-        self.state_machines.clear()
-        for name, agent_pane in self.commander.agents.items():
-            self.state_machines[name] = AgentStateMachine(agent_pane, self.config)
-            log.info(f"State machine initialized for {name}")
+    def _init_agent_states(self):
+        """Initialize agent state tracking for all discovered agents.
+
+        Headless Phase 2: states derived from HeadlessCommander methods,
+        no AgentStateMachine needed.
+        """
+        self.agent_states.clear()
+        self._state_changed_at.clear()
+        now = time.time()
+        for name in self.commander.discovered_agents:
+            self.agent_states[name] = AgentState.UNKNOWN
+            self._state_changed_at[name] = now
+            log.info(f"Agent state initialized: {name} → UNKNOWN")
 
     def _poll_agent_states(self):
-        """Poll all agent state machines. Called every ~2s from main loop."""
-        for name, sm in self.state_machines.items():
-            prev = sm.state
-            current = sm.poll()
-            # Log only transitions (poll() already logs them, but we handle side effects here)
-            if current == AgentState.WAITING_HUMAN and prev != AgentState.WAITING_HUMAN:
-                self._notify(
-                    f"🙋 {name} needs human input — check tmux",
-                    critical=True,
-                )
-            elif current == AgentState.STUCK and prev != AgentState.STUCK:
-                self._notify(
-                    f"⏳ {name} appears stuck (no output for {self.config.stuck_timeout_seconds}s)",
-                    critical=True,
-                )
-            elif current == AgentState.CRASHED and prev != AgentState.CRASHED:
-                self._notify(
-                    f"💀 {name} has crashed — attempting recovery",
-                    critical=True,
-                )
-                self._attempt_respawn(name)
+        """Poll all agents for state changes. Called every ~2s from main loop.
+
+        Headless Phase 2: derives state from HeadlessCommander deterministic
+        checks — no AgentStateMachine, no canary probes.
+        - name in commander.active_agents → PROCESSING
+        - commander.is_agent_idle(name) → IDLE
+        - otherwise → UNKNOWN
+        """
+        now = time.time()
+        active = self.commander.active_agents
+
+        # Check for completed agents (pane returned to idle shell)
+        completed = self.commander.check_completions()
+        for name in completed:
+            prev = self.agent_states.get(name, AgentState.UNKNOWN)
+            self.agent_states[name] = AgentState.IDLE
+            self._state_changed_at[name] = now
+            if prev != AgentState.IDLE:
+                log.info(f"[{name}] {prev.value} → idle (completed)")
+
+        # Update all agent states
+        for name in self.agent_states:
+            if name in completed:
+                continue  # already handled above
+            prev = self.agent_states[name]
+
+            if name in active:
+                new_state = AgentState.PROCESSING
+            elif self.commander.is_agent_idle(name):
+                new_state = AgentState.IDLE
+            else:
+                new_state = AgentState.UNKNOWN
+
+            if new_state != prev:
+                self.agent_states[name] = new_state
+                self._state_changed_at[name] = now
+                log.info(f"[{name}] {prev.value} → {new_state.value}")
 
         # Check if any pending activations can proceed
         self._process_pending_activations()
@@ -277,14 +301,9 @@ class IWODaemon:
         success = self.commander.respawn_agent(agent_name)
 
         if success:
-            # Reset state machine — agent is fresh, will be detected as IDLE on next poll
-            sm = self.state_machines.get(agent_name)
-            if sm:
-                sm.state = AgentState.UNKNOWN
-                sm._output_stable_since = 0.0
-                sm._cursor_stable_since = 0.0
-                sm._last_output_hash = None
-                sm._last_cursor = None
+            # Reset agent state — will be detected as IDLE on next poll
+            self.agent_states[agent_name] = AgentState.UNKNOWN
+            self._state_changed_at[agent_name] = time.time()
 
             self._notify(f"✅ {agent_name} respawned successfully (attempt {attempt_num})")
             log.info(f"Respawn: {agent_name} recovered on attempt {attempt_num}")
@@ -427,13 +446,10 @@ class IWODaemon:
                 log.warning(f"Memory: health check logging failed: {e}")
 
     def _process_pending_activations(self):
-        """Fallback: try to activate agents for queued handoffs.
+        """Drain queued handoffs to idle agents.
 
-        Phase 2.3 + Option A: Uses canary probe as the definitive idle check.
-        State machine state is consulted as a soft hint — if it shows PROCESSING,
-        we still try the canary if the handoff has been queued for a while
-        (queue_retry_seconds). This prevents permanently stuck queues when
-        the state machine is wrong about an agent being busy.
+        Headless Phase 2: uses deterministic is_agent_idle() check.
+        No canary probes — pane_current_command is the idle signal.
         """
         # Legacy pending list (Phase 1 — migrate items to pipeline queue)
         if self._pending_activations:
@@ -442,66 +458,34 @@ class IWODaemon:
             self._pending_activations.clear()
             log.info("Migrated legacy pending activations to pipeline queue")
 
-        now = time.time()
-
         # Check each agent's queue
-        for name, sm in self.state_machines.items():
+        for name in list(self.agent_states.keys()):
             # Skip agents with no queued work
             if self.pipeline.queue_depth(name) == 0:
                 continue
             # Skip if pipeline thinks agent is busy on a CURRENT spec
             if self.pipeline.is_agent_busy(name):
                 continue
-
-            # Check queue age — how long has the oldest item been waiting?
-            queued = self.pipeline.peek_queue(name)
-            if not queued:
-                continue
-            queue_age = now - queued.queued_at
-
-            # Soft hint from state machine: skip canary only if agent is
-            # clearly busy AND the handoff hasn't been waiting long.
-            # After 30s in queue, always try canary regardless of state.
-            if queue_age < 30.0:
-                if sm.state in (AgentState.PROCESSING, AgentState.STUCK,
-                                AgentState.WAITING_HUMAN, AgentState.CRASHED):
-                    continue
-
-            # Try canary probe
-            agent = self.commander.get_agent(name)
-            if not agent:
+            # Skip if agent is not idle (deterministic check)
+            if not self.commander.is_agent_idle(name):
                 continue
 
-            canary_ok = agent.send_canary_and_wait(
-                self.config.canary_string,
-                self.config.canary_timeout_seconds,
-                self.config.canary_poll_interval_seconds,
-                self.config.idle_prompt_pattern,
-            )
-            if canary_ok:
-                queued = self.pipeline.dequeue(name)
-                if queued:
-                    log.info(
-                        f"Queue drain: {name} canary passed after "
-                        f"{queue_age:.0f}s in queue — dispatching"
-                    )
-                    time.sleep(1)
-                    self._activate_for_handoff(name, queued.handoff, queued.path)
-            elif queue_age > 120.0:
-                # Only notify after 2+ minutes stuck — initial failures are expected
-                self._notify(
-                    f"⚠️ {name} canary failing for {queue_age:.0f}s — "
-                    f"handoff queued, check agent"
+            queued = self.pipeline.dequeue(name)
+            if queued:
+                log.info(
+                    f"Queue drain: {name} idle — dispatching "
+                    f"{queued.spec_id} #{queued.handoff.sequence}"
                 )
+                self._activate_for_handoff(name, queued.handoff, queued.path)
 
     def _activate_for_handoff(self, agent: str, handoff: Handoff, path: Path):
         """Send activation command to an agent and update pipeline tracking."""
         log.info(f"Activating {agent} for {handoff.spec_id} #{handoff.sequence}")
         success = self.commander.activate_agent(agent, handoff=handoff, handoff_path=path)
         if success:
-            sm = self.state_machines.get(agent)
-            if sm:
-                sm.mark_command_sent()
+            # Mark agent as processing immediately
+            self.agent_states[agent] = AgentState.PROCESSING
+            self._state_changed_at[agent] = time.time()
             self.pipeline.assign_agent(agent, handoff.spec_id)
             self._notify(f"✅ Activated {agent} for {handoff.spec_id} (#{handoff.sequence})")
             # Emit INFO audit event for phone notification of successful handoffs
@@ -701,13 +685,9 @@ class IWODaemon:
             )
             return
 
-        # 9. Route to target agent — DIRECT DISPATCH via canary probe
-        #    Option A: bypass state machine for dispatch decisions.
-        #    The canary probe (send Enter, wait for prompt) is the definitive
-        #    test of whether an agent is idle and responsive.
-        #    State machine is still used for dashboard/alerts, NOT for dispatch.
-        agent = self.commander.get_agent(target)
-        if not agent:
+        # 9. Route to target agent — deterministic idle check
+        #    Headless Phase 2: pane_current_command check replaces canary probes.
+        if target not in self.agent_states:
             log.warning(f"No agent pane for {target}, queuing {handoff.spec_id}")
             self.pipeline.enqueue(handoff, path)
             self._notify(f"⏸️ Queued {handoff.spec_id} → {target} (no pane found)")
@@ -721,47 +701,28 @@ class IWODaemon:
                 )
                 self.pipeline.release_agent(target)
 
-            # Direct canary probe — the definitive idle check
-            log.info(f"Canary probe on {target} for {handoff.spec_id}...")
-            canary_ok = agent.send_canary_and_wait(
-                self.config.canary_string,
-                self.config.canary_timeout_seconds,
-                self.config.canary_poll_interval_seconds,
-                self.config.idle_prompt_pattern,
-            )
-
-            if canary_ok:
-                log.info(f"Canary passed for {target} — dispatching immediately")
-                time.sleep(1)  # brief settle after canary
+            # Deterministic idle check — pane_current_command ∈ IDLE_SHELLS
+            if self.commander.is_agent_idle(target):
+                log.info(f"Agent {target} idle — dispatching immediately")
                 self._activate_for_handoff(target, handoff, path)
             else:
-                # Canary failed — agent is busy or still loading. Queue for retry.
-                # Don't notify — this is expected during agent initialization.
-                # The fallback retry loop will pick it up within 30s.
+                # Agent is busy — queue for retry via _process_pending_activations
                 log.info(
-                    f"Canary failed for {target} — queuing {handoff.spec_id} "
-                    f"(will retry when agent becomes available)"
+                    f"Agent {target} busy — queuing {handoff.spec_id} "
+                    f"(will dispatch when idle)"
                 )
                 self.pipeline.enqueue(handoff, path)
 
         # 10. After processing, check if the released source agent has queued work
-        #     Use canary probe for source agent too (consistent with Option A)
+        #     Headless Phase 2: deterministic idle check replaces canary
         source = handoff.source_agent
-        source_agent = self.commander.get_agent(source)
-        if source_agent and not self.pipeline.is_agent_busy(source):
-            queued = self.pipeline.peek_queue(source)
+        if (source in self.agent_states
+                and not self.pipeline.is_agent_busy(source)
+                and self.commander.is_agent_idle(source)):
+            queued = self.pipeline.dequeue(source)
             if queued:
-                canary_ok = source_agent.send_canary_and_wait(
-                    self.config.canary_string,
-                    self.config.canary_timeout_seconds,
-                    self.config.canary_poll_interval_seconds,
-                    self.config.idle_prompt_pattern,
-                )
-                if canary_ok:
-                    queued = self.pipeline.dequeue(source)
-                    if queued:
-                        log.info(f"Queue drain: {source} freed, activating queued work")
-                        self._activate_for_handoff(source, queued.handoff, queued.path)
+                log.info(f"Queue drain: {source} freed, activating queued work")
+                self._activate_for_handoff(source, queued.handoff, queued.path)
 
         # 11. Auditor: post-handoff invariant checks (best-effort)
         if self.auditor:
@@ -907,7 +868,7 @@ class IWODaemon:
         """
         log.info("=" * 60)
         log.info("IWO — Ivan's Workflow Orchestrator v1.0")
-        log.info("Phase 1: State Machine + Canary Probes + Tag Discovery")
+        log.info("Phase 2: Headless Dispatch + Deterministic Idle Detection")
         log.info("=" * 60)
 
         # 1. Connect to tmux and discover agents (with tag-based discovery)
@@ -918,8 +879,8 @@ class IWODaemon:
         # 2. Set up agent environments (pipe-pane archival)
         self.commander.setup_agent_environments()
 
-        # 3. Initialize state machines for all discovered agents
-        self._init_state_machines()
+        # 3. Initialize agent state tracking for all discovered agents
+        self._init_agent_states()
 
         # 4. Scan for current state (stateless recovery)
         self._recover_state()
