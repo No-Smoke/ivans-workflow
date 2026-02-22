@@ -125,9 +125,6 @@ class HandoffHandler(FileSystemEventHandler):
             return
         if path.name.endswith(".tmp"):
             return
-        if path.name.startswith("007-"):
-            log.debug(f"Skipping 007 file: {path.name}")
-            return
         # Ignore audit trail files (written by auditor, not handoffs)
         if ".audit" in path.parts:
             log.debug(f"Skipping audit file: {path.name}")
@@ -744,7 +741,6 @@ class IWODaemon:
                 f for f in json_files
                 if f.name != "LATEST.json"
                 and not f.name.endswith(".tmp")
-                and not f.name.startswith("007-")
             ]
 
             missed = 0
@@ -991,7 +987,6 @@ class IWODaemon:
                 f for f in json_files
                 if f.name != "LATEST.json"
                 and not f.name.endswith(".tmp")
-                and not f.name.startswith("007-")
             ]
 
             if not json_files:
