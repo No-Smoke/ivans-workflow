@@ -806,14 +806,61 @@ class IWODaemon:
             pass
 
     def _notify(self, message: str, critical: bool = False):
-        """Send notification via configured channels (desktop, webhook, or both)."""
+        """Send notification via configured channels."""
         channels = self.config.notification_channels
+
+        if "ntfy" in channels:
+            self._notify_ntfy(message, critical)
 
         if "desktop" in channels:
             self._notify_desktop(message, critical)
 
         if "webhook" in channels:
             self._notify_webhook(message, critical)
+
+    def _notify_ntfy(self, message: str, critical: bool = False):
+        """Send push notification via ntfy (mobile phone).
+
+        ntfy is a simple HTTP-based pub/sub notification service.
+        Subscribe to the topic in the ntfy Android/iOS app to receive
+        all IWO notifications on your phone.
+        """
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+
+        url = f"{self.config.ntfy_server.rstrip('/')}/{self.config.ntfy_topic}"
+        priority = (
+            self.config.ntfy_priority_critical if critical
+            else self.config.ntfy_priority_normal
+        )
+
+        # Determine a short tag/emoji for the notification
+        if "AUTO-DEPLOY" in message or "activated" in message:
+            tags = "rocket"
+        elif "DEPLOY GATE" in message:
+            tags = "construction"
+        elif "FAIL" in message.upper() or "CRASH" in message.upper():
+            tags = "warning"
+        elif "STALE" in message.upper():
+            tags = "snail"
+        else:
+            tags = "robot"
+
+        # Extract a short title from the message (first ~50 chars)
+        title = message[:60].split(".")[0].split("→")[0].strip()
+
+        req = Request(url, data=message.encode("utf-8"))
+        req.add_header("Title", f"IWO: {title}")
+        req.add_header("Priority", str(priority))
+        req.add_header("Tags", tags)
+
+        try:
+            with urlopen(req, timeout=self.config.ntfy_timeout) as resp:
+                log.debug(f"ntfy notification sent: {resp.status}")
+        except URLError as e:
+            log.warning(f"ntfy notification failed: {e}")
+        except Exception as e:
+            log.warning(f"ntfy notification error: {e}")
 
     def _notify_desktop(self, message: str, critical: bool = False):
         """Send desktop notification via notify-send."""
