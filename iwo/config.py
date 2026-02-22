@@ -1,7 +1,7 @@
 """IWO Configuration — Agent mapping, paths, thresholds.
 
-Phase 1.0: Added state machine config, pane tagging, canary probes,
-waiting-human patterns, pipe-pane archival, reconciliation.
+Phase 3: Headless dispatch via HeadlessCommander.
+Pane tagging, pipe-pane archival, reconciliation, deploy gate.
 """
 
 from pathlib import Path
@@ -84,44 +84,10 @@ class IWOConfig:
     # Debounce: seconds to wait after file creation before reading
     file_debounce_seconds: float = 1.5
 
-    # --- State Machine (Phase 1) ---
+    # --- State Polling (used by TUI timer) ---
 
-    # Polling interval for agent state checks
+    # Polling interval for agent state checks in the TUI
     state_poll_interval_seconds: float = 2.0
-
-    # How long output must be stable + cursor stationary to declare IDLE
-    output_stable_seconds: float = 2.0
-
-    # No output change for this long without prompt → STUCK
-    stuck_timeout_seconds: float = 600.0  # 10 min: agents often wait legitimately
-
-    # Claude Code's idle prompt pattern (cursor at end of this line = IDLE)
-    # NOTE: IWO_READY> was the consensus design, but Claude Code manages its
-    # own prompt. Default matches Claude Code's actual `> ` prompt.
-    # Override if using a custom shell with PS1='IWO_READY> '.
-    idle_prompt_pattern: str = r"[❯>$%#]\s*$"  # Claude Code uses ❯, bash uses $, zsh uses %, root uses #
-
-    # Patterns indicating agent needs human input
-    waiting_human_patterns: list[str] = field(default_factory=lambda: [
-        r"\[Y/n\]",
-        r"\[y/N\]",
-        r"Password:",
-        r"CONFLICT",
-        r"--More--",
-        r"Are you sure",
-        r"Press ENTER",
-        r"Continue\?",
-        r"Overwrite",
-        r"\(yes/no\)",
-        r"Enter passphrase",
-        r"Permission denied",
-    ])
-
-    # --- Canary Probe (Phase 1) ---
-
-    canary_string: str = "# IWO_SYNC_CHECK"
-    canary_timeout_seconds: float = 10.0
-    canary_poll_interval_seconds: float = 0.5
 
     # --- Reconciliation (Phase 1) ---
 
