@@ -188,7 +188,7 @@ class TestInteractiveDispatchBug6:
     when pane has an interactive Claude session."""
 
     def test_dispatch_interactive_sends_workflow_next(self):
-        """Interactive dispatch sends Ctrl+U then /workflow-next."""
+        """Interactive dispatch sends Ctrl+U then /workflow-next and verifies delivery."""
         agent = _make_agent_pane(
             "builder", "claude",
             visible_lines=[">"]
@@ -202,16 +202,30 @@ class TestInteractiveDispatchBug6:
         handoff.nextAgent = MagicMock()
         handoff.nextAgent.action = "Build the feature"
 
+        # Simulate: after send_keys the prompt disappears (agent starts working).
+        # First call to capture-pane returns prompt (idle check before dispatch),
+        # subsequent calls return working output (verification after dispatch).
+        call_count = {"n": 0}
+        def _capture_side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            resp = MagicMock()
+            if call_count["n"] <= 1:
+                resp.stdout = [">"]          # idle: prompt visible
+            else:
+                resp.stdout = ["Processing…"]  # working: prompt gone
+            return resp
+        agent.pane.cmd.side_effect = _capture_side_effect
+
         result = hc.activate_agent("builder", handoff, Path("/tmp/fake.json"))
 
         assert result is True
         assert "builder" in hc._active_agents
 
         # Verify Ctrl+U was sent first, then /workflow-next
-        calls = agent.pane.send_keys.call_args_list
-        assert len(calls) == 2
-        assert calls[0][0][0] == "C-u"  # clear line
-        assert calls[1][0][0] == "/workflow-next"  # dispatch command
+        send_calls = agent.pane.send_keys.call_args_list
+        assert len(send_calls) == 2
+        assert send_calls[0][0][0] == "C-u"  # clear line
+        assert send_calls[1][0][0] == "/workflow-next"  # dispatch command
 
     def test_dispatch_headless_when_bash(self):
         """Bash pane gets headless dispatch (original behavior)."""
