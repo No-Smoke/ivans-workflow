@@ -350,6 +350,11 @@ class HeadlessCommander:
         else:
             return self._dispatch_headless(agent_name, agent, handoff, handoff_path)
 
+    # Maximum attempts for interactive dispatch (send_keys is fire-and-forget)
+    _INTERACTIVE_DISPATCH_MAX_RETRIES = 2
+    _INTERACTIVE_DISPATCH_VERIFY_DELAY = 0.5  # seconds after send_keys
+    _INTERACTIVE_DISPATCH_CLEAR_DELAY = 0.3   # seconds after C-u
+
     def _dispatch_interactive(
         self,
         agent_name: str,
@@ -358,27 +363,59 @@ class HeadlessCommander:
     ) -> bool:
         """Dispatch work to an interactive Claude Code session.
 
-        Sends Ctrl+U (clear any partial input) then `/workflow-next`
-        to the existing interactive session at the `>` prompt.
+        Sends Ctrl+U (clear any partial input) then ``/workflow-next``
+        to the existing interactive session at the ``❯`` prompt.
+
+        After sending, verifies delivery by checking that the agent is
+        no longer at the idle prompt (i.e. it started processing the
+        command).  Retries up to ``_INTERACTIVE_DISPATCH_MAX_RETRIES``
+        times if the prompt is still visible after sending.
         """
-        try:
-            # Clear any partially typed text
-            agent.pane.send_keys("C-u", enter=False, suppress_history=True)
-            import time as _time
-            _time.sleep(0.1)
+        max_retries = self._INTERACTIVE_DISPATCH_MAX_RETRIES
 
-            # Send /workflow-next command
-            agent.pane.send_keys("/workflow-next", enter=True, suppress_history=False)
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Clear any partially typed text
+                agent.pane.send_keys("C-u", enter=False, suppress_history=True)
+                time.sleep(self._INTERACTIVE_DISPATCH_CLEAR_DELAY)
 
-            self._active_agents.add(agent_name)
-            log.info(
-                f"[{agent_name}] Dispatched /workflow-next to interactive session "
-                f"(spec={handoff.spec_id}, seq={handoff.sequence})"
-            )
-            return True
-        except Exception as e:
-            log.error(f"[{agent_name}] Interactive dispatch failed: {e}")
-            return False
+                # Send /workflow-next command
+                agent.pane.send_keys(
+                    "/workflow-next", enter=True, suppress_history=False,
+                )
+                log.info(
+                    f"[{agent_name}] Sent /workflow-next (attempt {attempt}/"
+                    f"{max_retries}, spec={handoff.spec_id}, "
+                    f"seq={handoff.sequence})"
+                )
+
+                # Verify: wait then check that the prompt has gone away
+                time.sleep(self._INTERACTIVE_DISPATCH_VERIFY_DELAY)
+                if not self._is_interactive_prompt(agent):
+                    # Agent is no longer at the prompt → delivery confirmed
+                    self._active_agents.add(agent_name)
+                    log.info(
+                        f"[{agent_name}] Verified: agent accepted /workflow-next "
+                        f"on attempt {attempt}"
+                    )
+                    return True
+
+                # Still at prompt — command may have been swallowed
+                log.warning(
+                    f"[{agent_name}] Prompt still visible after attempt "
+                    f"{attempt}/{max_retries} — retrying"
+                )
+            except Exception as e:
+                log.error(
+                    f"[{agent_name}] Interactive dispatch error on attempt "
+                    f"{attempt}: {e}"
+                )
+
+        log.error(
+            f"[{agent_name}] Interactive dispatch FAILED after {max_retries} "
+            f"attempts — agent may not have received /workflow-next"
+        )
+        return False
 
     def _dispatch_headless(
         self,

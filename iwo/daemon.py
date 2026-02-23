@@ -27,7 +27,7 @@ from typing import Optional
 
 from pydantic import ValidationError
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileMovedEvent
 
 from .config import IWOConfig
 from .parser import Handoff
@@ -110,15 +110,34 @@ class HandoffTracker:
 
 
 class HandoffHandler(FileSystemEventHandler):
-    """Watchdog handler for new handoff JSON files."""
+    """Watchdog handler for new handoff JSON files.
+
+    Handles both ``on_created`` and ``on_moved`` events because Nextcloud
+    sync clients (and many editors) write to a temp file then rename/move
+    into the final path.  The rename triggers ``on_moved`` (not
+    ``on_created``), so we must handle both to reliably detect handoffs.
+    """
 
     def __init__(self, daemon: "IWODaemon"):
         self.daemon = daemon
 
+    # -- public watchdog callbacks -----------------------------------------
+
     def on_created(self, event: FileCreatedEvent):
         if event.is_directory:
             return
-        path = Path(event.src_path)
+        self._handle_new_handoff(Path(event.src_path))
+
+    def on_moved(self, event: FileMovedEvent):
+        """Catch Nextcloud's atomic .tmp → .json rename pattern."""
+        if event.is_directory:
+            return
+        self._handle_new_handoff(Path(event.dest_path))
+
+    # -- shared logic ------------------------------------------------------
+
+    def _handle_new_handoff(self, path: Path) -> None:
+        """Validate *path* and forward to the daemon for processing."""
         if path.suffix != ".json":
             return
         if path.name == "LATEST.json":
@@ -521,9 +540,9 @@ class IWODaemon:
                     details={
                         "agent": agent,
                         "sequence": handoff.sequence,
-                        "message": f"✅ {agent} activated for {handoff.spec_id} (#{handoff.sequence})",
+                        "message": f"✅ {agent} activated (verified) for {handoff.spec_id} (#{handoff.sequence})",
                     },
-                    action_taken=f"activated_{agent}",
+                    action_taken=f"activated_{agent}_verified",
                     recommended_action=None,
                 ))
         else:
