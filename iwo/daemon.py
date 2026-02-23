@@ -189,6 +189,11 @@ class IWODaemon:
         # Phase 3.0: Auditor module (Agent 007 Phase 1)
         self.auditor: Optional[Auditor] = None
 
+        # State-change notification debounce: agent_name → last notify timestamp
+        # Prevents notification spam when agents flicker between states rapidly
+        self._state_notify_debounce: dict[str, float] = {}
+        self._state_notify_cooldown: float = 30.0  # seconds between state notifications per agent
+
     def _init_agent_states(self):
         """Initialize agent state tracking for all discovered agents.
 
@@ -223,6 +228,8 @@ class IWODaemon:
             self._state_changed_at[name] = now
             if prev != AgentState.IDLE:
                 log.info(f"[{name}] {prev.value} → idle (completed)")
+                if prev == AgentState.PROCESSING:
+                    self._notify_state_change(name, prev, AgentState.IDLE, now)
 
         # Update all agent states
         for name in self.agent_states:
@@ -241,6 +248,7 @@ class IWODaemon:
                 self.agent_states[name] = new_state
                 self._state_changed_at[name] = now
                 log.info(f"[{name}] {prev.value} → {new_state.value}")
+                self._notify_state_change(name, prev, new_state, now)
 
         # Check if any pending activations can proceed
         self._process_pending_activations()
@@ -250,6 +258,32 @@ class IWODaemon:
         released = self.pipeline.release_stale_pipelines(stale_threshold)
         if released:
             self._notify(f"🧹 Released {len(released)} stale pipeline(s): {', '.join(released)}")
+
+    def _notify_state_change(
+        self, agent: str, prev: AgentState, new: AgentState, now: float
+    ):
+        """Send a push notification for significant agent state transitions.
+
+        Debounced per-agent to avoid notification spam when agents flicker
+        between states rapidly.  Only PROCESSING→IDLE and *→PROCESSING
+        transitions trigger notifications; other transitions are too noisy.
+        """
+        # Only notify on significant transitions
+        if new == AgentState.PROCESSING:
+            msg = f"🚀 {agent} started working"
+        elif new == AgentState.IDLE and prev == AgentState.PROCESSING:
+            msg = f"✅ {agent} finished work"
+        else:
+            return  # UNKNOWN transitions are not worth a push notification
+
+        # Debounce: skip if last notification for this agent was < cooldown ago
+        last = self._state_notify_debounce.get(agent, 0.0)
+        if now - last < self._state_notify_cooldown:
+            log.debug(f"State notification suppressed for {agent} (debounce)")
+            return
+
+        self._state_notify_debounce[agent] = now
+        self._notify(msg)
 
     def _attempt_respawn(self, agent_name: str):
         """Attempt to respawn a crashed agent. Max 3 attempts with 30s cooldown.
