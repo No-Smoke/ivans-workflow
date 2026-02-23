@@ -81,6 +81,19 @@ class HeadlessCommander:
         completed = commander.check_completions()       # poll for done
     """
 
+    # Minimum seconds between dispatch attempts to the same agent.
+    # Prevents rapid C-u/workflow-next injection from poll loops and
+    # state recovery bursts.
+    _DISPATCH_COOLDOWN_SECONDS = 10.0
+
+    # Exponential backoff for failed dispatch attempts.
+    # After a dispatch failure, subsequent attempts are delayed:
+    #   cooldown = min(BASE * 2^(fail_count-1), MAX)
+    # i.e. 30s → 60s → 120s → 300s → 300s ...
+    # Resets to zero on successful dispatch.
+    _DISPATCH_FAIL_BASE_COOLDOWN = 30.0
+    _DISPATCH_FAIL_MAX_COOLDOWN = 300.0
+
     def __init__(self, config: IWOConfig):
         self.config = config
         self._server: Optional[libtmux.Server] = None
@@ -92,6 +105,13 @@ class HeadlessCommander:
 
         # Session IDs from stream-json output (for potential resumption)
         self._session_ids: dict[str, str] = {}
+
+        # Dispatch rate limiting: agent_name → last dispatch timestamp
+        self._last_dispatch_time: dict[str, float] = {}
+
+        # Failed dispatch backoff: tracks consecutive failures per agent
+        self._dispatch_fail_count: dict[str, int] = {}
+        self._dispatch_fail_time: dict[str, float] = {}
 
         # Ensure prompt and log directories exist
         self._prompt_dir = config.log_dir / "prompts"
@@ -220,6 +240,87 @@ class HeadlessCommander:
             agent_pane.setup_pipe_pane(str(self.config.log_dir))
 
     # ------------------------------------------------------------------
+    # Pane Identity Validation (dispatch safety)
+    # ------------------------------------------------------------------
+
+    def _validate_pane_identity(self, agent_name: str, agent: AgentPane) -> bool:
+        """Verify a pane is genuinely an IWO agent before dispatching.
+
+        Three checks prevent injecting C-u/workflow-next into wrong panes:
+
+        1. **Tag check**: The pane must have the @iwo-agent user option set
+           to this agent's name.  Without the tag, the pane was discovered
+           by window-index fallback and may be an unrelated session.
+
+        2. **Working directory check**: The pane's current working directory
+           must be within the configured project_root.  An agent pane
+           running ebatt code should be in the ebatt project tree.
+
+        3. **Rate limiting**: Dispatch to the same agent must not happen
+           more than once per _DISPATCH_COOLDOWN_SECONDS to prevent
+           rapid repeated C-u/workflow-next injection from poll loops.
+
+        Returns True only if all checks pass.
+        """
+        import subprocess
+
+        # --- Check 1: @iwo-agent tag matches ---
+        try:
+            result = subprocess.run(
+                ["tmux", "show-options", "-p", "-t", agent.pane.pane_id,
+                 "-v", self.config.pane_tag_key],
+                capture_output=True, text=True, timeout=5,
+            )
+            tag_value = result.stdout.strip() if result.returncode == 0 else ""
+            if tag_value != agent_name:
+                log.warning(
+                    f"[{agent_name}] Pane identity REJECTED: "
+                    f"@iwo-agent tag is {tag_value!r}, expected {agent_name!r} "
+                    f"(pane {agent.pane.pane_id}). "
+                    f"This pane may not be a Boris agent — refusing dispatch."
+                )
+                return False
+        except Exception as e:
+            log.warning(
+                f"[{agent_name}] Cannot verify @iwo-agent tag "
+                f"(pane {agent.pane.pane_id}): {e} — refusing dispatch"
+            )
+            return False
+
+        # --- Check 2: Working directory within project root ---
+        try:
+            pane_path = agent.pane.pane_current_path
+            if pane_path:
+                project_root_str = str(self.config.project_root)
+                if not pane_path.startswith(project_root_str):
+                    log.warning(
+                        f"[{agent_name}] Pane identity REJECTED: "
+                        f"pane cwd is {pane_path!r}, expected prefix "
+                        f"{project_root_str!r} — refusing dispatch"
+                    )
+                    return False
+        except Exception as e:
+            # pane_current_path may not be available — log but don't block
+            log.debug(f"[{agent_name}] Could not check pane cwd: {e}")
+
+        # --- Check 3: Rate limiting ---
+        now = time.time()
+        last = self._last_dispatch_time.get(agent_name, 0.0)
+        elapsed = now - last
+        if elapsed < self._DISPATCH_COOLDOWN_SECONDS:
+            log.warning(
+                f"[{agent_name}] Dispatch THROTTLED: only {elapsed:.1f}s "
+                f"since last dispatch (cooldown={self._DISPATCH_COOLDOWN_SECONDS}s)"
+            )
+            return False
+
+        log.debug(
+            f"[{agent_name}] Pane identity VERIFIED: "
+            f"tag={agent_name!r}, pane={agent.pane.pane_id}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
     # Idle Detection (deterministic)
     # ------------------------------------------------------------------
 
@@ -321,6 +422,10 @@ class HeadlessCommander:
           - bash/shell idle → headless `claude -p` dispatch
           - interactive Claude at `>` prompt → `/workflow-next` dispatch
 
+        Failed dispatches trigger exponential backoff (30s → 60s → 120s →
+        300s max) to prevent the 2-second poll loop from hammering a pane
+        that keeps rejecting commands.
+
         Returns True if dispatch succeeded.
         """
         from .parser import Handoff  # avoid circular import at module level
@@ -330,6 +435,23 @@ class HeadlessCommander:
             log.error(f"Agent '{agent_name}' not found")
             return False
 
+        # --- Failed dispatch backoff ---
+        fail_count = self._dispatch_fail_count.get(agent_name, 0)
+        if fail_count > 0:
+            fail_time = self._dispatch_fail_time.get(agent_name, 0.0)
+            cooldown = min(
+                self._DISPATCH_FAIL_BASE_COOLDOWN * (2 ** (fail_count - 1)),
+                self._DISPATCH_FAIL_MAX_COOLDOWN,
+            )
+            elapsed = time.time() - fail_time
+            if elapsed < cooldown:
+                log.info(
+                    f"[{agent_name}] Dispatch BACKOFF: {fail_count} consecutive "
+                    f"failures, {cooldown - elapsed:.0f}s remaining "
+                    f"(cooldown={cooldown:.0f}s)"
+                )
+                return False
+
         if not self.is_agent_idle(agent_name):
             log.warning(f"Agent '{agent_name}' is not idle, cannot dispatch")
             return False
@@ -338,17 +460,49 @@ class HeadlessCommander:
             log.warning(f"Agent '{agent_name}' already tracked as active")
             return False
 
+        # --- Pane identity validation (prevents C-u/workflow-next injection) ---
+        if not self._validate_pane_identity(agent_name, agent):
+            log.error(
+                f"[{agent_name}] Dispatch ABORTED: pane identity check failed. "
+                f"Refusing to send commands to unverified pane."
+            )
+            self._record_dispatch_failure(agent_name)
+            return False
+
         # Detect dispatch mode based on pane state
         try:
             cmd = agent.pane.pane_current_command
         except Exception:
             log.error(f"[{agent_name}] Cannot read pane_current_command")
+            self._record_dispatch_failure(agent_name)
             return False
 
         if cmd in CLAUDE_COMMANDS:
-            return self._dispatch_interactive(agent_name, agent, handoff)
+            success = self._dispatch_interactive(agent_name, agent, handoff)
         else:
-            return self._dispatch_headless(agent_name, agent, handoff, handoff_path)
+            success = self._dispatch_headless(agent_name, agent, handoff, handoff_path)
+
+        if success:
+            self._dispatch_fail_count.pop(agent_name, None)
+            self._dispatch_fail_time.pop(agent_name, None)
+        else:
+            self._record_dispatch_failure(agent_name)
+
+        return success
+
+    def _record_dispatch_failure(self, agent_name: str):
+        """Record a dispatch failure for exponential backoff tracking."""
+        count = self._dispatch_fail_count.get(agent_name, 0) + 1
+        self._dispatch_fail_count[agent_name] = count
+        self._dispatch_fail_time[agent_name] = time.time()
+        cooldown = min(
+            self._DISPATCH_FAIL_BASE_COOLDOWN * (2 ** (count - 1)),
+            self._DISPATCH_FAIL_MAX_COOLDOWN,
+        )
+        log.warning(
+            f"[{agent_name}] Dispatch failure #{count} — "
+            f"next attempt in {cooldown:.0f}s"
+        )
 
     # Maximum attempts for interactive dispatch (send_keys is fire-and-forget)
     _INTERACTIVE_DISPATCH_MAX_RETRIES = 2
@@ -394,6 +548,7 @@ class HeadlessCommander:
                 if not self._is_interactive_prompt(agent):
                     # Agent is no longer at the prompt → delivery confirmed
                     self._active_agents.add(agent_name)
+                    self._last_dispatch_time[agent_name] = time.time()
                     log.info(
                         f"[{agent_name}] Verified: agent accepted /workflow-next "
                         f"on attempt {attempt}"
@@ -463,6 +618,7 @@ class HeadlessCommander:
         success = agent.send_command(cmd)
         if success:
             self._active_agents.add(agent_name)
+            self._last_dispatch_time[agent_name] = time.time()
             log.info(
                 f"[{agent_name}] Dispatched headless claude -p "
                 f"(spec={handoff.spec_id}, seq={seq})"

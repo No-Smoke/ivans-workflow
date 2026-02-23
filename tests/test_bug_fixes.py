@@ -96,6 +96,9 @@ def _make_commander(agents_dict=None):
     hc._agents = agents_dict or {}
     hc._active_agents = set()
     hc._session_ids = {}
+    hc._last_dispatch_time = {}
+    hc._dispatch_fail_count = {}
+    hc._dispatch_fail_time = {}
     hc._prompt_dir = config.log_dir / "prompts"
     return hc
 
@@ -216,7 +219,10 @@ class TestInteractiveDispatchBug6:
             return resp
         agent.pane.cmd.side_effect = _capture_side_effect
 
-        result = hc.activate_agent("builder", handoff, Path("/tmp/fake.json"))
+        # Bypass pane identity validation — this test checks dispatch routing,
+        # not validation logic (tested separately in TestPaneIdentityValidation).
+        with patch.object(hc, "_validate_pane_identity", return_value=True):
+            result = hc.activate_agent("builder", handoff, Path("/tmp/fake.json"))
 
         assert result is True
         assert "builder" in hc._active_agents
@@ -242,7 +248,10 @@ class TestInteractiveDispatchBug6:
 
         handoff_path = Path("/tmp/fake-handoff.json")
 
-        with patch.object(hc, "_dispatch_headless", return_value=True) as mock_hl:
+        # Bypass pane identity validation — this test checks dispatch routing,
+        # not validation logic (tested separately in TestPaneIdentityValidation).
+        with patch.object(hc, "_validate_pane_identity", return_value=True), \
+             patch.object(hc, "_dispatch_headless", return_value=True) as mock_hl:
             result = hc.activate_agent("builder", handoff, handoff_path)
             mock_hl.assert_called_once_with("builder", agent, handoff, handoff_path)
             assert result is True
@@ -328,3 +337,253 @@ class TestInteractiveCompletionBug6Fix:
         # from _active_agents for the idle check, or use a separate method.
         assert "builder" in completed
         assert "builder" not in hc._active_agents
+
+
+# ── Pane Identity Validation (C-u/workflow-next injection fix) ────
+
+
+class TestPaneIdentityValidation:
+    """Verify _validate_pane_identity prevents dispatch to wrong panes.
+
+    Three checks:
+    1. @iwo-agent tag must match expected agent name
+    2. pane cwd must be within project_root
+    3. Rate limiting: cooldown between dispatches
+    """
+
+    def _mock_subprocess_tag(self, tag_value, returncode=0):
+        """Create a subprocess.run mock that returns a specific tag value."""
+        result = MagicMock()
+        result.stdout = f"{tag_value}\n"
+        result.returncode = returncode
+        return MagicMock(return_value=result)
+
+    def test_valid_pane_passes_all_checks(self):
+        """Pane with correct tag, correct cwd, and no recent dispatch → passes."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project/src"
+        )
+        hc = _make_commander({"builder": agent})
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            assert hc._validate_pane_identity("builder", agent) is True
+
+    def test_wrong_tag_rejects(self):
+        """Pane with wrong @iwo-agent tag → rejected."""
+        agent = _make_agent_pane("builder", "claude")
+        hc = _make_commander({"builder": agent})
+
+        with patch("subprocess.run", self._mock_subprocess_tag("planner")):
+            assert hc._validate_pane_identity("builder", agent) is False
+
+    def test_empty_tag_rejects(self):
+        """Pane with no @iwo-agent tag → rejected."""
+        agent = _make_agent_pane("builder", "claude")
+        hc = _make_commander({"builder": agent})
+
+        with patch("subprocess.run", self._mock_subprocess_tag("")):
+            assert hc._validate_pane_identity("builder", agent) is False
+
+    def test_subprocess_failure_rejects(self):
+        """Tag check subprocess failure → rejected (fail-safe)."""
+        agent = _make_agent_pane("builder", "claude")
+        hc = _make_commander({"builder": agent})
+
+        with patch("subprocess.run", side_effect=OSError("no tmux")):
+            assert hc._validate_pane_identity("builder", agent) is False
+
+    def test_wrong_cwd_rejects(self):
+        """Pane in wrong working directory → rejected."""
+        agent = _make_agent_pane("builder", "claude")
+        # cwd is NOT under /tmp/fake-project
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/home/user/other-project"
+        )
+        hc = _make_commander({"builder": agent})
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            assert hc._validate_pane_identity("builder", agent) is False
+
+    def test_correct_cwd_passes(self):
+        """Pane in correct working directory → passes."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project/packages/web-app"
+        )
+        hc = _make_commander({"builder": agent})
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            assert hc._validate_pane_identity("builder", agent) is True
+
+    def test_rate_limiting_throttles(self):
+        """Dispatch within cooldown period → throttled."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project"
+        )
+        hc = _make_commander({"builder": agent})
+        # Simulate recent dispatch (2 seconds ago)
+        hc._last_dispatch_time["builder"] = time.time() - 2.0
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            assert hc._validate_pane_identity("builder", agent) is False
+
+    def test_rate_limiting_allows_after_cooldown(self):
+        """Dispatch after cooldown expires → allowed."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project"
+        )
+        hc = _make_commander({"builder": agent})
+        # Simulate old dispatch (30 seconds ago, well past 10s cooldown)
+        hc._last_dispatch_time["builder"] = time.time() - 30.0
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            assert hc._validate_pane_identity("builder", agent) is True
+
+    def test_no_previous_dispatch_allowed(self):
+        """First-ever dispatch (no previous timestamp) → allowed."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project"
+        )
+        hc = _make_commander({"builder": agent})
+        # _last_dispatch_time is empty — no previous dispatch
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            assert hc._validate_pane_identity("builder", agent) is True
+
+
+# ── Failed Dispatch Backoff (infinite retry loop fix) ────────────
+
+
+class TestDispatchFailBackoff:
+    """Verify exponential backoff prevents rapid retry after dispatch failures.
+
+    Root cause: when activate_agent() fails, the daemon re-queues the handoff.
+    The 2-second poll loop then retries immediately on the next cycle,
+    creating an infinite rapid-fire retry loop of C-u/workflow-next injection.
+
+    Fix: exponential backoff — 30s → 60s → 120s → 300s max after failures,
+    resetting on success.
+    """
+
+    def _mock_subprocess_tag(self, tag_value, returncode=0):
+        """Create a subprocess.run mock that returns a specific tag value."""
+        result = MagicMock()
+        result.stdout = f"{tag_value}\n"
+        result.returncode = returncode
+        return MagicMock(return_value=result)
+
+    def test_first_failure_sets_30s_cooldown(self):
+        """After first failure, next attempt blocked for 30 seconds."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project"
+        )
+        hc = _make_commander({"builder": agent})
+
+        # Record one failure
+        hc._record_dispatch_failure("builder")
+        assert hc._dispatch_fail_count["builder"] == 1
+
+        # Immediate retry should be blocked (within 30s cooldown)
+        handoff = MagicMock()
+        result = hc.activate_agent("builder", handoff, Path("/tmp/h.json"))
+        assert result is False
+
+    def test_second_failure_doubles_cooldown(self):
+        """After two failures, cooldown is 60 seconds."""
+        hc = _make_commander()
+
+        hc._record_dispatch_failure("builder")
+        hc._record_dispatch_failure("builder")
+        assert hc._dispatch_fail_count["builder"] == 2
+
+        # Cooldown should be min(30 * 2^1, 300) = 60s
+        from iwo.headless_commander import HeadlessCommander
+        cooldown = min(
+            HeadlessCommander._DISPATCH_FAIL_BASE_COOLDOWN * (2 ** 1),
+            HeadlessCommander._DISPATCH_FAIL_MAX_COOLDOWN,
+        )
+        assert cooldown == 60.0
+
+    def test_backoff_caps_at_300s(self):
+        """Backoff never exceeds 300 seconds regardless of failure count."""
+        hc = _make_commander()
+
+        # 10 consecutive failures
+        for _ in range(10):
+            hc._record_dispatch_failure("builder")
+
+        fail_count = hc._dispatch_fail_count["builder"]
+        from iwo.headless_commander import HeadlessCommander
+        cooldown = min(
+            HeadlessCommander._DISPATCH_FAIL_BASE_COOLDOWN * (2 ** (fail_count - 1)),
+            HeadlessCommander._DISPATCH_FAIL_MAX_COOLDOWN,
+        )
+        assert cooldown == 300.0
+
+    def test_backoff_allows_after_cooldown_expires(self):
+        """After cooldown expires, dispatch attempt proceeds."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project"
+        )
+        hc = _make_commander({"builder": agent})
+
+        # Record a failure 60 seconds ago (past 30s cooldown)
+        hc._dispatch_fail_count["builder"] = 1
+        hc._dispatch_fail_time["builder"] = time.time() - 60.0
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            with patch.object(hc, "is_agent_idle", return_value=True):
+                with patch.object(hc, "_dispatch_interactive", return_value=True):
+                    result = hc.activate_agent(
+                        "builder", MagicMock(), Path("/tmp/h.json")
+                    )
+                    assert result is True
+
+    def test_success_resets_backoff(self):
+        """Successful dispatch clears failure count."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project"
+        )
+        hc = _make_commander({"builder": agent})
+
+        # Set up past failures (but cooldown expired)
+        hc._dispatch_fail_count["builder"] = 3
+        hc._dispatch_fail_time["builder"] = time.time() - 600.0  # 10 min ago
+
+        with patch("subprocess.run", self._mock_subprocess_tag("builder")):
+            with patch.object(hc, "is_agent_idle", return_value=True):
+                with patch.object(hc, "_dispatch_interactive", return_value=True):
+                    result = hc.activate_agent(
+                        "builder", MagicMock(), Path("/tmp/h.json")
+                    )
+                    assert result is True
+
+        # Failure count should be reset
+        assert "builder" not in hc._dispatch_fail_count
+        assert "builder" not in hc._dispatch_fail_time
+
+    def test_identity_failure_records_backoff(self):
+        """Failed pane identity check records a dispatch failure for backoff."""
+        agent = _make_agent_pane("builder", "claude")
+        type(agent.pane).pane_current_path = PropertyMock(
+            return_value="/tmp/fake-project"
+        )
+        hc = _make_commander({"builder": agent})
+
+        # Tag check will fail (wrong tag) — must pass idle check first
+        with patch("subprocess.run", self._mock_subprocess_tag("planner")):
+            with patch.object(hc, "is_agent_idle", return_value=True):
+                result = hc.activate_agent(
+                    "builder", MagicMock(), Path("/tmp/h.json")
+                )
+                assert result is False
+
+        # Should have recorded a failure
+        assert hc._dispatch_fail_count.get("builder", 0) == 1

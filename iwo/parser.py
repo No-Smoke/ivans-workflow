@@ -1,15 +1,25 @@
-"""Handoff JSON parser with Pydantic validation."""
+"""Handoff JSON parser with Pydantic validation.
+
+Handles format variations across the 6-agent Boris pipeline:
+- metadata.specId (planner, docs) vs metadata.spec (builder, reviewer, tester, deployer)
+- deliverables as array (builder) vs dict (planner, docs) vs absent (reviewer, tester, deployer)
+- Agent-specific extra fields silently ignored (findings, deployment, testResults, etc.)
+"""
 
 from datetime import datetime
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from typing import Any, Optional
 
 
 class HandoffMetadata(BaseModel):
-    specId: str
+    """Handoff metadata — accepts both 'specId' and 'spec' as the spec identifier."""
+    model_config = ConfigDict(extra="ignore")
+
+    specId: str = Field(validation_alias=AliasChoices("specId", "spec"))
     agent: str
     timestamp: str
     sequence: int
+    received_at: Optional[str] = None
 
 
 class TestsStatus(BaseModel):
@@ -29,6 +39,8 @@ class ReviewFindings(BaseModel):
 
 
 class HandoffStatus(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     outcome: str  # "success" | "failed" | "approved"
     issueCount: int = 0
     claimMismatches: int = 0
@@ -42,6 +54,8 @@ class HandoffStatus(BaseModel):
 
 class Deliverables(BaseModel):
     """Files and verification results from agent work."""
+    model_config = ConfigDict(extra="ignore")
+
     filesCreated: list[str] = []
     filesModified: list[str] = []
     filesReviewed: list[str] = []
@@ -57,6 +71,8 @@ class Evidence(BaseModel):
 
 
 class NextAgent(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     target: str
     action: str
     context: Optional[str] = None
@@ -64,7 +80,15 @@ class NextAgent(BaseModel):
 
 
 class Handoff(BaseModel):
-    """Validated handoff document matching production JSON structure."""
+    """Validated handoff document matching production JSON structure.
+
+    Handles format variations across different agents:
+    - metadata.specId vs metadata.spec (both accepted via AliasChoices)
+    - deliverables as array (builder) vs dict (planner/docs) vs absent
+    - Extra agent-specific top-level fields silently ignored
+    """
+    model_config = ConfigDict(extra="ignore")
+
     metadata: HandoffMetadata
     status: HandoffStatus
     nextAgent: NextAgent
@@ -78,6 +102,36 @@ class Handoff(BaseModel):
     reviewDetails: Optional[dict] = None
     claimVerification: Optional[dict] = None
     summary: Optional[dict] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_deliverables(cls, data: Any) -> Any:
+        """Normalize builder's array deliverables into Deliverables dict format.
+
+        Builder writes deliverables as:
+            [{file: "...", action: "created|modified", ...}, ...]
+        Other agents write as:
+            {filesCreated: [...], filesModified: [...], ...}
+        """
+        if isinstance(data, dict):
+            deliverables = data.get("deliverables")
+            if isinstance(deliverables, list):
+                created = []
+                modified = []
+                for item in deliverables:
+                    if isinstance(item, dict):
+                        filepath = item.get("file", "")
+                        if not filepath:
+                            continue
+                        if item.get("action") == "created":
+                            created.append(filepath)
+                        else:
+                            modified.append(filepath)
+                data["deliverables"] = {
+                    "filesCreated": created,
+                    "filesModified": modified,
+                }
+        return data
 
     @property
     def spec_id(self) -> str:

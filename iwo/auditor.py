@@ -341,8 +341,8 @@ class Auditor:
     def _check_timestamp_sanity(self, handoff: Handoff) -> Optional[AuditEvent]:
         """Check for drift between metadata.timestamp and received_at."""
         try:
-            meta_ts = handoff.metadata.get("timestamp", "") if handoff.metadata else ""
-            received = handoff.metadata.get("received_at", "") if handoff.metadata else ""
+            meta_ts = handoff.metadata.timestamp if handoff.metadata else ""
+            received = (handoff.metadata.received_at or "") if handoff.metadata else ""
 
             if not meta_ts or not received:
                 return None
