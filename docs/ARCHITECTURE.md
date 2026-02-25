@@ -64,7 +64,8 @@ IWO is designed for Ivan's Workflow — a seven-agent development pipeline where
 │  │  Polls .directives/ every 2s for JSON commands             │  │
 │  │  Types: start-spec, next-spec, resume, reconcile, status,  │  │
 │  │         pause, unpause, cancel-spec                        │  │
-│  │  Sources: desktop launcher scripts, cron, CLI              │  │
+│  │  Sources: desktop launcher scripts, cron, CLI,             │  │
+│  │           auto-continue (on pipeline completion)           │  │
 │  │  Archives processed directives to .processed/              │  │
 │  └────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
@@ -338,6 +339,10 @@ class IWOConfig:
     max_handoffs_per_spec: int = 150
     agent_timeout_seconds: int = 1800
     human_gate_agents: set = {"deployer"}
+
+    # Auto-continue (queues next-spec directive on pipeline completion)
+    auto_continue_on_completion: bool = False   # TUI 'a' key to toggle
+    auto_continue_delay_seconds: float = 10.0
 
     # State machine
     state_poll_interval_seconds: float = 2.0

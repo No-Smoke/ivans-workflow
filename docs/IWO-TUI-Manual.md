@@ -71,6 +71,7 @@ The IWO TUI Dashboard is a live terminal interface that monitors and controls yo
 | `d` | Deploy Approve | When deployer is gated — sends `/workflow-next` to deployer |
 | `r` | Force Reconcile | Immediate filesystem scan for missed handoffs |
 | `p` | Pause / Resume | Toggles state polling and reconciliation on/off |
+| `a` | Auto-Continue | Toggles auto next-spec after pipeline completion (default: off) |
 
 ## Agent States
 
