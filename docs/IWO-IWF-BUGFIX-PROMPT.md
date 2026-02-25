@@ -4,103 +4,83 @@ Copy everything below the line into a fresh chat in the eBatt.ai Claude Project.
 
 ---
 
-## Task: Debug and fix IWO auto-dispatch — agents not picking up handoffs
+## Task: Debug and fix an IWO/IWF issue
 
-IWO (Ivan's Workflow Orchestrator) is failing to reliably dispatch handoffs to agents. Despite 8 bugs fixed in the previous session, the system still stalls. I need you to diagnose and fix the remaining issues.
+IWO (Ivan's Workflow Orchestrator) is a Python daemon that orchestrates 6 Claude Code agents in tmux via headless `claude -p` dispatch. IWF (Ivan's Workflow) is the agent framework. I need you to diagnose and fix a specific issue.
+
+**The bug:** [DESCRIBE THE SYMPTOM HERE — e.g. "Builder dispatched twice for the same spec" or "Reviewer handoff not detected" or "TUI shows IDLE but agent is running"]
 
 ### System Overview
 
-**IWO** is a Python daemon (~4,800 lines across 10 modules) that orchestrates 6 Claude Code agents in tmux. When one agent writes a handoff JSON file, IWO detects it via inotify watchdog and dispatches the next agent.
+- **IWO:** Python daemon (~3,300 lines across 12 modules), headless dispatch via `claude -p`
+- **IWF:** 6 agents (Planner→Builder→Reviewer→Tester→Deployer→Docs) in tmux panes
+- **Dispatch model:** All panes start as idle bash. IWO detects handoff JSON via inotify, validates with Pydantic, checks pane is idle (pane_current_command + child process check via pgrep), launches `claude -p --model {opus|sonnet}` with handoff context piped to stdin.
+- **Agent models:** Planner/Builder/Reviewer=Opus, Tester/Deployer/Docs=Sonnet (AGENT_MODEL_MAP)
 
-**IWF** (Ivan's Workflow) is the agent framework — 6 agents (Planner, Builder, Reviewer, Tester, Deployer, Docs) running in tmux windows, each with a SKILL.md defining their role.
+### Repos and Key Paths
 
-**Repos:**
-- IWO: `/home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/` (commit `2962915`)
-- eBatt (agents + handoffs): `/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/` (commit `8c3b1f9`)
+| Location | Purpose |
+|----------|---------|
+| `/home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/` | IWO daemon, TUI, tools |
+| `/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/` | eBatt project (agents, handoffs, specs) |
+| `iwo/headless_commander.py` (~719 lines) | Dispatch, idle detection, completion checking |
+| `iwo/daemon.py` | Watchdog handler, poll loop, state derivation |
+| `iwo/parser.py` | Pydantic handoff validation |
+| `iwo/pipeline.py` | PipelineManager, multi-spec tracking |
+| `iwo/directives.py` | Desktop launcher directive processing |
+| `iwo/tui.py` | Textual TUI dashboard |
+| `iwo/config.py` | IWOConfig defaults |
+| `docs/ARCHITECTURE.md` | Full architecture guide |
+| `docs/CHANGELOG-FIXES.md` | All bug fixes chronologically (read this FIRST) |
+| `docs/IWO-TUI-Manual.md` | TUI controls and safety rails |
+| `ebatt/docs/agent-comms/{SPEC-ID}/` | Handoff JSON files per spec |
+| `ebatt/.claude/skills/boris-{role}-agent/SKILL.md` | Agent role definitions |
+| `ebatt/.claude/skills/workflow-handoff/HANDOFF-SCHEMA.md` | Handoff JSON schema |
 
-### Current Architecture (v2.8.5)
+### Debugging Methodology
 
-Dispatch has three layers:
-1. **Direct dispatch:** `HandoffHandler.on_created()` → `process_handoff()` → canary probe on target → rich activation prompt
-2. **Queue retry:** If canary fails, handoff queued. `_process_pending_activations()` retries every ~2s. After 30s queue age, ignores state machine hint. After 2min, sends notification.
-3. **State machine (display only):** IDLE/PROCESSING/STUCK/CRASHED for TUI dashboard. NOT used for dispatch decisions.
 
-### Key Files to Read First
+**ALWAYS read these files before proposing any fix:**
 
-Read these files using Desktop Commander before proposing any changes:
+1. `docs/CHANGELOG-FIXES.md` — all prior fixes with root causes. Do not re-introduce fixed bugs.
+2. `docs/ARCHITECTURE.md` — system architecture and component diagram.
+3. The specific module(s) implicated by the symptom.
 
-1. `docs/ARCHITECTURE.md` — full architecture guide with troubleshooting decision tree
-2. `docs/BUG-REPORT-2026-02-21-state-detection.md` — 8 bugs found and fixed, with root causes
-3. `iwo/daemon.py` (1172 lines) — HandoffHandler, process_handoff(), _process_pending_activations(), _activate_for_handoff()
-4. `iwo/commander.py` (485 lines) — activate_agent() with rich prompt, send_canary_and_wait(), AgentPane
-5. `iwo/state.py` (195 lines) — AgentStateMachine, _check_idle_prompt()
-6. `iwo/pipeline.py` (341 lines) — PipelineManager, queue/dequeue, agent assignments, staleness
-7. `iwo/config.py` (148 lines) — IWOConfig defaults
-8. `tests/test_bug_fixes.py` — existing tests for bugs 1-3
+**Diagnosis steps:**
 
-Also read the IWF agent activation flow:
-- `.claude/commands/workflow-next.md` (in eBatt repo) — the slash command agents are supposed to execute
-- `.claude/hooks.json` (in eBatt repo) — agent hooks configuration
+1. **Did IWO see the file?** Check `received_at` field in the handoff JSON. Present = watchdog fired.
+2. **Is LATEST.json correct?** Compare symlink target vs highest-numbered JSON in the spec directory.
+3. **Is the target pane idle?** Run: `tmux list-windows -t claude-agents -F '#{window_index}: #{window_name} | #{pane_current_command}'` and check for child processes: `pgrep -P $(tmux display -t claude-agents:{N} -p '#{pane_pid}')`.
+4. **Was dispatch attempted?** Check IWO TUI log panel or `logs/agent-{name}-{seq}.log` existence.
+5. **Did the agent run?** Check `ps aux | grep 'claude -p'` for active processes.
+6. **Pipeline state?** Read `docs/agent-comms/.active-specs.json` for pipeline tracking state.
 
-### Debugging Decision Tree
+### Known Fixed Bugs (Do NOT Re-Introduce)
 
-Follow this to diagnose where dispatch fails:
+Fixes 1-13 are documented in `docs/CHANGELOG-FIXES.md`. Key ones:
 
-**Step 1: Did IWO see the file?** Check `received_at` in the handoff JSON. Present = watchdog fired. Absent = detection failed.
-
-**Step 2: Is LATEST.json correct?** `readlink` the symlink vs highest-numbered JSON file.
-
-**Step 3: Was canary attempted?** TUI log panel shows "Canary probe on {agent}..."
-
-**Step 4: Did canary pass?** "Canary passed" = dispatch attempted. "Canary failed" = queued for retry.
-
-**Step 5: Did agent execute?** Check tmux pane for the rich prompt text. If visible but no execution = Claude Code ignored it.
-
-**Step 6: Pipeline state?** Check `pipeline.is_agent_busy()`, `pipeline.queue_depth()`, pipeline status.
-
-### Known Fixed Bugs (Do Not Re-Fix)
-
-1. State machine stuck PROCESSING → canary is now the dispatch gate (c1cf05a, 09a59bd)
-2. LATEST.json symlink stale → IWO owns symlink updates (c1cf05a)
-3. Stale pipeline assignments → session-timestamp staleness (849413c)
-4. Permission prompts → `--permission-mode bypassPermissions` (220b4ae, 68e2e1d)
-5. Missing webhook notifications → INFO-severity audit events (05f3970)
-6. Permission mode refinement → exact skill paths (cc028ec)
-7. Audit file filtering → .audit/ excluded from HandoffHandler (b11ab20)
-8. /workflow-next silently ignored → rich activation prompt (fed1c67)
-9. Queue retry deadlock → 30s threshold ignores state machine (2c89c71)
-
-### What's Still Failing
-
-Despite all fixes, the Reviewer agent did not pick up Builder handoff #012 for EBATT-006A. The rich activation prompt was committed (fed1c67) but needs IWO restart to take effect. After restart, if dispatch still fails, investigate:
-
-- Whether `send_command()` (tmux send-keys) actually delivers the full rich prompt text reliably (long strings may be truncated or garbled by tmux)
-- Whether the canary probe's "bottom 5 lines" check matches what Claude Code actually shows
-- Whether `pipeline.is_agent_busy()` is returning True when it shouldn't (blocking queue drain)
-- Whether the queue `peek_queue()` returns items with correct `queued_at` timestamps
-- Whether the Textual TUI timer for `_poll_states` is actually calling `_process_pending_activations()`
+- **Fix 11:** Stripped interactive dispatch — headless only. No send-keys, no canary probes.
+- **Fix 12:** Added `--model` flag and AGENT_MODEL_MAP. Without it, all agents default to Haiku.
+- **Fix 13:** Idle detection now checks child processes via `pgrep -P $pane_pid`. Without this, `pane_current_command` reports "bash" while `claude -p` runs as a child, causing double-dispatch and premature completion detection.
 
 ### Rules
 
-- Use Desktop Commander for ALL file operations under `/home/vanya/`
-- Read the ARCHITECTURE.md troubleshooting section before proposing changes
-- Query `qdrant-new:semantic_search collection='project_memory_v2' query='IWO dispatch canary queue retry'` for additional context
-- Query `neo4j-memory-remote:search_memories query='IWO Dispatch System Option A'` for architecture decisions
-- Run `python3 -m pytest tests/ -v` after any code change
-- All syntax must pass `python3 -m py_compile iwo/{file}.py`
-- Commit with detailed messages explaining root cause and fix
-- Push to `origin main` after each fix
-- Follow the Honesty Protocol: report exact evidence, no claims without verification
+- Use **Desktop Commander** for ALL file operations under `/home/vanya/`. Never use container tools (view, bash_tool, str_replace) for local files.
+- Read CHANGELOG-FIXES.md and ARCHITECTURE.md BEFORE proposing changes.
+- Run `python3 -m py_compile iwo/{file}.py` after any code change.
+- Run `python3 -m pytest tests/ -v` if tests exist for the affected module.
+- Commit with detailed message explaining root cause and fix, following the pattern in CHANGELOG-FIXES.md.
+- **Honesty Protocol:** Report exact evidence. No claims without verification. If you cannot reproduce the bug, say so.
+- After fixing, verify with `get_file_info` that the file was written (size > 0, mtime updated).
+- Query `qdrant-new:semantic_search collection='project_memory_v2'` for related context if the bug involves a recurring pattern.
 
-### Reproduction Steps
+### Reproduction
 
-1. Start IWO: `cd /home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator && source .venv/bin/activate && python -m iwo.tui`
-2. Start agents: `cd /home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt && ./scripts/boris-workflow/launch-tmux-agents-v5.sh`
-3. On the Planner pane: `/workflow-start` or `/workflow-next`
-4. Watch IWO TUI — when Planner writes handoff, does the Builder pick it up?
-5. When Builder writes handoff, does the Reviewer pick it up?
-6. Check for stuck queues, false PROCESSING states, silent command failures
+1. Start IWF: Click "Ivan's Workflow" desktop launcher (or `cd ebatt && ./scripts/boris-workflow/launch-tmux-agents-v5.sh`)
+2. Start IWO: Click "IWO" desktop launcher (or `cd ivans-workflow-orchestrator && source .venv/bin/activate && python -m iwo.tui`)
+3. Trigger work: "Plan Next Spec" desktop action, or manually dispatch via directive
+4. Monitor: IWO TUI dashboard, Kanban at http://localhost:8787, and `docs/agent-comms/{SPEC}/` for new handoff files
 
 ### Success Criteria
 
-IWO reliably dispatches handoffs through at least one full pipeline cycle: Planner → Builder → Reviewer → Tester → Deployer → Docs, with no manual intervention. Each transition should complete within 60 seconds of the previous agent writing its handoff.
+The specific bug described above is fixed, verified by evidence, committed with a descriptive message, and does not regress any of the 13 prior fixes.
