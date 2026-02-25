@@ -76,6 +76,12 @@ class IWOConfig:
     agent_007_timeout_seconds: int = 600  # 10 min max runtime per activation
     agent_007_budget_usd: float = 5.0  # max API spend per activation
 
+    # --- Ops Actions Notifications ---
+    ops_actions_notify_critical: bool = True
+    ops_actions_notify_warning: bool = True
+    ops_actions_daily_digest: bool = False
+    ops_actions_daily_digest_hour: int = 8  # NZ morning
+
     # --- Pipeline staleness (Bug 3 fix) ---
     stale_pipeline_hours: float = 4.0  # pipelines with no handoff activity beyond this are stale
     agent_007_project_root: Path = Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt"

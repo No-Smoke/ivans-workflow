@@ -19,6 +19,7 @@ Design: Three-model consensus (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro).
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +41,14 @@ from .pipeline import PipelineManager
 from .metrics import MetricsCollector
 from .auditor import Auditor, AuditorConfig
 from .directives import DirectiveProcessor
+from .ops_actions import (
+    OpsAction,
+    OpsActionsRegister,
+    classify_category,
+    classify_priority,
+    compute_fingerprint,
+    _next_id,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -217,6 +226,11 @@ class IWODaemon:
 
         # Directive processor — operator commands via filesystem
         self.directive_processor = DirectiveProcessor(self.config, self)
+
+        # Ops Actions Register — tracks human-required operational tasks
+        ops_path = self.config.handoffs_dir / ".ops-actions.json"
+        self.ops_register = OpsActionsRegister(ops_path)
+        self.ops_register.load()
 
         # Pause flag — set by pause directive, prevents new dispatches
         self._paused: bool = False
@@ -622,6 +636,196 @@ class IWODaemon:
         log.info(f"Auto-approve check: UNSAFE — {reason}")
         return False, reason
 
+    # --- Ops Actions Auto-Extraction ---
+
+    # Patterns that indicate a human operational task (not code review notes)
+    _OPS_PATTERNS = [
+        re.compile(p, re.IGNORECASE) for p in [
+            r'migration.*not\s+(yet\s+)?(applied|run)',
+            r'not\s+yet\s+(set|configured|created|applied|deployed|stored)',
+            r'wrangler\s+(secret|d1)',
+            r'must\s+(run|create|configure|set|apply|execute|deploy|store)',
+            r'secrets?\s+not\s+(set|configured)',
+            r'\bDNS\b.*\b(CNAME|A\s+record|MX|DKIM|SPF|DMARC)\b',
+            r'HUMAN\s+ACTION\s+REQUIRED',
+            r'human\s+(must|task)',
+            r'seed\s+data\s+not\s+(yet\s+)?loaded',
+            r'not\s+yet\s+deployed',
+            r'webhook.*not\s+(set|configured)',
+            r'SMTP.*not\s+configured',
+            r'Stripe\s+(product|webhook).*not\s+(yet\s+)?(created|configured)',
+            r'n8n\s+workflow',
+            r'KV\s+namespace.*not\s+(yet\s+)?created',
+            r'KV\s+namespace\s+ID\s+(is\s+)?empty',
+            r'npx\s+wrangler',
+        ]
+    ]
+
+    def _is_ops_action(self, text: str) -> bool:
+        """Check if text matches an operational action pattern."""
+        return any(p.search(text) for p in self._OPS_PATTERNS)
+
+    def _extract_ops_actions(self, handoff: Handoff, path: Path):
+        """Extract ops actions from a handoff and add to the register.
+
+        Scans unresolvedIssues, deploymentInstructions, and nextAgent for
+        human-required operational tasks. Deduplicates via fingerprinting.
+        Also runs stale detection for existing actions on this spec.
+        """
+        spec_id = handoff.spec_id
+        new_actions: list[OpsAction] = []
+
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+        except Exception as e:
+            log.warning(f"Ops extraction: cannot read {path.name}: {e}")
+            return
+
+        source_agent = handoff.source_agent
+        sequence = handoff.sequence
+        existing_ids = [a.id for a in self.ops_register.actions]
+
+        # Collect candidate texts for stale detection
+        current_texts: set[str] = set()
+
+        # 1. unresolvedIssues
+        for issue in raw.get("status", {}).get("unresolvedIssues", []):
+            if isinstance(issue, str) and len(issue.strip()) > 10:
+                current_texts.add(issue.strip().lower())
+                if self._is_ops_action(issue):
+                    fp = compute_fingerprint(spec_id, issue)
+                    new_actions.append(OpsAction(
+                        id=_next_id(existing_ids + [a.id for a in new_actions]),
+                        spec_id=spec_id,
+                        title=issue.strip()[:80],
+                        description=issue.strip(),
+                        category=classify_category(issue),
+                        priority=classify_priority(issue),
+                        source_agent=source_agent,
+                        source_sequence=sequence,
+                        fingerprint=fp,
+                        auto_extracted=True,
+                    ))
+
+        # 2. deploymentInstructions manual steps
+        deploy_info = raw.get("deploymentInstructions", {})
+        if isinstance(deploy_info, dict):
+            for field in ("preDeploySteps", "postDeploySteps", "manualSteps"):
+                steps = deploy_info.get(field, [])
+                if isinstance(steps, list):
+                    for step in steps:
+                        if isinstance(step, str) and len(step.strip()) > 10:
+                            current_texts.add(step.strip().lower())
+                            if self._is_ops_action(step):
+                                fp = compute_fingerprint(spec_id, step)
+                                new_actions.append(OpsAction(
+                                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                                    spec_id=spec_id,
+                                    title=step.strip()[:80],
+                                    description=step.strip(),
+                                    category=classify_category(step),
+                                    priority=classify_priority(step),
+                                    source_agent=source_agent,
+                                    source_sequence=sequence,
+                                    fingerprint=fp,
+                                    auto_extracted=True,
+                                ))
+
+            # Infrastructure flags
+            if deploy_info.get("noNewMigrations") is False:
+                text = f"D1 migration required for {spec_id} — noNewMigrations=false"
+                fp = compute_fingerprint(spec_id, text)
+                new_actions.append(OpsAction(
+                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                    spec_id=spec_id,
+                    title=f"D1 migration required for {spec_id}",
+                    description=text,
+                    category="migration",
+                    priority="critical",
+                    source_agent=source_agent,
+                    source_sequence=sequence,
+                    fingerprint=fp,
+                    auto_extracted=True,
+                ))
+
+            if deploy_info.get("noNewSecrets") is False:
+                text = f"Wrangler secrets must be configured for {spec_id} — noNewSecrets=false"
+                fp = compute_fingerprint(spec_id, text)
+                new_actions.append(OpsAction(
+                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                    spec_id=spec_id,
+                    title=f"Wrangler secrets needed for {spec_id}",
+                    description=text,
+                    category="secret",
+                    priority="critical",
+                    source_agent=source_agent,
+                    source_sequence=sequence,
+                    fingerprint=fp,
+                    auto_extracted=True,
+                ))
+
+        # 3. nextAgent targeting human
+        next_agent = raw.get("nextAgent", {})
+        if isinstance(next_agent, dict) and next_agent.get("target") == "human":
+            action_text = next_agent.get("action", "")
+            if isinstance(action_text, str) and len(action_text.strip()) > 10 and self._is_ops_action(action_text):
+                fp = compute_fingerprint(spec_id, action_text)
+                new_actions.append(OpsAction(
+                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                    spec_id=spec_id,
+                    title=action_text.strip()[:80],
+                    description=action_text.strip(),
+                    category=classify_category(action_text),
+                    priority=classify_priority(action_text),
+                    source_agent=source_agent,
+                    source_sequence=sequence,
+                    fingerprint=fp,
+                    auto_extracted=True,
+                ))
+
+        # Add new actions (dedup handled by register)
+        added = 0
+        for action in new_actions:
+            if self.ops_register.add(action):
+                added += 1
+                # Notify for critical/warning actions
+                if action.effective_priority == "critical":
+                    self._notify(
+                        f"⛔ OPS ACTION REQUIRED [{spec_id}]: {action.title}",
+                        critical=True,
+                    )
+                elif action.effective_priority == "warning":
+                    self._notify(
+                        f"⚠️ OPS ACTION [{spec_id}]: {action.title}",
+                    )
+
+        if added:
+            self.ops_register.save()
+            log.info(f"Ops extraction: {added} new action(s) from {handoff.spec_id} #{sequence}")
+
+        # 4. Stale detection: check if existing pending actions for this spec
+        # are no longer mentioned in current handoff's unresolvedIssues
+        if current_texts:
+            for action in self.ops_register.get_pending_for_spec(spec_id):
+                if not action.auto_extracted:
+                    continue
+                # Check if the action's description (normalized) still appears
+                desc_lower = action.description.lower().strip()
+                still_present = any(
+                    desc_lower in t or t in desc_lower
+                    for t in current_texts
+                )
+                if not still_present and not action.stale_since:
+                    self.ops_register.mark_stale(action.id)
+                    log.info(f"Ops stale: {action.id} ({action.title[:50]}) no longer in {spec_id} handoff")
+                elif still_present and action.stale_since:
+                    self.ops_register.clear_stale(action.id)
+                    log.info(f"Ops un-stale: {action.id} reappeared in {spec_id}")
+
+            # Save if any stale changes
+            self.ops_register.save()
+
     def process_handoff(self, path: Path):
         """Parse, validate, and route a handoff file.
 
@@ -736,11 +940,23 @@ class IWODaemon:
                     )
                     # Fall through to step 9 routing
                 else:
+                    # Build pending critical ops actions list for this spec
+                    ops_detail = ""
+                    pending_critical = self.ops_register.get_pending_for_spec(
+                        handoff.spec_id, "critical"
+                    )
+                    if pending_critical:
+                        ops_lines = [f"  - {a.title}" for a in pending_critical[:5]]
+                        ops_detail = (
+                            f"\n⛔ {len(pending_critical)} pending critical ops action(s):\n"
+                            + "\n".join(ops_lines)
+                        )
                     msg = (
                         f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
                         f"Reason: {reason}. "
                         f"Press 'd' to approve. "
                         f"Action: {handoff.nextAgent.action[:100]}"
+                        f"{ops_detail}"
                     )
                     log.info(msg)
                     self._notify(msg, critical=True)
@@ -813,6 +1029,12 @@ class IWODaemon:
                 self.auditor.post_handoff_checks(handoff)
             except Exception as e:
                 log.warning(f"Auditor post-handoff check failed (non-fatal): {e}")
+
+        # 12. Ops Actions: extract human-required tasks from handoff (best-effort)
+        try:
+            self._extract_ops_actions(handoff, path)
+        except Exception as e:
+            log.warning(f"Ops actions extraction failed (non-fatal): {e}")
 
     def _reconcile_filesystem(self):
         """Periodic scan to catch missed inotify events. Called every 30s.
@@ -988,7 +1210,13 @@ class IWODaemon:
         )
 
         # Determine a short tag/emoji for the notification
-        if "AUTO-DEPLOY" in message or "activated" in message:
+        if "OPS ACTION REQUIRED" in message:
+            tags = "rotating_light"
+        elif "OPS ACTION" in message and critical:
+            tags = "rotating_light"
+        elif "OPS ACTION" in message:
+            tags = "warning"
+        elif "AUTO-DEPLOY" in message or "activated" in message:
             tags = "rocket"
         elif "DEPLOY GATE" in message:
             tags = "construction"

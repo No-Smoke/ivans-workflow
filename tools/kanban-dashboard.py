@@ -33,6 +33,44 @@ def get_project_root(override: str = None) -> Path:
 AGENTS_ORDERED = ["planner", "builder", "reviewer", "tester", "deployer", "docs"]
 
 
+def load_ops_actions(project_root: Path) -> dict:
+    """Load ops actions register and compute summary counts."""
+    ops_path = project_root / "docs" / "agent-comms" / ".ops-actions.json"
+    result = {
+        "actions": [],
+        "pending_critical": 0,
+        "pending_warning": 0,
+        "pending_info": 0,
+        "completed": 0,
+        "skipped": 0,
+        "total_pending": 0,
+    }
+    if not ops_path.exists():
+        return result
+    try:
+        data = json.loads(ops_path.read_text())
+        actions = data.get("actions", [])
+        result["actions"] = actions
+        for a in actions:
+            status = a.get("status", "pending")
+            priority = a.get("priority_override") or a.get("priority", "info")
+            if status == "pending":
+                if priority == "critical":
+                    result["pending_critical"] += 1
+                elif priority == "warning":
+                    result["pending_warning"] += 1
+                else:
+                    result["pending_info"] += 1
+                result["total_pending"] += 1
+            elif status == "completed":
+                result["completed"] += 1
+            elif status == "skipped":
+                result["skipped"] += 1
+    except Exception:
+        pass
+    return result
+
+
 
 def get_tmux_pane_states() -> dict[str, dict]:
     """Query tmux for all agent pane states."""
@@ -207,6 +245,7 @@ def build_html(project_root: Path) -> str:
     current_spec = get_current_spec(agent_comms)
     pane_states = get_tmux_pane_states()
     specs = get_all_specs(agent_comms)
+    ops = load_ops_actions(project_root)
     now = datetime.now().strftime("%H:%M:%S")
 
     # Find active spec data
@@ -311,6 +350,22 @@ def build_html(project_root: Path) -> str:
             <span class="progress-text">{len(completed_agents)}/{len(AGENTS_ORDERED)} stages complete</span>
         </div>"""
 
+    # Build banner text
+    if ops['pending_critical'] > 0:
+        banner_text = f"{ops['pending_critical']} critical ops action(s) pending"
+        if ops['pending_warning'] > 0:
+            banner_text += f" + {ops['pending_warning']} warning"
+    elif ops['pending_warning'] > 0:
+        banner_text = f"{ops['pending_warning']} warning ops action(s) pending"
+    elif ops['total_pending'] > 0:
+        banner_text = f"{ops['pending_info']} info ops action(s) pending"
+    else:
+        banner_text = "All ops actions resolved"
+
+    # Ops banner/button colors
+    ops_color = '#da3633' if ops['pending_critical'] > 0 else '#9e6a03' if ops['pending_warning'] > 0 else '#238636'
+    ops_btn_label = f"Ops Actions ({ops['total_pending']})" if ops['total_pending'] > 0 else "Ops Actions"
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -335,14 +390,18 @@ header {{
     justify-content: space-between;
     align-items: center;
 }}
-header h1 {{
-    font-size: 18px;
-    color: #58a6ff;
-    font-weight: 600;
+header h1 {{ font-size: 18px; color: #58a6ff; font-weight: 600; }}
+.header-right {{ display: flex; align-items: center; gap: 12px; }}
+header .time {{ color: #8b949e; font-size: 13px; }}
+.ops-btn {{
+    display: inline-block; padding: 4px 12px; border-radius: 12px;
+    font-size: 12px; font-weight: 600; text-decoration: none;
+    color: #fff; background: {ops_color};
 }}
-header .time {{
-    color: #8b949e;
-    font-size: 13px;
+.ops-btn:hover {{ opacity: 0.85; }}
+.ops-banner {{
+    padding: 8px 24px; font-size: 13px; font-weight: 600;
+    text-align: center; background: {ops_color}; color: #fff;
 }}
 .main {{
     display: flex;
@@ -520,8 +579,12 @@ header .time {{
 <body>
 <header>
     <h1>Ivan's Workflow — Pipeline Dashboard</h1>
-    <span class="time">Updated {now} · Auto-refresh 5s</span>
+    <div class="header-right">
+        <a href="/ops" class="ops-btn">{ops_btn_label}</a>
+        <span class="time">Updated {now} · Auto-refresh 5s</span>
+    </div>
 </header>
+<div class="ops-banner">{banner_text}</div>
 <div class="main">
     <div class="kanban">
         {active_card}
@@ -539,6 +602,140 @@ header .time {{
 
 
 
+def _action_age(created_at: str) -> str:
+    """Compute human-readable age from ISO timestamp."""
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - created
+        days = delta.days
+        hours = delta.seconds // 3600
+        if days > 0:
+            return f"{days}d {hours}h"
+        return f"{hours}h {(delta.seconds % 3600) // 60}m"
+    except Exception:
+        return "?"
+
+
+def _escape(text: str) -> str:
+    """Minimal HTML escaping."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def build_ops_html(project_root: Path) -> str:
+    """Generate the Ops Actions register page at /ops."""
+    ops = load_ops_actions(project_root)
+    actions = ops["actions"]
+    now = datetime.now().strftime("%H:%M:%S")
+
+    # Group actions by status
+    pending_critical = [a for a in actions if a["status"] == "pending" and (a.get("priority_override") or a["priority"]) == "critical"]
+    pending_warning = [a for a in actions if a["status"] == "pending" and (a.get("priority_override") or a["priority"]) == "warning"]
+    pending_info = [a for a in actions if a["status"] == "pending" and (a.get("priority_override") or a["priority"]) == "info"]
+    completed = [a for a in actions if a["status"] == "completed"]
+    skipped = [a for a in actions if a["status"] == "skipped"]
+
+    def render_action(a: dict) -> str:
+        priority = a.get("priority_override") or a["priority"]
+        pri_colors = {"critical": "#da3633", "warning": "#9e6a03", "info": "#388bfd"}
+        pri_color = pri_colors.get(priority, "#8b949e")
+        age = _action_age(a.get("created_at", ""))
+        stale_badge = ""
+        if a.get("stale_since"):
+            stale_badge = '<span style="background:#9e6a03;color:#fff;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:8px;">POSSIBLY RESOLVED</span>'
+        ver_cmd = ""
+        if a.get("verification_cmd"):
+            escaped_cmd = _escape(a["verification_cmd"])
+            ver_cmd = f'<div class="ver-cmd" onclick="navigator.clipboard.writeText(this.innerText)" title="Click to copy"><code>{escaped_cmd}</code></div>'
+        status_class = a["status"]
+        return f'''<div class="ops-action {status_class}">
+            <div class="ops-action-header">
+                <span class="pri-badge" style="background:{pri_color}">{priority.upper()}</span>
+                <span class="ops-spec">{_escape(a.get("spec_id", ""))}</span>
+                <span class="ops-id">{_escape(a.get("id", ""))}</span>
+                <span class="ops-age">{age}</span>
+                <span class="ops-cat">{_escape(a.get("category", ""))}</span>
+                {stale_badge}
+            </div>
+            <div class="ops-title">{_escape(a.get("title", ""))}</div>
+            <div class="ops-desc">{_escape(a.get("description", ""))}</div>
+            {ver_cmd}
+        </div>'''
+
+    def render_group(title: str, items: list[dict], collapse: bool = False) -> str:
+        if not items:
+            return ""
+        cards = "\n".join(render_action(a) for a in items)
+        open_attr = "" if collapse else " open"
+        return f'<details{open_attr}><summary class="group-header">{title} ({len(items)})</summary><div class="group-body">{cards}</div></details>'
+
+    groups_html = ""
+    groups_html += render_group("Pending Critical", pending_critical)
+    groups_html += render_group("Pending Warning", pending_warning)
+    groups_html += render_group("Pending Info", pending_info)
+    groups_html += render_group("Completed", completed, collapse=True)
+    groups_html += render_group("Skipped", skipped, collapse=True)
+
+    ops_color = '#da3633' if ops['pending_critical'] > 0 else '#9e6a03' if ops['pending_warning'] > 0 else '#238636'
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>Ops Actions Register</title>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#0d1117; color:#c9d1d9; }}
+header {{ background:#161b22; border-bottom:1px solid #30363d; padding:12px 24px; display:flex; justify-content:space-between; align-items:center; }}
+header h1 {{ font-size:18px; color:#58a6ff; font-weight:600; }}
+.header-right {{ display:flex; align-items:center; gap:12px; }}
+header .time {{ color:#8b949e; font-size:13px; }}
+a.back-btn {{ color:#58a6ff; text-decoration:none; font-size:13px; font-weight:600; }}
+a.back-btn:hover {{ text-decoration:underline; }}
+.summary-bar {{ background:#161b22; padding:12px 24px; border-bottom:1px solid #30363d; display:flex; gap:20px; align-items:center; }}
+.summary-pill {{ padding:4px 12px; border-radius:12px; font-size:12px; font-weight:600; color:#fff; }}
+.content {{ max-width:1000px; margin:0 auto; padding:20px 24px; }}
+.group-header {{ font-size:14px; font-weight:700; color:#c9d1d9; padding:12px 0 8px; cursor:pointer; list-style:none; }}
+.group-header::-webkit-details-marker {{ display:none; }}
+.group-header::before {{ content:"\\25B6 "; font-size:10px; margin-right:6px; }}
+details[open] > .group-header::before {{ content:"\\25BC "; }}
+.group-body {{ display:flex; flex-direction:column; gap:8px; margin-bottom:16px; }}
+.ops-action {{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px 16px; }}
+.ops-action.completed {{ opacity:0.6; }}
+.ops-action.skipped {{ opacity:0.5; }}
+.ops-action-header {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:6px; }}
+.pri-badge {{ padding:2px 8px; border-radius:4px; font-size:10px; font-weight:700; color:#fff; }}
+.ops-spec {{ font-weight:600; color:#58a6ff; font-size:13px; }}
+.ops-id {{ color:#484f58; font-size:11px; }}
+.ops-age {{ color:#8b949e; font-size:11px; }}
+.ops-cat {{ background:#21262d; padding:2px 6px; border-radius:4px; font-size:10px; color:#8b949e; }}
+.ops-title {{ font-weight:600; font-size:14px; color:#c9d1d9; margin-bottom:4px; }}
+.ops-desc {{ font-size:13px; color:#8b949e; line-height:1.4; margin-bottom:6px; }}
+.ver-cmd {{ background:#0d1117; border:1px solid #21262d; border-radius:4px; padding:6px 10px; cursor:pointer; margin-top:4px; }}
+.ver-cmd code {{ font-size:12px; color:#7ee787; word-break:break-all; }}
+.ver-cmd:hover {{ border-color:#58a6ff; }}
+</style></head>
+<body>
+<header>
+    <h1>Ops Actions Register</h1>
+    <div class="header-right">
+        <a href="/" class="back-btn">Back to Pipeline</a>
+        <span class="time">Updated {now}</span>
+    </div>
+</header>
+<div class="summary-bar">
+    <span class="summary-pill" style="background:#da3633">{ops['pending_critical']} critical</span>
+    <span class="summary-pill" style="background:#9e6a03">{ops['pending_warning']} warning</span>
+    <span class="summary-pill" style="background:#388bfd">{ops['pending_info']} info</span>
+    <span class="summary-pill" style="background:#238636">{ops['completed']} completed</span>
+    <span class="summary-pill" style="background:#484f58">{ops['skipped']} skipped</span>
+    <span style="color:#8b949e;font-size:12px;margin-left:auto;">{len(actions)} total actions</span>
+</div>
+<div class="content">
+    {groups_html}
+</div>
+</body></html>"""
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     """HTTP handler that serves the Kanban dashboard."""
 
@@ -551,8 +748,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(html.encode())
+        elif self.path == "/ops":
+            html = build_ops_html(self.project_root)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode())
         elif self.path == "/api/state":
-            # JSON API for programmatic access
             agent_comms = self.project_root / "docs" / "agent-comms"
             data = {
                 "current_spec": get_current_spec(agent_comms),
@@ -564,6 +766,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(data, indent=2).encode())
+        elif self.path == "/api/ops":
+            ops = load_ops_actions(self.project_root)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(ops, indent=2).encode())
         else:
             self.send_response(404)
             self.end_headers()
