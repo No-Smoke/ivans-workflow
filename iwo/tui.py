@@ -266,6 +266,7 @@ class IWOApp(App):
         Binding("d", "deploy_approve", "Deploy Approve", priority=True),
         Binding("r", "force_reconcile", "Reconcile", priority=True),
         Binding("p", "pause_toggle", "Pause/Resume", priority=True),
+        Binding("a", "auto_continue_toggle", "Auto-Continue", priority=True),
     ]
 
     CSS = """
@@ -377,6 +378,7 @@ class IWOApp(App):
         self._display_timer = self.set_interval(1.0, self._update_display)
         self._health_timer = self.set_interval(60.0, self._check_memory_health)
         self._metrics_timer = self.set_interval(60.0, self._refresh_metrics)
+        self._directive_timer = self.set_interval(poll_interval, self._poll_directives)
 
         # Run initial health check and metrics
         self._check_memory_health()
@@ -393,6 +395,13 @@ class IWOApp(App):
         if self._paused:
             return
         self.daemon._reconcile_filesystem()
+
+    def _poll_directives(self) -> None:
+        """Poll for operator directive files."""
+        try:
+            self.daemon.directive_processor.poll()
+        except Exception as e:
+            self.log_message(f"Directive poll error: {e}")
 
     def _update_display(self) -> None:
         """Refresh all display widgets from daemon state."""
@@ -691,6 +700,16 @@ class IWOApp(App):
             rich_log.write("[bold yellow]⏸ Polling PAUSED[/]")
         else:
             rich_log.write("[bold green]▶ Polling RESUMED[/]")
+
+    def action_auto_continue_toggle(self) -> None:
+        """Toggle auto-continue on pipeline completion."""
+        cfg = self.daemon.config
+        cfg.auto_continue_on_completion = not cfg.auto_continue_on_completion
+        rich_log = self.query_one("#log-output", RichLog)
+        if cfg.auto_continue_on_completion:
+            rich_log.write("[bold green]🔄 Auto-continue ENABLED — next-spec will auto-queue on pipeline completion[/]")
+        else:
+            rich_log.write("[bold yellow]⏹ Auto-continue DISABLED — manual next-spec required[/]")
 
     def action_quit(self) -> None:
         """Clean shutdown."""

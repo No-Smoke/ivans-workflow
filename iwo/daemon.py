@@ -22,6 +22,8 @@ import os
 import subprocess
 import sys
 import time
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -747,6 +749,12 @@ class IWODaemon:
                 f"Pipeline complete: {handoff.spec_id} → {target} "
                 f"(terminal target, no activation)"
             )
+            # Auto-continue: queue next-spec directive if enabled
+            if (
+                self.config.auto_continue_on_completion
+                and handoff.status.outcome == "success"
+            ):
+                self._schedule_auto_continue(handoff.spec_id)
             return
 
         # 9. Route to target agent — deterministic idle check
@@ -844,6 +852,64 @@ class IWODaemon:
             log.info(f"LATEST.json → {handoff_path.name}")
         except Exception as e:
             log.warning(f"Failed to update LATEST.json: {e}")
+
+    def _schedule_auto_continue(self, completed_spec_id: str):
+        """Queue a next-spec directive after a pipeline completes successfully.
+
+        Creates a directive JSON in .directives/ so the normal directive processing
+        loop picks it up. Uses a delay to let file writes settle.
+
+        Only fires if:
+        - auto_continue_on_completion is True (already checked by caller)
+        - No other active pipelines (avoid overloading agents)
+        - Planner pane is idle
+        """
+        # Guard: don't auto-continue if other pipelines are active
+        active_count = self.pipeline.active_count
+        if active_count > 0:
+            log.info(
+                f"Auto-continue skipped: {active_count} active pipeline(s) remain"
+            )
+            return
+
+        # Guard: check planner is idle
+        from .state import AgentState
+        planner_state = self.agent_states.get("planner", AgentState.UNKNOWN)
+        if planner_state not in (AgentState.IDLE, AgentState.UNKNOWN):
+            log.info(
+                f"Auto-continue skipped: planner is {planner_state.value}"
+            )
+            return
+
+        # Write the directive file after a short delay
+        def _write_directive():
+            time.sleep(self.config.auto_continue_delay_seconds)
+            try:
+                directives_dir = self.config.handoffs_dir / ".directives"
+                directives_dir.mkdir(parents=True, exist_ok=True)
+                ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                ts_ns = time.time_ns()
+                filename = f"{ts_ns}-auto-next-spec.json"
+                directive = {
+                    "directive": "next-spec",
+                    "focus": f"Auto-continue after {completed_spec_id} completed successfully. Select the next logical spec.",
+                    "timestamp": ts_iso,
+                    "auto_generated": True,
+                }
+                directive_path = directives_dir / filename
+                directive_path.write_text(json.dumps(directive))
+                log.info(
+                    f"Auto-continue: queued next-spec directive after "
+                    f"{completed_spec_id} → {directive_path.name}"
+                )
+                self._notify(
+                    f"🔄 Auto-continue: next-spec queued after {completed_spec_id}"
+                )
+            except Exception as e:
+                log.error(f"Auto-continue failed to write directive: {e}")
+
+        thread = threading.Thread(target=_write_directive, daemon=True)
+        thread.start()
 
     def _write_active_specs(self):
         """Write .active-specs.json for external visibility (TUI, other tools).

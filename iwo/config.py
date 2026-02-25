@@ -88,6 +88,14 @@ class IWOConfig:
     # When False, ALL deploys require manual 'd' key approval.
     auto_approve_safe_deploys: bool = True
 
+    # Auto-continue: when a pipeline completes (nextAgent=human, workflowComplete),
+    # automatically queue a next-spec directive so Planner selects the next spec.
+    # Enable for overnight autonomous runs; disable for manual control.
+    auto_continue_on_completion: bool = False
+    # Delay in seconds before issuing the auto-continue directive.
+    # Gives agents time to settle and avoids dispatch during file writes.
+    auto_continue_delay_seconds: float = 10.0
+
     # Debounce: seconds to wait after file creation before reading
     file_debounce_seconds: float = 1.5
 

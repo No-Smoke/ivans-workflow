@@ -5,6 +5,21 @@ Ordered chronologically (newest first). Feature commits are excluded — see `gi
 
 ---
 
+## Feature 1: Auto-continue on pipeline completion
+**Date:** 2026-02-25 | **Files:** `iwo/daemon.py`, `iwo/config.py`, `iwo/tui.py`
+
+**Symptom:** After a pipeline completed successfully (docs → human), IWO stopped and waited for a manual "Plan Next Spec" directive. This prevented autonomous overnight development runs — each completed spec required human intervention to start the next.
+
+**Root cause:** The terminal-target handler (daemon.py line ~738) called `mark_completed()`, sent a notification, and returned. No mechanism existed to automatically queue a next-spec directive.
+
+**Fix:** Added `_schedule_auto_continue()` method to daemon. When a pipeline completes with `outcome=success` and `target in ("human", "none")`, and auto-continue is enabled, it writes a `next-spec` directive JSON to `.directives/` after a configurable delay (default 10s). Guards prevent firing when other pipelines are active or the planner is busy.
+
+**Config:** `auto_continue_on_completion: bool = False` (opt-in), `auto_continue_delay_seconds: float = 10.0`. Toggle at runtime via TUI 'a' key.
+
+**Safety:** Directive goes through the normal `DirectiveProcessor.poll()` pipeline, so all existing safety rails (pause, idle check, validation) still apply. The directive is marked `auto_generated: True` for audit trail.
+
+---
+
 ## Fix 12: Headless dispatch missing --model flag (all agents defaulting to Haiku)
 **Date:** 2026-02-25 | **Version:** v2.9.0 | **File:** `iwo/headless_commander.py` (691 lines)
 
