@@ -344,6 +344,9 @@ class IWOConfig:
     auto_continue_on_completion: bool = False   # TUI 'a' key to toggle
     auto_continue_delay_seconds: float = 10.0
 
+    # Auto-deploy (bypass human gate for ALL deploys)
+    auto_deploy_all: bool = False               # TUI 'D' key to toggle
+
     # State machine
     state_poll_interval_seconds: float = 2.0
     output_stable_seconds: float = 2.0

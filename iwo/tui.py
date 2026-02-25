@@ -264,6 +264,7 @@ class IWOApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
         Binding("d", "deploy_approve", "Deploy Approve", priority=True),
+        Binding("D", "auto_deploy_toggle", "Auto-Deploy", priority=True),
         Binding("r", "force_reconcile", "Reconcile", priority=True),
         Binding("p", "pause_toggle", "Pause/Resume", priority=True),
         Binding("a", "auto_continue_toggle", "Auto-Continue", priority=True),
@@ -710,6 +711,23 @@ class IWOApp(App):
             rich_log.write("[bold green]🔄 Auto-continue ENABLED — next-spec will auto-queue on pipeline completion[/]")
         else:
             rich_log.write("[bold yellow]⏹ Auto-continue DISABLED — manual next-spec required[/]")
+
+    def action_auto_deploy_toggle(self) -> None:
+        """Toggle auto-deploy (bypass human gate for ALL deploys)."""
+        cfg = self.daemon.config
+        cfg.auto_deploy_all = not cfg.auto_deploy_all
+        rich_log = self.query_one("#log-output", RichLog)
+        if cfg.auto_deploy_all:
+            rich_log.write("[bold red]🚀 Auto-deploy ALL ENABLED — deploy gate bypassed for all specs[/]")
+            # Flush any pending deploys immediately
+            if self.daemon._deploy_gate_pending:
+                count = len(self.daemon._deploy_gate_pending)
+                rich_log.write(f"[bold]   Releasing {count} pending deploy(s)...[/]")
+                while self.daemon._deploy_gate_pending:
+                    handoff, path = self.daemon._deploy_gate_pending.pop(0)
+                    self.daemon._activate_agent(handoff, path)
+        else:
+            rich_log.write("[bold green]🛡 Auto-deploy ALL DISABLED — deploy gate restored[/]")
 
     def action_quit(self) -> None:
         """Clean shutdown."""

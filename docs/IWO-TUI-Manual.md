@@ -69,6 +69,7 @@ The IWO TUI Dashboard is a live terminal interface that monitors and controls yo
 |-----|--------|-------------|
 | `q` | Quit | Clean shutdown — stops observer, exits |
 | `d` | Deploy Approve | When deployer is gated — sends `/workflow-next` to deployer |
+| `D` | Auto-Deploy Toggle | Bypass deploy gate for ALL specs (default: off). Flushes pending deploys on enable. |
 | `r` | Force Reconcile | Immediate filesystem scan for missed handoffs |
 | `p` | Pause / Resume | Toggles state polling and reconciliation on/off |
 | `a` | Auto-Continue | Toggles auto next-spec after pipeline completion (default: off) |

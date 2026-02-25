@@ -88,6 +88,11 @@ class IWOConfig:
     # When False, ALL deploys require manual 'd' key approval.
     auto_approve_safe_deploys: bool = True
 
+    # Auto-deploy: bypass the human gate entirely for ALL deploys, regardless
+    # of infrastructure flags. Overrides auto_approve_safe_deploys.
+    # Enable for overnight autonomous runs; disable for manual control.
+    auto_deploy_all: bool = False
+
     # Auto-continue: when a pipeline completes (nextAgent=human, workflowComplete),
     # automatically queue a next-spec directive so Planner selects the next spec.
     # Enable for overnight autonomous runs; disable for manual control.

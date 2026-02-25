@@ -714,28 +714,39 @@ class IWODaemon:
         # 8. Human gate check (conditional: auto-approve if no infrastructure changes)
         target = handoff.target_agent
         if target in self.config.human_gate_agents:
-            approved, reason = self._should_auto_approve_deploy(path, handoff)
-            if approved:
+            # Auto-deploy-all: bypass gate entirely
+            if self.config.auto_deploy_all:
                 log.info(
-                    f"Deploy auto-approved for {handoff.spec_id}: {reason}"
+                    f"Deploy auto-approved for {handoff.spec_id}: "
+                    f"auto_deploy_all enabled (gate bypassed)"
                 )
                 self._notify(
-                    f"✅ AUTO-DEPLOY: {handoff.spec_id} → {target} "
-                    f"({reason})"
+                    f"🚀 AUTO-DEPLOY (all): {handoff.spec_id} → {target}"
                 )
-                # Fall through to step 9 routing instead of returning
+                # Fall through to step 9 routing
             else:
-                msg = (
-                    f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
-                    f"Reason: {reason}. "
-                    f"Press 'd' to approve. "
-                    f"Action: {handoff.nextAgent.action[:100]}"
-                )
-                log.info(msg)
-                self._notify(msg, critical=True)
-                # Append to pending queue (FIFO — 'd' key approves oldest first)
-                self._deploy_gate_pending.append((handoff, path))
-                return
+                approved, reason = self._should_auto_approve_deploy(path, handoff)
+                if approved:
+                    log.info(
+                        f"Deploy auto-approved for {handoff.spec_id}: {reason}"
+                    )
+                    self._notify(
+                        f"✅ AUTO-DEPLOY: {handoff.spec_id} → {target} "
+                        f"({reason})"
+                    )
+                    # Fall through to step 9 routing
+                else:
+                    msg = (
+                        f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
+                        f"Reason: {reason}. "
+                        f"Press 'd' to approve. "
+                        f"Action: {handoff.nextAgent.action[:100]}"
+                    )
+                    log.info(msg)
+                    self._notify(msg, critical=True)
+                    # Append to pending queue (FIFO — 'd' key approves oldest first)
+                    self._deploy_gate_pending.append((handoff, path))
+                    return
 
         # 8.5 Terminal targets — pipeline complete, no activation needed
         if target in ("human", "none"):
