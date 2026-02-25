@@ -818,6 +818,18 @@ class IWODaemon:
             if spec_dir.name.startswith("."):
                 continue  # Skip .current-spec etc.
 
+            # Skip specs whose LATEST.json is terminal (workflow complete)
+            latest_link = spec_dir / "LATEST.json"
+            if latest_link.exists():
+                try:
+                    with open(latest_link) as fh:
+                        latest_data = json.load(fh)
+                    latest_target = latest_data.get("nextAgent", {}).get("target", "")
+                    if latest_target in ("human", "none"):
+                        continue  # Pipeline complete, nothing to reconcile
+                except Exception:
+                    pass
+
             json_files = sorted(spec_dir.glob("*.json"))
             json_files = [
                 f for f in json_files
@@ -1177,6 +1189,24 @@ class IWODaemon:
                 continue
             if spec_dir.name.startswith("."):
                 continue
+
+            # Fast-path: skip specs whose LATEST.json is terminal
+            latest_link = spec_dir / "LATEST.json"
+            if latest_link.exists():
+                try:
+                    with open(latest_link) as fh:
+                        latest_data = json.load(fh)
+                    latest_target = latest_data.get("nextAgent", {}).get("target", "")
+                    if latest_target in ("human", "none"):
+                        # Mark completed in pipeline state and move on
+                        spec_id = spec_dir.name
+                        pipeline = self.pipeline.get_or_create_pipeline(spec_id)
+                        pipeline.status = "completed"
+                        pipeline.current_agent = None
+                        total_specs += 1
+                        continue
+                except Exception:
+                    pass
 
             spec_id = spec_dir.name
             json_files = sorted(spec_dir.glob("*.json"))
