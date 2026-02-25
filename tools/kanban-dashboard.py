@@ -168,13 +168,21 @@ def build_html(project_root: Path) -> str:
             active_spec = s
             break
 
-    # Build completed agents set for active spec
+    # Build completed agents set for active spec — scoped to current sprint
+    # A "sprint" starts at the most recent planner handoff
     completed_agents = set()
     active_agent = None
     pending_agents = []
     if active_spec:
+        # Find the last planner handoff sequence to scope the current sprint
+        last_planner_seq = 0
         for ho in active_spec["handoffs"]:
-            completed_agents.add(ho["agent"])
+            if ho["agent"] == "planner":
+                last_planner_seq = max(last_planner_seq, ho["sequence"])
+        # Only count agents from the current sprint (>= last planner sequence)
+        for ho in active_spec["handoffs"]:
+            if ho["sequence"] >= last_planner_seq:
+                completed_agents.add(ho["agent"])
         if active_spec["next_agent"] and active_spec["next_agent"] not in ("human", "none"):
             active_agent = active_spec["next_agent"]
         for ag in AGENTS_ORDERED:
