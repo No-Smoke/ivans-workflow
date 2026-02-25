@@ -113,6 +113,8 @@ Processed directives are archived to `.directives/.processed/`. Last status repo
 
 **IWF launcher (`boris-workflow.desktop`):** 6 actions — Kill Session, Plan Next Spec, Start Spec, Resume Spec, View Git Log, Load Credentials
 
+**Standalone launcher (`iwo-next-spec.desktop`):** Single-click "Plan Next Spec" — use this if right-click menu actions fail to fire (known GNOME Shell / Wayland issue with desktop action Exec lines). Available in Activities search as "IWO — Plan Next Spec".
+
 ## Safety Rails (Automatic)
 
 | Rail | Threshold | Action |

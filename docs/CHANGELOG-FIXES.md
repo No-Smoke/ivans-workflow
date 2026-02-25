@@ -5,6 +5,28 @@ Ordered chronologically (newest first). Feature commits are excluded — see `gi
 
 ---
 
+## Fix 14: Skip terminal specs in reconciliation and startup recovery
+**Date:** 2026-02-25 | **Commit:** `4a907a4` | **File:** `iwo/daemon.py`
+
+**Symptom:** EMAIL-TEMPLATES-ENHANCEMENT (and other completed specs) re-dispatched agents on every TUI restart, burning ~$0.53 API credits per restart for no work. The reviewer would be dispatched, correctly identify the stale dispatch, and exit — every single time.
+
+**Root cause:** On daemon startup, `_recover_state_from_filesystem()` processed all specs through a stale/recover dance before checking for terminal targets. The reconciliation loop (`_reconcile_filesystem()`) also scanned all spec dirs and found handoffs as "missed" (tracker empty after restart), re-dispatching agents via `process_handoff()`.
+
+**Fix:** Both `_reconcile_filesystem()` and `_recover_state_from_filesystem()` now check LATEST.json first. If `nextAgent.target` is `human` or `none`, the spec is marked completed and skipped entirely — no recovery dance, no reconciliation, no agent dispatch.
+
+---
+
+## Fix 13: Kanban dashboard showing wrong spec / all agents as DONE
+**Date:** 2026-02-25 | **Commits:** `639434f`, `b75a321` | **File:** `tools/kanban-dashboard.py`
+
+**Symptom:** (a) Kanban showed all 6 agents as "DONE" when Sprint 2 of EBATT-015 was actively building. (b) Kanban displayed EMAIL-TEMPLATES-ENHANCEMENT instead of EBATT-015 after concurrent pipeline activity.
+
+**Root cause:** (a) `completed_agents` set was built from ALL handoffs across all sprints, so Sprint 1's planner/builder/reviewer/tester/deployer/docs appeared "done" even during Sprint 2. (b) `get_current_spec()` read `.current-spec` which was overwritten by whichever pipeline last wrote it — a single-value file can't track concurrent pipelines.
+
+**Fix:** (a) Scoped `completed_agents` to current sprint only: counts handoffs at or after the most recent planner sequence number. (b) Rewrote `get_current_spec()` to scan all spec dirs for the most recent non-terminal LATEST.json (where `nextAgent` is not human/none and `workflowComplete` is false). Falls back to `.active-specs.json` then `.current-spec` only if no active handoff found.
+
+---
+
 ## Feature 1: Auto-continue on pipeline completion
 **Date:** 2026-02-25 | **Files:** `iwo/daemon.py`, `iwo/config.py`, `iwo/tui.py`
 
