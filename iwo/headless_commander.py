@@ -12,7 +12,9 @@ Dispatch:
         --append-system-prompt-file .claude/skills/$SKILL/SKILL.md \\
         2>&1 | tee $LOG
 
-Idle detection: pane_current_command ∈ IDLE_SHELLS (bash, zsh, sh, fish).
+Idle detection: pane_current_command ∈ IDLE_SHELLS AND no child processes
+(pgrep -P $pane_pid). The child-process check catches claude -p which tmux
+reports as "bash" because it runs as a child of the shell process.
 No interactive prompt matching, no canary probes, no send-keys injection.
 """
 
@@ -313,10 +315,15 @@ class HeadlessCommander:
     # ------------------------------------------------------------------
 
     def is_agent_idle(self, agent_name: str) -> bool:
-        """Check if agent pane is idle (running a shell, not claude).
+        """Check if agent pane is idle (running a shell, no child processes).
 
-        Deterministic: pane_current_command ∈ IDLE_SHELLS.
-        No interactive prompt matching, no canary probes.
+        Two-layer check:
+        1. pane_current_command ∈ IDLE_SHELLS (fast path)
+        2. Shell has no child processes (catches claude -p which tmux
+           reports as "bash" because it's a child of the shell)
+
+        Without check 2, tmux's pane_current_command returns "bash" even
+        while `claude -p` is running as a child, causing double-dispatch.
         """
         agent = self._agents.get(agent_name)
         if not agent:
@@ -325,7 +332,30 @@ class HeadlessCommander:
         try:
             cmd = agent.pane.pane_current_command
             log.debug(f"[{agent_name}] pane_current_command = {cmd!r}")
-            return cmd in IDLE_SHELLS
+            if cmd not in IDLE_SHELLS:
+                return False
+
+            # Check 2: verify the shell has no child processes.
+            # pane_pid is the shell PID; if claude -p is running, it's a
+            # child of that shell and pgrep will find it.
+            pane_pid = agent.pane.pane_pid
+            if pane_pid:
+                import subprocess
+                result = subprocess.run(
+                    ["pgrep", "-P", str(pane_pid)],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.stdout.strip():
+                    # Shell has child processes — not idle
+                    log.debug(
+                        f"[{agent_name}] pane_current_command=bash but shell "
+                        f"(PID {pane_pid}) has children: "
+                        f"{result.stdout.strip().replace(chr(10), ', ')} "
+                        f"— NOT idle"
+                    )
+                    return False
+
+            return True
         except Exception as e:
             log.warning(f"[{agent_name}] pane read failed: {e}")
             return False
@@ -563,15 +593,12 @@ Action: {handoff.nextAgent.action}
         return completed
 
     def _is_agent_complete(self, agent_name: str) -> bool:
-        """Check if an active agent has finished (pane back at shell)."""
-        agent = self._agents.get(agent_name)
-        if not agent:
-            return False
-        try:
-            cmd = agent.pane.pane_current_command
-            return cmd in IDLE_SHELLS
-        except Exception:
-            return False
+        """Check if an active agent has finished (pane back at shell, no children).
+
+        Uses is_agent_idle() which checks both pane_current_command AND
+        child processes to avoid false completion detection.
+        """
+        return self.is_agent_idle(agent_name)
 
     def _try_extract_session_id(self, agent_name: str):
         """Parse the most recent log file for session_id."""
