@@ -4,7 +4,7 @@
 DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"
 mkdir -p "$DIR"
 
-FOCUS=$(zenity --entry --title="IWO: Plan Next Spec" --text="Optional focus area (e.g. calculators, shared infra):" --width=500 2>/dev/null) || true
+FOCUS=$(zenity --entry --title="IWO: Plan Next Spec" --text="Optional focus area (e.g. calculators, shared infra):" --width=500 --modal 2>/dev/null) || true
 
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 FILENAME=$(date +%s%N)-next-spec.json
