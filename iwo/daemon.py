@@ -37,6 +37,7 @@ from .memory import IWOMemory
 from .pipeline import PipelineManager
 from .metrics import MetricsCollector
 from .auditor import Auditor, AuditorConfig
+from .directives import DirectiveProcessor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,6 +149,10 @@ class HandoffHandler(FileSystemEventHandler):
         if ".audit" in path.parts:
             log.debug(f"Skipping audit file: {path.name}")
             return
+        # Ignore directive files (processed by DirectiveProcessor, not handoff pipeline)
+        if ".directives" in path.parts:
+            log.debug(f"Skipping directive file: {path.name}")
+            return
         # Update LATEST.json symlink — IWO is the authority, not agents (Bug 2 fix)
         spec_dir = path.parent
         latest = spec_dir / "LATEST.json"
@@ -207,6 +212,12 @@ class IWODaemon:
 
         # Phase 3.0: Auditor module (Agent 007 Phase 1)
         self.auditor: Optional[Auditor] = None
+
+        # Directive processor — operator commands via filesystem
+        self.directive_processor = DirectiveProcessor(self.config, self)
+
+        # Pause flag — set by pause directive, prevents new dispatches
+        self._paused: bool = False
 
         # State-change notification debounce: agent_name → last notify timestamp
         # Prevents notification spam when agents flicker between states rapidly
@@ -900,7 +911,9 @@ class IWODaemon:
             tags = "robot"
 
         # Extract a short title from the message (first ~50 chars)
-        title = message[:60].split(".")[0].split("→")[0].strip()
+        # Strip non-ASCII to avoid latin-1 encoding errors in HTTP headers
+        title_raw = message[:60].split(".")[0].split("→")[0].strip()
+        title = title_raw.encode("ascii", errors="ignore").decode("ascii").strip()
 
         req = Request(url, data=message.encode("utf-8"))
         req.add_header("Title", f"IWO: {title}")
@@ -1020,6 +1033,10 @@ class IWODaemon:
             self.auditor = None
 
         self._notify("IWO v1.0 started — state machine active")
+
+        # 9. Initialize directive processor directories
+        self.directive_processor.ensure_dirs()
+        log.info(f"Directive processor active: {self.directive_processor.directives_dir}")
         return True
 
     def run_loop(self):
@@ -1041,6 +1058,10 @@ class IWODaemon:
 
                 if tick % recon_every == 0:
                     self._reconcile_filesystem()
+
+                # Poll for operator directives every 2 seconds
+                if tick % poll_every == 0:
+                    self.directive_processor.poll()
 
                 # Auditor periodic checks (self-throttles to 5-min intervals)
                 if self.auditor:

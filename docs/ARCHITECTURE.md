@@ -1,13 +1,13 @@
 # Ivan's Workflow Orchestrator (IWO) — Architecture Guide
 
-**Version:** 2.8.5 | **Updated:** 2026-02-21
+**Version:** 2.9.0 | **Updated:** 2026-02-25
 **Repository:** [No-Smoke/ivans-workflow-orchestrator](https://github.com/No-Smoke/ivans-workflow-orchestrator)
 
 ## Overview
 
-Ivan's Workflow Orchestrator (IWO) is a Python daemon that automates handoffs between multiple Claude Code AI agents running in tmux sessions. It monitors for handoff JSON files, validates them, checks agent readiness via a state machine, and routes work to the next agent in a software development pipeline.
+Ivan's Workflow Orchestrator (IWO) is a Python daemon that automates handoffs between multiple Claude Code AI agents running in tmux sessions. It monitors for handoff JSON files, validates them, checks agent readiness via deterministic `pane_current_command` inspection, and dispatches work via headless `claude -p` invocations. No interactive prompt detection, no send-keys injection, no canary probes.
 
-IWO is designed for Ivan's Workflow — a six-agent development pipeline where each agent has a specialized role and strict separation of concerns.
+IWO is designed for Ivan's Workflow — a seven-agent development pipeline where each agent has a specialized role and strict separation of concerns.
 
 ```
 ┌─────────┐    ┌─────────┐    ┌──────────┐    ┌────────┐    ┌──────────┐    ┌──────┐
@@ -32,12 +32,12 @@ IWO is designed for Ivan's Workflow — a six-agent development pipeline where e
 │                        IWO Daemon (Python)                       │
 │                                                                  │
 │  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │ Watchdog  │  │   State   │  │  Tmux    │  │    Memory     │  │
-│  │ Observer  │  │  Machine  │  │Commander │  │  Integration  │  │
-│  │(filesystem│  │(per-agent │  │(pane tags│  │(Qdrant+Neo4j) │  │
-│  │ monitor)  │  │ 5 states) │  │canary/   │  │              │  │
-│  └─────┬─────┘  └─────┬─────┘  │respawn)  │  └──────┬───────┘  │
-│        │              │        └────┬─────┘         │          │
+│  │ Watchdog  │  │ Headless  │  │ Pipeline │  │    Memory     │  │
+│  │ Observer  │  │Commander  │  │ Manager  │  │  Integration  │  │
+│  │(filesystem│  │(pane tags,│  │(multi-   │  │(Qdrant+Neo4j) │  │
+│  │ monitor)  │  │claude -p, │  │ spec)    │  │              │  │
+│  │          │  │model tier)│  │          │  │              │  │
+│  └─────┬─────┘  └─────┬─────┘  └────┬─────┘  └──────┬───────┘  │
 │  ┌─────┴──────────────┴──────────────┴───────────────┴───────┐  │
 │  │                    IWO Daemon Core                         │  │
 │  │  - Multi-spec pipeline tracking (PipelineManager)         │  │
@@ -58,6 +58,15 @@ IWO is designed for Ivan's Workflow — a six-agent development pipeline where e
 │  │   aggregation,    │  │  Memory │ Safety    │ Handoff log  │  │
 │  │   60s cache)      │  │  Keys: q=quit d=deploy r=refresh   │  │
 │  └───────────────────┘  └────────────────────────────────────┘  │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  DirectiveProcessor (operator commands via filesystem)     │  │
+│  │  Polls .directives/ every 2s for JSON commands             │  │
+│  │  Types: start-spec, next-spec, resume, reconcile, status,  │  │
+│  │         pause, unpause, cancel-spec                        │  │
+│  │  Sources: desktop launcher scripts, cron, CLI              │  │
+│  │  Archives processed directives to .processed/              │  │
+│  └────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
          │                    │                      │
          ▼                    ▼                      ▼
@@ -78,22 +87,26 @@ IWO is designed for Ivan's Workflow — a six-agent development pipeline where e
 
 ```
 iwo/
-├── __init__.py          # Package init
-├── config.py            # Central configuration (dataclass)
-├── parser.py            # Handoff JSON validation (Pydantic models)
-├── commander.py         # tmux interaction (pane tagging, canary, respawn)
-├── state.py             # Agent state machine (5 states, polling)
-├── pipeline.py          # Multi-spec pipeline tracking + per-agent queuing
-├── metrics.py           # Pipeline performance metrics (Neo4j Cypher queries)
-├── daemon.py            # Main orchestrator (watchdog, routing, safety, health checks)
-├── memory.py            # Qdrant + Neo4j pipeline history storage
-└── tui.py               # Textual TUI dashboard
+├── __init__.py              # Package init
+├── config.py                # Central configuration (dataclass)
+├── parser.py                # Handoff JSON validation (Pydantic models)
+├── commander.py             # tmux interaction (pane tagging, respawn)
+├── headless_commander.py    # Headless claude -p dispatch with AGENT_MODEL_MAP
+├── directives.py            # DirectiveProcessor (8 directive types, filesystem polling)
+├── state.py                 # Agent state machine (5 states, polling)
+├── pipeline.py              # Multi-spec pipeline tracking + per-agent queuing
+├── metrics.py               # Pipeline performance metrics (Neo4j Cypher queries)
+├── daemon.py                # Main orchestrator (watchdog, routing, safety, health checks)
+├── memory.py                # Qdrant + Neo4j pipeline history storage
+└── tui.py                   # Textual TUI dashboard
 
 scripts/
-└── migrate_patterns_384_to_1024.py  # One-time pattern library migration
+├── directive-next-spec.sh                   # Desktop launcher script for next-spec directive
+├── boris-workflow/launch-tmux-agents-v5.sh  # tmux session launcher (v5.6, idle bash shells)
+└── migrate_patterns_384_to_1024.py          # One-time pattern library migration
 ```
 
-**Total:** ~3,265 lines across 10 Python modules + migration script.
+**Total:** ~4,500 lines across 12 Python modules + scripts.
 
 ## Core Concepts
 

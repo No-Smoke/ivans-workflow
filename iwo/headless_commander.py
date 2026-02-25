@@ -1,26 +1,22 @@
-"""HeadlessCommander — Dual-mode agent dispatch.
+"""HeadlessCommander — Headless-only agent dispatch.
 
-Supports two dispatch modes depending on pane state:
+All agent panes start as idle bash shells. When IWO detects a handoff
+targeting an agent, it launches `claude -p` in the pane with the handoff
+context. When claude -p exits, the pane returns to idle bash.
 
-1. **Headless** (pane at bash prompt):
-    cd $PROJECT && cat prompt.md | claude -p \
-        --output-format stream-json \
-        --permission-mode bypassPermissions \
-        --append-system-prompt-file .claude/skills/$SKILL/SKILL.md \
+Dispatch:
+    cd $PROJECT && cat prompt.md | claude -p \\
+        --model opus \\
+        --output-format stream-json \\
+        --permission-mode bypassPermissions \\
+        --append-system-prompt-file .claude/skills/$SKILL/SKILL.md \\
         2>&1 | tee $LOG
 
-2. **Interactive** (pane has Claude Code session at `>` prompt):
-    Sends `/workflow-next` to the existing interactive session.
-
-Idle detection is dual-mode:
-  - pane_current_command ∈ IDLE_SHELLS → bash idle (headless dispatch)
-  - pane_current_command ∈ CLAUDE_COMMANDS + `❯` prompt visible → interactive idle
-
-Design: Three-model consensus (Claude Opus 4.6, GPT-5.2, Gemini 3 Pro).
+Idle detection: pane_current_command ∈ IDLE_SHELLS (bash, zsh, sh, fish).
+No interactive prompt matching, no canary probes, no send-keys injection.
 """
 
 import logging
-import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -42,28 +38,20 @@ SKILL_DIR_MAP: dict[str, str] = {
     "docs": "boris-docs-agent",
 }
 
+# IWO agent name → Claude model to use for headless dispatch.
+# Planner/Builder/Reviewer need Opus for quality; Tester/Deployer/Docs
+# can use Sonnet for speed since their tasks are more mechanical.
+AGENT_MODEL_MAP: dict[str, str] = {
+    "planner": "opus",
+    "builder": "opus",
+    "reviewer": "opus",
+    "tester": "sonnet",
+    "deployer": "sonnet",
+    "docs": "sonnet",
+}
+
 # Shell names that indicate an idle pane (no claude process running)
 IDLE_SHELLS = frozenset(("bash", "zsh", "sh", "fish"))
-
-# Claude Code process names — "claude" is the binary name, but Claude Code
-# is a Node.js app so tmux may report "node" as pane_current_command.
-CLAUDE_COMMANDS = frozenset(("claude", "node"))
-
-# Regex to strip ANSI escape sequences from captured pane output.
-# capture-pane -p -J does NOT strip ANSI codes, so prompt matching
-# like `stripped == ">"` fails when the prompt has colour codes.
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[.*?[@-~]")
-
-# Claude Code prompt characters.  The TUI uses ❯ (U+276F "HEAVY RIGHT-POINTING
-# ANGLE QUOTATION MARK ORNAMENT") rather than ASCII >.  Match both to be safe.
-_PROMPT_CHARS = frozenset(("❯", ">"))
-
-# Claude Code status chrome — lines belonging to the bottom status bar
-# that must be skipped when scanning for the prompt.  Patterns:
-#   ⏵⏵  = permission mode bar      (U+23F5 BLACK MEDIUM RIGHT-POINTING TRIANGLE)
-#   ───  = box-drawing divider      (U+2500 BOX DRAWINGS LIGHT HORIZONTAL)
-#   token counter / path bar        (contains " tokens" or "@" agent-node)
-_CHROME_INDICATORS = ("⏵", "─", " tokens", "current:", "latest:")
 
 # Strip CLAUDECODE env var to avoid "nested session" detection when
 # claude -p is launched from inside an existing Claude Code session.
@@ -325,14 +313,10 @@ class HeadlessCommander:
     # ------------------------------------------------------------------
 
     def is_agent_idle(self, agent_name: str) -> bool:
-        """Check if agent pane is idle and ready for dispatch.
+        """Check if agent pane is idle (running a shell, not claude).
 
-        Dual-mode detection:
-          1. pane_current_command ∈ IDLE_SHELLS → bash idle (headless mode)
-          2. pane_current_command == "claude" AND interactive `>` prompt
-             visible AND agent not in _active_agents → interactive idle
-
-        Returns True if the agent can accept new work.
+        Deterministic: pane_current_command ∈ IDLE_SHELLS.
+        No interactive prompt matching, no canary probes.
         """
         agent = self._agents.get(agent_name)
         if not agent:
@@ -341,70 +325,10 @@ class HeadlessCommander:
         try:
             cmd = agent.pane.pane_current_command
             log.debug(f"[{agent_name}] pane_current_command = {cmd!r}")
-            # Mode 1: bash/shell idle — ready for headless claude -p
-            if cmd in IDLE_SHELLS:
-                return True
-            # Mode 2: interactive Claude session at `>` prompt
-            # Claude Code is Node.js, so tmux may report "node" or "claude"
-            if cmd in CLAUDE_COMMANDS and agent_name not in self._active_agents:
-                return self._is_interactive_prompt(agent)
-            return False
+            return cmd in IDLE_SHELLS
         except Exception as e:
             log.warning(f"[{agent_name}] pane read failed: {e}")
             return False
-
-    def _is_interactive_prompt(self, agent: AgentPane) -> bool:
-        """Check if an interactive Claude Code session is at its ``❯`` prompt.
-
-        Claude Code's TUI layout (bottom to top):
-            [empty / version info]
-            ⏵⏵ bypass permissions on ...         ← permission bar (chrome)
-            vanya@host:/path/...  123456 tokens  ← path/token bar (chrome)
-            ────────────────────────────────────  ← divider        (chrome)
-            ❯ /workflow-next                      ← THE PROMPT
-            ────────────────────────────────────  ← divider        (chrome)
-            ... output content above ...
-
-        We scan the last ~20 lines from the bottom, skip empty lines
-        and Claude Code status chrome, then look for the prompt character
-        ``❯`` (U+276F) or ``>`` (ASCII fallback).
-
-        We use 20 lines because Claude Code may leave significant blank
-        space below the status bar (e.g. after screen resize or compact
-        output), pushing the prompt further up from the pane bottom.
-
-        Note: capture-pane -p -J does NOT strip ANSI escape codes, so we
-        must strip them before matching.
-        """
-        try:
-            lines = agent.capture_visible(last_n_lines=20)
-            for line in reversed(lines):
-                # Strip ANSI escape codes THEN whitespace
-                cleaned = _ANSI_ESCAPE_RE.sub("", line)
-                stripped = cleaned.strip()
-                if not stripped:
-                    continue
-                # Skip Claude Code status chrome (status bar, dividers, etc.)
-                if any(stripped.startswith(ind) for ind in _CHROME_INDICATORS):
-                    continue
-                # Also skip lines that look like the path/token status bar
-                # e.g. "vanya@agent-node:/path/to/project   123456 tokens"
-                if "@" in stripped and ("tokens" in stripped or ":" in stripped[:40]):
-                    continue
-                # Check for Claude Code prompt: ❯ or > (with optional text after)
-                first_char = stripped[0]
-                if first_char in _PROMPT_CHARS:
-                    # Bare prompt or prompt with typed text (e.g. "❯ /workflow-next")
-                    log.debug(f"[{agent.agent_name}] interactive prompt detected")
-                    return True
-                # Non-chrome, non-prompt content → agent is outputting
-                log.debug(
-                    f"[{agent.agent_name}] not at prompt, last line: {stripped[:60]!r}"
-                )
-                return False
-        except Exception as e:
-            log.debug(f"Interactive prompt check failed for {agent.agent_name}: {e}")
-        return False
 
     # ------------------------------------------------------------------
     # Agent Dispatch
@@ -416,15 +340,14 @@ class HeadlessCommander:
         handoff: "Handoff",
         handoff_path: Path,
     ) -> bool:
-        """Dispatch work to an agent — dual-mode.
+        """Dispatch work to an agent via headless claude -p.
 
-        Detects pane state and routes to the appropriate dispatch mode:
-          - bash/shell idle → headless `claude -p` dispatch
-          - interactive Claude at `>` prompt → `/workflow-next` dispatch
+        Requires the agent pane to be at an idle shell prompt.
+        If the pane is running claude or any other process, dispatch
+        is refused — the agent must finish or be terminated first.
 
         Failed dispatches trigger exponential backoff (30s → 60s → 120s →
-        300s max) to prevent the 2-second poll loop from hammering a pane
-        that keeps rejecting commands.
+        300s max) to prevent the 2-second poll loop from hammering a pane.
 
         Returns True if dispatch succeeded.
         """
@@ -460,27 +383,16 @@ class HeadlessCommander:
             log.warning(f"Agent '{agent_name}' already tracked as active")
             return False
 
-        # --- Pane identity validation (prevents C-u/workflow-next injection) ---
+        # --- Pane identity validation ---
         if not self._validate_pane_identity(agent_name, agent):
             log.error(
-                f"[{agent_name}] Dispatch ABORTED: pane identity check failed. "
-                f"Refusing to send commands to unverified pane."
+                f"[{agent_name}] Dispatch ABORTED: pane identity check failed."
             )
             self._record_dispatch_failure(agent_name)
             return False
 
-        # Detect dispatch mode based on pane state
-        try:
-            cmd = agent.pane.pane_current_command
-        except Exception:
-            log.error(f"[{agent_name}] Cannot read pane_current_command")
-            self._record_dispatch_failure(agent_name)
-            return False
-
-        if cmd in CLAUDE_COMMANDS:
-            success = self._dispatch_interactive(agent_name, agent, handoff)
-        else:
-            success = self._dispatch_headless(agent_name, agent, handoff, handoff_path)
+        # --- Headless dispatch (only mode) ---
+        success = self._dispatch_headless(agent_name, agent, handoff, handoff_path)
 
         if success:
             self._dispatch_fail_count.pop(agent_name, None)
@@ -503,74 +415,6 @@ class HeadlessCommander:
             f"[{agent_name}] Dispatch failure #{count} — "
             f"next attempt in {cooldown:.0f}s"
         )
-
-    # Maximum attempts for interactive dispatch (send_keys is fire-and-forget)
-    _INTERACTIVE_DISPATCH_MAX_RETRIES = 2
-    _INTERACTIVE_DISPATCH_VERIFY_DELAY = 0.5  # seconds after send_keys
-    _INTERACTIVE_DISPATCH_CLEAR_DELAY = 0.3   # seconds after C-u
-
-    def _dispatch_interactive(
-        self,
-        agent_name: str,
-        agent: AgentPane,
-        handoff: "Handoff",
-    ) -> bool:
-        """Dispatch work to an interactive Claude Code session.
-
-        Sends Ctrl+U (clear any partial input) then ``/workflow-next``
-        to the existing interactive session at the ``❯`` prompt.
-
-        After sending, verifies delivery by checking that the agent is
-        no longer at the idle prompt (i.e. it started processing the
-        command).  Retries up to ``_INTERACTIVE_DISPATCH_MAX_RETRIES``
-        times if the prompt is still visible after sending.
-        """
-        max_retries = self._INTERACTIVE_DISPATCH_MAX_RETRIES
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                # Clear any partially typed text
-                agent.pane.send_keys("C-u", enter=False, suppress_history=True)
-                time.sleep(self._INTERACTIVE_DISPATCH_CLEAR_DELAY)
-
-                # Send /workflow-next command
-                agent.pane.send_keys(
-                    "/workflow-next", enter=True, suppress_history=False,
-                )
-                log.info(
-                    f"[{agent_name}] Sent /workflow-next (attempt {attempt}/"
-                    f"{max_retries}, spec={handoff.spec_id}, "
-                    f"seq={handoff.sequence})"
-                )
-
-                # Verify: wait then check that the prompt has gone away
-                time.sleep(self._INTERACTIVE_DISPATCH_VERIFY_DELAY)
-                if not self._is_interactive_prompt(agent):
-                    # Agent is no longer at the prompt → delivery confirmed
-                    self._active_agents.add(agent_name)
-                    self._last_dispatch_time[agent_name] = time.time()
-                    log.info(
-                        f"[{agent_name}] Verified: agent accepted /workflow-next "
-                        f"on attempt {attempt}"
-                    )
-                    return True
-
-                # Still at prompt — command may have been swallowed
-                log.warning(
-                    f"[{agent_name}] Prompt still visible after attempt "
-                    f"{attempt}/{max_retries} — retrying"
-                )
-            except Exception as e:
-                log.error(
-                    f"[{agent_name}] Interactive dispatch error on attempt "
-                    f"{attempt}: {e}"
-                )
-
-        log.error(
-            f"[{agent_name}] Interactive dispatch FAILED after {max_retries} "
-            f"attempts — agent may not have received /workflow-next"
-        )
-        return False
 
     def _dispatch_headless(
         self,
@@ -604,10 +448,12 @@ class HeadlessCommander:
 
         # Build the full command
         project_root = self.config.project_root
+        model = AGENT_MODEL_MAP.get(agent_name, "sonnet")
         cmd = (
             f"{CLEAN_ENV_PREFIX} "
             f"cd {project_root} && "
             f"cat {prompt_path} | claude -p "
+            f"--model {model} "
             f"--output-format stream-json "
             f"--permission-mode bypassPermissions "
             f"{skill_flag} "
@@ -621,7 +467,7 @@ class HeadlessCommander:
             self._last_dispatch_time[agent_name] = time.time()
             log.info(
                 f"[{agent_name}] Dispatched headless claude -p "
-                f"(spec={handoff.spec_id}, seq={seq})"
+                f"(spec={handoff.spec_id}, seq={seq}, model={model})"
             )
         else:
             log.error(f"[{agent_name}] Failed to send command to pane")
@@ -704,50 +550,26 @@ Action: {handoff.nextAgent.action}
     def check_completions(self) -> list[str]:
         """Poll all active agents for completion.
 
-        Dual-mode: an agent is complete when it returns to idle state:
-          - Headless mode: pane_current_command returns to bash/shell
-          - Interactive mode: pane_current_command is "claude" and
-            the `>` prompt is visible again
-
-        Note: is_agent_idle() filters out agents in _active_agents for
-        interactive mode (to prevent re-dispatch). Completion detection
-        must bypass that filter, so we check directly here.
-
-        Returns list of agent names that have completed.
+        An agent is complete when pane_current_command returns to a shell
+        (claude -p has exited). Returns list of agent names that completed.
         """
         completed = []
         for agent_name in list(self._active_agents):
             if self._is_agent_complete(agent_name):
                 completed.append(agent_name)
                 self._active_agents.discard(agent_name)
-
-                # Try to extract session ID from log (headless mode only)
                 self._try_extract_session_id(agent_name)
-
-                log.info(f"[{agent_name}] Completed (pane idle)")
-
+                log.info(f"[{agent_name}] Completed (pane returned to shell)")
         return completed
 
     def _is_agent_complete(self, agent_name: str) -> bool:
-        """Check if an active agent has finished its work.
-
-        Unlike is_agent_idle(), this does NOT filter by _active_agents.
-        It's called from check_completions() for agents we KNOW are active
-        to detect when they return to idle.
-
-          - Headless: pane_current_command ∈ IDLE_SHELLS (back to bash)
-          - Interactive: pane_current_command == "claude" + `>` prompt visible
-        """
+        """Check if an active agent has finished (pane back at shell)."""
         agent = self._agents.get(agent_name)
         if not agent:
             return False
         try:
             cmd = agent.pane.pane_current_command
-            if cmd in IDLE_SHELLS:
-                return True
-            if cmd in CLAUDE_COMMANDS:
-                return self._is_interactive_prompt(agent)
-            return False
+            return cmd in IDLE_SHELLS
         except Exception:
             return False
 
