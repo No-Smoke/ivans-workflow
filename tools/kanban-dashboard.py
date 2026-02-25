@@ -148,6 +148,54 @@ def get_all_specs(agent_comms: Path) -> list[dict]:
 
 
 def get_current_spec(agent_comms: Path) -> str:
+    """Determine the actively-building spec from ground truth (handoff files).
+
+    Strategy: find the spec with the most recent non-terminal handoff.
+    A terminal handoff has nextAgent.target in ('human', 'none') with
+    workflowComplete=true. A non-terminal handoff means work is in progress.
+
+    Fallback chain:
+    1. Spec with most recent non-terminal LATEST.json (actively building)
+    2. .active-specs.json — spec with current_agent assigned
+    3. .current-spec file
+    """
+    # Strategy 1: scan LATEST.json across all spec dirs
+    best_spec = None
+    best_mtime = 0
+    for d in agent_comms.iterdir():
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        latest = d / "LATEST.json"
+        if not latest.exists():
+            continue
+        try:
+            mtime = latest.stat().st_mtime
+            data = json.loads(latest.read_text())
+            next_target = data.get("nextAgent", {}).get("target", "")
+            workflow_complete = data.get("status", {}).get("workflowComplete", False)
+            # Skip terminal specs
+            if workflow_complete or next_target in ("human", "none"):
+                continue
+            if mtime > best_mtime:
+                best_mtime = mtime
+                best_spec = d.name
+        except Exception:
+            continue
+    if best_spec:
+        return best_spec
+
+    # Strategy 2: .active-specs.json
+    active_file = agent_comms / ".active-specs.json"
+    if active_file.exists():
+        try:
+            data = json.loads(active_file.read_text())
+            assignments = data.get("agent_assignments", {})
+            for agent, spec_id in assignments.items():
+                return spec_id
+        except Exception:
+            pass
+
+    # Strategy 3: .current-spec
     f = agent_comms / ".current-spec"
     return f.read_text().strip() if f.exists() else ""
 
