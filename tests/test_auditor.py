@@ -125,6 +125,11 @@ class MockPipelineManager:
         self._queue_depths[agent] = depth
 
 
+class MockStateMachine:
+    def __init__(self, state: AgentState = AgentState.IDLE):
+        self.state = state
+
+
 class MockConfig:
     """Minimal IWOConfig stand-in."""
     def __init__(self, tmp_path: Path):
@@ -172,8 +177,8 @@ class MockDaemon:
         self.config = MockConfig(tmp_path)
         self.pipeline = MockPipelineManager()
         self.commander = MockCommander()
-        self.agent_states: dict[str, AgentState] = {
-            name: AgentState.IDLE
+        self.state_machines: dict[str, MockStateMachine] = {
+            name: MockStateMachine()
             for name in self.config.agent_window_map
         }
         self.handoff_history: list[Handoff] = []
@@ -368,7 +373,7 @@ class TestAgentLiveness:
             MockSpecPipeline("TEST-SPEC", idle_seconds=35 * 60)
         )
         daemon.pipeline.assign_agent("builder", "TEST-SPEC")
-        daemon.agent_states["builder"] = AgentState.CRASHED
+        daemon.state_machines["builder"] = MockStateMachine(AgentState.CRASHED)
         events = auditor.periodic_checks()
         liveness = [e for e in events if e.check == "agent_liveness"]
         assert len(liveness) == 1

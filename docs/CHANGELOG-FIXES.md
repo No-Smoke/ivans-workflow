@@ -5,6 +5,36 @@ Ordered chronologically (newest first). Feature commits are excluded — see `gi
 
 ---
 
+## Fix 16: Kanban "Waiting" on reviewer due to orphaned EMAIL-TEMPLATES directory
+**Date:** 2026-02-28 | **Files:** `docs/agent-comms/EMAIL-TEMPLATES/LATEST.json` (ebatt repo)
+
+**Symptom:** Kanban dashboard at localhost:8787 showed the Reviewer column as "WAITING" indefinitely, even though the IWO TUI correctly showed all agents idle. Restarting the TUI and refreshing the kanban had no effect.
+
+**Root cause (kanban):** An orphaned `EMAIL-TEMPLATES/` directory (note: no `-ENHANCEMENT` suffix) existed in `docs/agent-comms/` alongside the correct `EMAIL-TEMPLATES-ENHANCEMENT/` directory. It contained a stale builder handoff (seq 2) with `nextAgent.target: "reviewer"` and no `workflowComplete` flag. The kanban's `get_current_spec()` found this as the most recent non-terminal LATEST.json and treated the reviewer as the active waiting agent.
+
+**Root cause (TUI):** Separately, two IWO TUI instances were running simultaneously (PIDs 376476 and 383649). The older instance had dispatched the reviewer and held it in its in-memory `_active_agents` set. The newer instance (from Vanya's restart attempt) ran cleanly but couldn't clear the older instance's state. Killing the stale TUI process (376476) resolved the TUI issue.
+
+**Fix:** Updated `EMAIL-TEMPLATES/LATEST.json` to a terminal handoff (`nextAgent.target: "none"`, `workflowComplete: true`) referencing the canonical `EMAIL-TEMPLATES-ENHANCEMENT/` directory at seq 22. This caused `get_current_spec()` to skip the orphaned directory and correctly resolve to the next active spec (SERVER-SIDE-API).
+
+**Lesson:** The TUI and kanban track agent state through entirely different mechanisms — TUI uses IWO's in-memory `_active_agents` set derived from tmux pane monitoring, while the kanban reads handoff files from disk on every HTTP request. A fix to one doesn't propagate to the other. Additionally, the kanban's fallback chain in `get_current_spec()` can be tricked by orphaned spec directories with non-terminal handoffs.
+
+**Prevention:** Consider adding a periodic cleanup pass to `get_current_spec()` that detects orphaned directories (directories whose `metadata.specId` doesn't match the directory name), or adding directory-name validation to the scan.
+
+---
+
+## Fix 15: Duplicate TUI instances causing stale PROCESSING state
+**Date:** 2026-02-28 | **Scope:** Runtime process management
+
+**Symptom:** IWO TUI showed Reviewer agent as "Processing" for hours despite the reviewer having completed its work. Pressing 'r' to refresh and restarting the TUI did not resolve the issue.
+
+**Root cause:** Two `python -m iwo.tui` processes were running simultaneously (PIDs 376476 at 15:46 and 383649 at 15:50). The `_active_agents` set is in-memory per-process — the old instance held the reviewer in its active set, and since both instances were attached to the same tmux session, the state displayed depended on which terminal window was focused. The restart launched a new instance without killing the old one.
+
+**Fix:** Killed the older TUI process (376476) and its parent terminal processes. The remaining instance (383649) had a clean `_active_agents` set and correctly showed the reviewer as IDLE on its next poll cycle.
+
+**Lesson:** IWO TUI should enforce single-instance behavior — either via a PID file, a Unix socket lock, or by checking for existing `python -m iwo.tui` processes on startup and refusing to launch (or offering to kill the existing instance).
+
+---
+
 ## Fix 14: Skip terminal specs in reconciliation and startup recovery
 **Date:** 2026-02-25 | **Commit:** `4a907a4` | **File:** `iwo/daemon.py`
 

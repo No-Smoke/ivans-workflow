@@ -1277,7 +1277,7 @@ class IWODaemon:
             "critical": critical,
             "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "active_specs": active_specs,
-            "version": "2.5.2",
+            "version": "2.9.0",
         }).encode("utf-8")
 
         req = Request(url, data=payload, headers={"Content-Type": "application/json"})

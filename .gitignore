@@ -19,4 +19,6 @@ logs/
 .DS_Store
 Thumbs.db
 .claude/worktrees/
+backups/
+_1.gitignore
 pal_generated.code

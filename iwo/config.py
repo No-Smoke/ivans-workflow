@@ -126,12 +126,12 @@ class IWOConfig:
     # --- Memory Integration (Phase 2.1) ---
 
     enable_memory: bool = True
-    qdrant_url: str = "http://74.50.49.35:6333"
+    qdrant_url: str = "http://192.168.1.71:6333"
     qdrant_api_key: str = "qdrant-ethospower-2025-secure-key"
-    neo4j_uri: str = "bolt://74.50.49.35:7687"
+    neo4j_uri: str = "bolt://192.168.1.78:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "ebatt2025"
-    ollama_url: str = "http://localhost:11434"
+    ollama_url: str = "http://192.168.1.76:11434"
     ollama_embed_model: str = "mxbai-embed-large"
 
     def __post_init__(self):
