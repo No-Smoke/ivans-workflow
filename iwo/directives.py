@@ -400,13 +400,16 @@ These spec directories have completed the full pipeline (docs agent finished):
                 prompt += f"- {s}\n"
 
         prompt += """
-### Step 3: Check the Tracking File
+### Step 3: Read the Build Priority Queue and Disposition
 
 ```bash
-cat ebatt-specs/TRACKING-v2.1.md
+cat ebatt-specs/v2-schema-first/BUILD-PRIORITY.md
+cat ebatt-specs/v2-schema-first/DISPOSITION.md
 ```
 
-Review the tracking file for completion status, dependencies, and priority order.
+BUILD-PRIORITY.md is the authoritative build order. Follow it top-to-bottom — do NOT
+skip phases. DISPOSITION.md tells you which specs are archived (do not plan work for
+archived specs) and which have been rewritten into new spec IDs.
 
 ### Step 4: Check Current State
 
@@ -420,13 +423,14 @@ Identify any specs that were started but not completed (partial pipelines).
 ### Step 5: Select the Next Spec
 
 Apply these selection criteria IN ORDER:
-1. **Resume incomplete pipelines first** — if a spec has handoffs but no docs-agent completion, resume it
-2. **Respect dependency chains** — don't start a spec whose prerequisites aren't done
-3. **Prioritise foundation specs** — shared infrastructure, schema, core platform over features
-4. **Prefer lower-numbered specs** — they were sequenced intentionally
+1. **Follow BUILD-PRIORITY.md phase order** — Phase 1 before Phase 2 before Phase 3. This is the HIGHEST PRIORITY criterion and overrides ALL others. If Phase 1 has uncompleted items, you MUST select Phase 1 work. Do NOT resume or continue Phase 3 specs when Phase 1 or Phase 2 work remains.
+2. **Skip archived specs** — DISPOSITION.md lists which specs are archived; never plan work for them
+3. **Respect dependency chains** — don't start a spec whose prerequisites aren't done
+4. **Resume incomplete pipelines ONLY within the current phase** — if a spec in the current phase has handoffs but no docs-agent completion, resume it. NEVER resume a spec from a later phase to "finish what was started" — phase order takes absolute precedence over continuation convenience.
+5. **Prefer lower-numbered specs within the same phase** — they were sequenced intentionally
 """
         if focus:
-            prompt += f"5. **Focus area requested:** {focus}\n"
+            prompt += f"6. **Focus area requested:** {focus}\n"
 
         prompt += """
 ### Step 6: Read the Selected Spec

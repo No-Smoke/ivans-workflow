@@ -71,6 +71,20 @@ def load_ops_actions(project_root: Path) -> dict:
     return result
 
 
+def save_ops_actions(project_root: Path, actions_data: dict) -> bool:
+    """Write ops actions register to disk with backup."""
+    ops_path = project_root / "docs" / "agent-comms" / ".ops-actions.json"
+    bak_path = ops_path.with_suffix(".json.bak")
+    try:
+        if ops_path.exists():
+            import shutil
+            shutil.copy2(ops_path, bak_path)
+        actions_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        ops_path.write_text(json.dumps(actions_data, indent=2) + "\n")
+        return True
+    except Exception:
+        return False
+
 
 def get_tmux_pane_states() -> dict[str, dict]:
     """Query tmux for all agent pane states."""
@@ -647,11 +661,43 @@ def build_ops_html(project_root: Path) -> str:
             escaped_cmd = _escape(a["verification_cmd"])
             ver_cmd = f'<div class="ver-cmd" onclick="navigator.clipboard.writeText(this.innerText)" title="Click to copy"><code>{escaped_cmd}</code></div>'
         status_class = a["status"]
-        return f'''<div class="ops-action {status_class}">
+        action_id = _escape(a.get("id", ""))
+
+        # Verification checklist for verification-category pending items
+        verify_section = ""
+        if a["status"] == "pending" and a.get("category") == "verification":
+            verify_section = f'''<div class="verify-section" id="verify-{action_id}">
+                <label class="verify-check"><input type="checkbox" id="chk-{action_id}"> Verified — mark as done</label>
+                <textarea class="verify-comment" id="comment-{action_id}" rows="3" placeholder="What did you observe?"></textarea>
+                <button class="btn-done" onclick="markDone('{action_id}')">Mark as Done</button>
+                <span class="save-confirm" id="confirm-{action_id}"></span>
+            </div>'''
+
+        # Add note toggle for all pending items (non-verification get this as their interaction)
+        note_section = ""
+        if a["status"] == "pending" and a.get("category") != "verification":
+            note_section = f'''<div class="note-toggle">
+                <a href="#" class="note-link" onclick="toggleNote('{action_id}');return false;">Add note</a>
+                <div class="note-box" id="note-{action_id}" style="display:none;">
+                    <textarea class="verify-comment" id="notetext-{action_id}" rows="3" placeholder="Add observation or note..."></textarea>
+                    <button class="btn-note" onclick="saveNote('{action_id}')">Save Note</button>
+                    <span class="save-confirm" id="noteconfirm-{action_id}"></span>
+                </div>
+            </div>'''
+        elif a["status"] == "pending" and a.get("category") == "verification":
+            # Verification items also get note fallback if not completing
+            pass  # verify_section already has a textarea
+
+        # Show existing notes if present
+        notes_display = ""
+        if a.get("notes"):
+            notes_display = f'<div class="ops-notes">Note: {_escape(a["notes"])}</div>'
+
+        return f'''<div class="ops-action {status_class}" id="card-{action_id}">
             <div class="ops-action-header">
                 <span class="pri-badge" style="background:{pri_color}">{priority.upper()}</span>
                 <span class="ops-spec">{_escape(a.get("spec_id", ""))}</span>
-                <span class="ops-id">{_escape(a.get("id", ""))}</span>
+                <span class="ops-id">{action_id}</span>
                 <span class="ops-age">{age}</span>
                 <span class="ops-cat">{_escape(a.get("category", ""))}</span>
                 {stale_badge}
@@ -659,6 +705,9 @@ def build_ops_html(project_root: Path) -> str:
             <div class="ops-title">{_escape(a.get("title", ""))}</div>
             <div class="ops-desc">{_escape(a.get("description", ""))}</div>
             {ver_cmd}
+            {notes_display}
+            {verify_section}
+            {note_section}
         </div>'''
 
     def render_group(title: str, items: list[dict], collapse: bool = False) -> str:
@@ -713,6 +762,27 @@ details[open] > .group-header::before {{ content:"\\25BC "; }}
 .ver-cmd {{ background:#0d1117; border:1px solid #21262d; border-radius:4px; padding:6px 10px; cursor:pointer; margin-top:4px; }}
 .ver-cmd code {{ font-size:12px; color:#7ee787; word-break:break-all; }}
 .ver-cmd:hover {{ border-color:#58a6ff; }}
+.verify-section {{ margin-top:10px; padding-top:10px; border-top:1px solid #21262d; }}
+.verify-check {{ display:flex; align-items:center; gap:8px; font-size:13px; color:#c9d1d9; cursor:pointer; margin-bottom:8px; }}
+.verify-check input[type="checkbox"] {{ appearance:none; width:18px; height:18px; border:2px solid #30363d; border-radius:4px; background:#0d1117; cursor:pointer; position:relative; flex-shrink:0; }}
+.verify-check input[type="checkbox"]:checked {{ background:#238636; border-color:#238636; }}
+.verify-check input[type="checkbox"]:checked::after {{ content:"\\2713"; color:#fff; font-size:13px; position:absolute; top:0; left:3px; }}
+.verify-comment {{ width:100%; background:#0d1117; border:1px solid #30363d; border-radius:6px; color:#c9d1d9; font-size:13px; font-family:inherit; padding:8px; resize:vertical; margin-bottom:8px; }}
+.verify-comment:focus {{ border-color:#58a6ff; outline:none; }}
+.btn-done {{ background:#238636; color:#fff; border:none; border-radius:6px; padding:6px 16px; font-size:13px; font-weight:600; cursor:pointer; }}
+.btn-done:hover {{ background:#2ea043; }}
+.btn-done:disabled {{ opacity:0.5; cursor:not-allowed; }}
+.btn-note {{ background:#1f6feb; color:#fff; border:none; border-radius:6px; padding:6px 16px; font-size:13px; font-weight:600; cursor:pointer; }}
+.btn-note:hover {{ background:#388bfd; }}
+.note-toggle {{ margin-top:8px; }}
+.note-link {{ color:#58a6ff; font-size:12px; text-decoration:none; }}
+.note-link:hover {{ text-decoration:underline; }}
+.note-box {{ margin-top:8px; }}
+.save-confirm {{ font-size:12px; color:#3fb950; margin-left:8px; opacity:0; transition:opacity 0.3s; }}
+.save-confirm.show {{ opacity:1; }}
+.ops-notes {{ font-size:12px; color:#8b949e; font-style:italic; margin-top:4px; padding:4px 8px; background:#0d1117; border-radius:4px; border-left:3px solid #30363d; }}
+.ops-action.just-completed {{ border-color:#238636; }}
+.ops-action.just-completed .ops-title::after {{ content:" \\2713"; color:#3fb950; }}
 </style></head>
 <body>
 <header>
@@ -733,6 +803,79 @@ details[open] > .group-header::before {{ content:"\\25BC "; }}
 <div class="content">
     {groups_html}
 </div>
+<script>
+async function markDone(actionId) {{
+    const chk = document.getElementById('chk-' + actionId);
+    const comment = document.getElementById('comment-' + actionId);
+    const confirm = document.getElementById('confirm-' + actionId);
+    const btn = event.target;
+    if (!chk.checked) {{
+        comment.style.borderColor = '#da3633';
+        setTimeout(() => comment.style.borderColor = '#30363d', 1500);
+        return;
+    }}
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    try {{
+        const resp = await fetch('/api/ops/update', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{
+                id: actionId,
+                status: 'completed',
+                resolved_by: 'vanya',
+                notes: comment.value || 'Verified OK',
+                resolved_at: new Date().toISOString()
+            }})
+        }});
+        const data = await resp.json();
+        if (data.ok) {{
+            confirm.textContent = '\\u2713 Saved';
+            confirm.classList.add('show');
+            const card = document.getElementById('card-' + actionId);
+            if (card) card.classList.add('just-completed');
+            setTimeout(() => confirm.classList.remove('show'), 2000);
+        }} else {{
+            btn.textContent = 'Error: ' + (data.error || 'unknown');
+        }}
+    }} catch(e) {{
+        btn.textContent = 'Network error';
+    }}
+}}
+function toggleNote(actionId) {{
+    const box = document.getElementById('note-' + actionId);
+    box.style.display = box.style.display === 'none' ? 'block' : 'none';
+}}
+async function saveNote(actionId) {{
+    const text = document.getElementById('notetext-' + actionId);
+    const confirm = document.getElementById('noteconfirm-' + actionId);
+    const btn = event.target;
+    if (!text.value.trim()) return;
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    try {{
+        const resp = await fetch('/api/ops/update', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{ id: actionId, notes: text.value }})
+        }});
+        const data = await resp.json();
+        if (data.ok) {{
+            confirm.textContent = '\\u2713 Saved';
+            confirm.classList.add('show');
+            btn.textContent = 'Save Note';
+            btn.disabled = false;
+            setTimeout(() => confirm.classList.remove('show'), 2000);
+        }} else {{
+            btn.textContent = 'Error';
+            setTimeout(() => {{ btn.textContent = 'Save Note'; btn.disabled = false; }}, 2000);
+        }}
+    }} catch(e) {{
+        btn.textContent = 'Network error';
+        setTimeout(() => {{ btn.textContent = 'Save Note'; btn.disabled = false; }}, 2000);
+    }}
+}}
+</script>
 </body></html>"""
 
 
@@ -775,6 +918,58 @@ class DashboardHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/api/ops/update":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(content_length))
+                action_id = body.get("id")
+                if not action_id:
+                    self._json_response(400, {"ok": False, "error": "Missing 'id' field"})
+                    return
+
+                # Load current register
+                ops_path = self.project_root / "docs" / "agent-comms" / ".ops-actions.json"
+                if not ops_path.exists():
+                    self._json_response(404, {"ok": False, "error": "Register not found"})
+                    return
+                data = json.loads(ops_path.read_text())
+                actions = data.get("actions", [])
+
+                # Find and update the action
+                found = False
+                PROTECTED_FIELDS = {"id", "fingerprint", "spec_id", "created_at", "auto_extracted"}
+                ALLOWED_FIELDS = {"status", "resolved_by", "notes", "resolved_at"}
+                for action in actions:
+                    if action.get("id") == action_id:
+                        for key in ALLOWED_FIELDS:
+                            if key in body:
+                                action[key] = body[key]
+                        found = True
+                        break
+
+                if not found:
+                    self._json_response(404, {"ok": False, "error": f"Action '{action_id}' not found"})
+                    return
+
+                if save_ops_actions(self.project_root, data):
+                    self._json_response(200, {"ok": True, "id": action_id})
+                else:
+                    self._json_response(500, {"ok": False, "error": "Failed to write register"})
+            except json.JSONDecodeError:
+                self._json_response(400, {"ok": False, "error": "Invalid JSON"})
+            except Exception as e:
+                self._json_response(500, {"ok": False, "error": str(e)})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _json_response(self, code: int, data: dict):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
 
     def log_message(self, format, *args):
         """Suppress default request logging."""
