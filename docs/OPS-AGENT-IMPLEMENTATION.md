@@ -130,6 +130,56 @@ safety classification, handoff target (planner).
 
 ---
 
+## Phase 5 — P0 Error Propagation + Skip-Archive Retry
+
+**Status:** COMPLETE
+**Date:** 2026-03-09
+**Commit:** `43dd09c`
+**Files:** `iwo/directives.py`, `tests/test_ops_agent.py`
+**Source:** Peer review report (P0-1 + P0-2), build prompt at `docs/P0-ERROR-PROPAGATION-BUILDER-PROMPT.md`
+
+### Problem
+
+Two related bugs made dispatch failures invisible:
+
+1. **P0-1 (Error Propagation):** `_handle_resolve_ops()` called `_dispatch_ops_agent()` but never checked its return value. `poll()` only set `failed = True` on exception. Result: dispatch failures silently archived as successes — `FAILED-` prefix never applied.
+
+2. **P0-2 (Silent Directive Loss):** When dispatch failed, the directive was moved to `.processed/` and lost. At-most-once delivery. Ops work requires at-least-once.
+
+### Changes
+
+1. **`AgentDispatchError` exception** — new custom exception raised when dispatch returns `False`
+2. **Retry tracking** — `_retry_counts: dict[str, int]` and `_max_directive_retries: int = 5` on `DirectiveProcessor.__init__`
+3. **`poll()` restructured** — `AgentDispatchError` caught separately from generic `Exception`:
+   - On `AgentDispatchError`: increment retry counter, leave directive in `.directives/` for next poll
+   - After max retries (5): archive with `FAILED-` prefix
+   - On other exceptions: archive immediately as `FAILED-`
+   - On success: archive normally, clear retry counter
+4. **`_handle_resolve_ops()` raises on failure** — both the auto-approved subset dispatch and the all-auto-approvable dispatch path now raise `AgentDispatchError` when dispatch returns `False`
+5. **`approve_ops_gate()` notifies on failure** — dispatch failure after human gate approval sends notification instead of raising (interactive context, not from `poll()`)
+
+### Pre-Existing Bugs Fixed
+
+Two additional bugs discovered during testing:
+- `OpsActionPriority.CRITICAL` → `"critical"` — `Literal` type aliases are not enums, don't support attribute access
+- `a.priority.value` → `a.priority` — priority is a plain string, not an enum with `.value`
+
+### Tests
+
+`tests/test_ops_agent.py` — rewritten (previous file was broken: wrong imports, incomplete). 7 tests:
+- **TestResolveOpsClassification** (3): filter=all, filter=critical, auto-approve bypass gate
+- **TestErrorPropagation** (4): T21 dispatch failure raises AgentDispatchError, T18 archives as FAILED after 5 retries, T19 retries then succeeds, T20 retry counter resets on success
+
+All 7 pass. AST check passes.
+
+### Deviations from Plan
+
+1. Test file is `test_ops_agent.py` not `test_ops_agent_e2e.py` (plan referenced wrong filename)
+2. Existing test file was broken and required full rewrite — plan assumed 17 working existing tests
+3. Fixed 2 pre-existing Literal/string bugs not in plan scope (discovered during testing, necessary for tests to pass)
+
+---
+
 ## Verification Checklist
 
 - [x] Manual `resolve-ops` directive dispatches Ops Agent correctly (T04, T07 dry-run; live session 4)
@@ -142,7 +192,12 @@ safety classification, handoff target (planner).
 - [x] Pipeline pauses during ops run (sequential) (T04 dry-run — 007 state=PROCESSING)
 - [x] Rollback to `pre-ops-agent-v1` works cleanly (T16 — tag verified)
 
-**Dry-run test harness:** `tests/test_ops_agent_e2e.py` — 17 tests, all passing (commit `d81c098`)
+- [x] Dispatch failure raises AgentDispatchError (T21 — commit `43dd09c`)
+- [x] Failed dispatch retries up to 5 times, then archives as FAILED- (T18 — commit `43dd09c`)
+- [x] Retry succeeds on second attempt, archives normally (T19 — commit `43dd09c`)
+- [x] Retry counter resets after successful archive (T20 — commit `43dd09c`)
+
+**Test harness:** `tests/test_ops_agent.py` — 7 tests, all passing (commit `43dd09c`)
 **Live tmux testing:** Session 4, 2026-03-08. See below.
 
 ---
