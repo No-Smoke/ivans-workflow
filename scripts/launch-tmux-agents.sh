@@ -123,6 +123,9 @@ fi
 echo -e "${BLUE}Creating tmux session...${NC}"
 tmux new-session -d -s "$SESSION" -n "${EMOJIS[0]} ${AGENTS[0]}" -x 200 -y 50
 
+# Set DBUS for credential-manager (GNOME Keyring → Bitwarden auto-unlock)
+tmux set-environment -t "$SESSION" DBUS_SESSION_BUS_ADDRESS "unix:path=/run/user/$(id -u)/bus"
+
 # Create additional windows
 for i in $(seq 1 $((${#AGENTS[@]} - 1))); do
     tmux new-window -t "$SESSION" -n "${EMOJIS[$i]} ${AGENTS[$i]}"

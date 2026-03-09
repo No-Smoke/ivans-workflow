@@ -886,5 +886,8 @@ the pending ops actions listed below.
 - Verify after each action — don't assume success
 - Update the register ATOMICALLY using Python heredoc pattern (Step 5 of skill)
 - If a "POSSIBLY RESOLVED" item is verified working, mark it completed
+- For ANY credential/secret retrieval, use the credential-manager script:
+  `python3 /home/vanya/Nextcloud/skills/personal/custom/credential-manager/get_credential.py <service> --field secret --quiet`
+  NEVER run raw `bw unlock` or `bw get` — they fail in headless/tmux shells.
 """
         return prompt
