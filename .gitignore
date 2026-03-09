@@ -1,20 +1,45 @@
-# Never commit credentials or secrets
-*.env
-*.local.json
-credentials.env
-.dev.vars
-*.secret
-*.key
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
 
-# Machine-specific
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code worktrees and local settings
+.claude/worktrees/
 .claude/settings.local.json
+
+# Test caches
+.pytest_cache/
+
+# Logs (runtime, not tracked)
+logs/
+
+# Backups (local safety nets, not tracked)
+backups/
+iwo-regressed-backup/
+
+# Stale/duplicate gitignore
+_1.gitignore
+
+# PAL generated code (ephemeral)
+pal_generated.code
 
 # OS
 .DS_Store
 Thumbs.db
-
-# Editor
-.vscode/
-.idea/
-*.swp
-*~

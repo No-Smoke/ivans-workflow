@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "iwo-007-completion-signal-v1",
+  "title": "Agent 007 Completion Signal",
+  "description": "Written by 007 at exit. Daemon watches for this file to detect completion. Points to the full diagnostic report. Stored at docs/agent-comms/.audit/007-complete-{timestamp}.json.",
+  "type": "object",
+  "required": ["completed_at", "trigger_timestamp", "outcome", "report_path"],
+  "additionalProperties": false,
+  "properties": {
+    "completed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When 007 finished its work."
+    },
+    "trigger_timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Matches the original activation timestamp — links signal to trigger."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["retry_initiated", "escalated", "skipped", "error"],
+      "description": "Final outcome of the 007 activation."
+    },
+    "report_path": {
+      "type": "string",
+      "description": "Relative path to the full diagnostic report (e.g., docs/agent-comms/.audit/007-2026-02-21T04-15-00Z.json)."
+    }
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "iwo-retry-handoff-v1",
+  "title": "Agent 007 Retry Handoff",
+  "description": "Written by Agent 007 when retrying a stalled or transiently-failed pipeline step. Distinct from normal pipeline handoffs — uses 007-retry-{N}.json naming and is NOT parsed by the standard handoff pipeline. The daemon HandoffHandler must skip files matching 007-*.json.",
+  "type": "object",
+  "required": ["type", "retry_count", "original_failure", "diagnosis", "instructions", "target_agent", "metadata"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "const": "retry",
+      "description": "Discriminator field. Always 'retry' — distinguishes from normal pipeline handoffs."
+    },
+    "retry_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3,
+      "description": "Which retry attempt this is (1-3). Enforced by 007 — escalates to human after 3."
+    },
+    "original_failure": {
+      "type": "object",
+      "required": ["spec_id", "failed_agent", "failed_at", "error_summary", "auditor_check", "auditor_severity"],
+      "additionalProperties": false,
+      "properties": {
+        "spec_id": {
+          "type": "string",
+          "description": "The spec ID of the pipeline that failed (e.g., 'EBATT-CALC-001')."
+        },
+        "failed_agent": {
+          "type": "string",
+          "enum": ["planner", "builder", "reviewer", "tester", "deployer", "docs"],
+          "description": "Which pipeline agent failed."
+        },
+        "failed_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp of when the failure was detected by the auditor."
+        },
+        "error_summary": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "One-line summary of the error. Extracted from pane output or handoff."
+        },
+        "auditor_check": {
+          "type": "string",
+          "enum": ["agent_liveness", "agent_timeout", "stale_assignment"],
+          "description": "Which auditor check triggered 007. Only retry-safe checks appear here."
+        },
+        "auditor_severity": {
+          "const": "critical",
+          "description": "Always 'critical' — 007 is only triggered on critical+ severity."
+        }
+      }
+    },
+    "diagnosis": {
+      "type": "object",
+      "required": ["classification", "summary", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "classification": {
+          "type": "string",
+          "enum": ["transient", "stall"],
+          "description": "Only transient and stall classifications reach retry. Deterministic/configuration/unknown always escalate."
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "007's diagnosis of what went wrong and why retry is appropriate."
+        },
+        "evidence": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 500 },
+          "minItems": 1,
+          "maxItems": 10,
+          "description": "Evidence lines supporting the diagnosis. Pane output excerpts, timestamps, file contents."
+        }
+      }
+    },
+    "instructions": {
+      "type": "string",
+      "maxLength": 2000,
+      "description": "What the retried agent should do differently. 007 provides context about the failure so the agent can adjust its approach."
+    },
+    "target_agent": {
+      "type": "string",
+      "enum": ["planner", "builder", "reviewer", "tester", "deployer", "docs"],
+      "description": "Same as failed_agent — retries always go back to the same agent."
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["triggered_by", "trigger_timestamp", "original_handoff_path"],
+      "additionalProperties": false,
+      "properties": {
+        "triggered_by": {
+          "const": "agent_007",
+          "description": "Always 'agent_007'."
+        },
+        "trigger_timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When 007 was activated."
+        },
+        "original_handoff_path": {
+          "type": ["string", "null"],
+          "description": "Path to the last handoff file for this spec. Null if no handoff existed (e.g., agent stalled before writing one)."
+        }
+      }
+    }
+  }
+}

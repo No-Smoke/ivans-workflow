@@ -1,0 +1,156 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "iwo-007-diagnostic-report-v1",
+  "title": "Agent 007 Diagnostic Report",
+  "description": "Written by Agent 007 after every activation. Records the full diagnosis, actions taken, and outcome. Stored at docs/agent-comms/.audit/007-{timestamp}.json. This is the durable audit trail for every 007 intervention.",
+  "type": "object",
+  "required": ["report_id", "trigger", "diagnosis", "actions", "outcome", "duration_seconds"],
+  "additionalProperties": false,
+  "properties": {
+    "report_id": {
+      "type": "string",
+      "pattern": "^007-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z$",
+      "description": "Unique report ID matching the filename pattern: 007-{ISO_TIMESTAMP_DASHES}.json"
+    },
+    "trigger": {
+      "type": "object",
+      "required": ["check", "severity", "spec_id", "agent", "window", "timestamp"],
+      "additionalProperties": false,
+      "properties": {
+        "check": {
+          "type": "string",
+          "enum": ["agent_liveness", "agent_timeout", "stale_assignment"],
+          "description": "Which auditor check triggered this activation."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["critical", "fatal"],
+          "description": "Auditor severity that triggered 007."
+        },
+        "spec_id": {
+          "type": ["string", "null"],
+          "description": "Spec ID affected. Null if the anomaly is not spec-specific."
+        },
+        "agent": {
+          "type": "string",
+          "enum": ["planner", "builder", "reviewer", "tester", "deployer", "docs"],
+          "description": "Which pipeline agent triggered the anomaly."
+        },
+        "window": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "description": "tmux window number of the affected agent."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the auditor detected the anomaly."
+        },
+        "auditor_diagnostic": {
+          "type": "object",
+          "description": "Full diagnostic output from the auditor check. Opaque to the schema — contents vary by check type.",
+          "additionalProperties": true
+        }
+      }
+    },
+    "diagnosis": {
+      "type": "object",
+      "required": ["classification", "pane_state", "summary"],
+      "additionalProperties": false,
+      "properties": {
+        "classification": {
+          "type": "string",
+          "enum": ["transient", "deterministic", "configuration", "stall", "unknown"],
+          "description": "007's classification of the root cause."
+        },
+        "pane_state": {
+          "type": "string",
+          "enum": ["idle_at_prompt", "showing_error", "actively_working", "pane_missing", "unresponsive"],
+          "description": "Observed state of the failing agent's tmux pane."
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "007's narrative diagnosis of what happened and why."
+        },
+        "error_detected": {
+          "type": ["string", "null"],
+          "maxLength": 500,
+          "description": "Specific error message extracted from pane output. Null if no error visible."
+        },
+        "last_output_lines": {
+          "type": "array",
+          "items": { "type": "string" },
+          "maxItems": 50,
+          "description": "Last N lines captured from the failing agent's pane. Raw evidence."
+        },
+        "root_cause_assessment": {
+          "type": ["string", "null"],
+          "maxLength": 1000,
+          "description": "007's best assessment of root cause. Null if unknown. Honesty protocol: if uncertain, say so here."
+        }
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["action", "target", "result"],
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["retry", "escalate", "skip", "webhook"],
+            "description": "What action was taken."
+          },
+          "target": {
+            "type": "string",
+            "description": "Target of the action — agent name for retry/skip, 'ntfy' for webhook, 'human' for escalate."
+          },
+          "retry_count": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "maximum": 3,
+            "description": "For retry actions, which attempt number. Null for non-retry actions."
+          },
+          "result": {
+            "type": "string",
+            "enum": ["sent", "written", "pending", "failed"],
+            "description": "Whether the action succeeded: 'sent' (webhook/command delivered), 'written' (file created), 'pending' (retry initiated, outcome unknown), 'failed' (action itself failed)."
+          },
+          "detail": {
+            "type": ["string", "null"],
+            "maxLength": 500,
+            "description": "Additional context about the action result."
+          }
+        }
+      },
+      "minItems": 1,
+      "description": "Ordered list of all actions 007 took during this activation."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["retry_initiated", "escalated", "skipped", "error"],
+      "description": "Final outcome of the 007 activation. 'error' means 007 itself encountered an issue during diagnosis."
+    },
+    "duration_seconds": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Wall-clock time from 007 activation to report completion."
+    },
+    "retry_history": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "attempt": { "type": "integer" },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "classification": { "type": "string" },
+          "outcome": { "type": "string" }
+        }
+      },
+      "description": "Previous retry attempts for this spec from the activation prompt. Empty on first trigger."
+    }
+  }
+}

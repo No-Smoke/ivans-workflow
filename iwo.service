@@ -1,0 +1,14 @@
+[Unit]
+Description=Ivan's Workflow Orchestrator (IWO)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/Nextcloud/PROJECTS/ivans-workflow-orchestrator/.venv/bin/python -m iwo.daemon
+WorkingDirectory=%h/Nextcloud/PROJECTS/ivans-workflow-orchestrator
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
