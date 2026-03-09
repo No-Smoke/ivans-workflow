@@ -37,11 +37,12 @@ python3 ~/Nextcloud/skills/personal/custom/credential-manager/get_credential.py 
 
 | Key | Contents |
 |-----|----------|
-| `secret` | The password, API key, or token |
+| `secret` | The password, API key, or token (for Secure Notes: first custom field value, or notes text) |
 | `username` | Login username (if any) |
 | `url` | Associated URL (if any) |
 | `service` | The alias you requested |
 | `label` | The actual Bitwarden entry name |
+| `fields` | Dict of all custom fields `{name: value}` (empty dict if none) |
 
 ## Error Recovery
 
@@ -84,6 +85,7 @@ If `get_credential()` raises `RuntimeError`, follow this sequence:
 | erpnext-api | ERPNext-API |
 | erpnext-api-admin | ERPNext-API-Admin |
 | erpnext-db | ERPNext-DB-Root |
+| monitor-token | ebatt-platform-monitor-auth-token |
 
 ## Storing Credentials
 
