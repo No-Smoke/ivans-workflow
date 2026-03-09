@@ -427,13 +427,15 @@ These spec directories have completed the full pipeline (docs agent finished):
                 prompt += f"- {s}\n"
 
         prompt += """
-### Step 3: Check the Tracking File
+### Step 3: Check the Build Priority Queue and Spec Disposition
 
 ```bash
-cat ebatt-specs/TRACKING-v2.1.md
+cat ebatt-specs/v2-schema-first/BUILD-PRIORITY.md
+cat ebatt-specs/v2-schema-first/DISPOSITION.md
 ```
 
-Review the tracking file for completion status, dependencies, and priority order.
+BUILD-PRIORITY.md defines the Phase 1→2→3→4 build queue. Follow it top-to-bottom.
+DISPOSITION.md shows which specs are archived — do not plan work for archived specs.
 
 ### Step 4: Check Current State
 
@@ -447,13 +449,14 @@ Identify any specs that were started but not completed (partial pipelines).
 ### Step 5: Select the Next Spec
 
 Apply these selection criteria IN ORDER:
-1. **Resume incomplete pipelines first** — if a spec has handoffs but no docs-agent completion, resume it
-2. **Respect dependency chains** — don't start a spec whose prerequisites aren't done
-3. **Prioritise foundation specs** — shared infrastructure, schema, core platform over features
-4. **Prefer lower-numbered specs** — they were sequenced intentionally
+1. **Follow BUILD-PRIORITY.md phase order** — Phase 1 before Phase 2 before Phase 3. This overrides all other criteria.
+2. **Resume incomplete pipelines first** — if a spec has handoffs but no docs-agent completion, resume it — but only if it belongs to the current or earlier phase.
+3. **Respect dependency chains** — don't start a spec whose prerequisites aren't done
+4. **Skip archived specs** — DISPOSITION.md lists which specs are archived. Do not plan work for archived specs.
+5. **Prefer lower-numbered specs within the same phase** — they were sequenced intentionally
 """
         if focus:
-            prompt += f"5. **Focus area requested:** {focus}\n"
+            prompt += f"6. **Focus area requested:** {focus}\n"
 
         prompt += """
 ### Step 6: Read the Selected Spec
