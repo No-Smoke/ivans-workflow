@@ -6,6 +6,7 @@ Before installing Ivan's Workflow, ensure you have:
 
 - **Claude Code CLI** — `claude` command available ([install guide](https://docs.anthropic.com/claude-code))
 - **tmux** — Terminal multiplexer (`sudo apt install tmux`)
+- **Python 3.11+** — For IWO orchestrator (`python3 --version`)
 - **git** — Version control (`sudo apt install git`)
 - **gh** — GitHub CLI for PR creation (`sudo apt install gh` or [install guide](https://cli.github.com))
 - **jq** — JSON processor (`sudo apt install jq`)
@@ -14,17 +15,24 @@ Before installing Ivan's Workflow, ensure you have:
 ## Quick Install
 
 ```bash
-# Clone the framework
+# Clone the framework + orchestrator
 git clone https://github.com/No-Smoke/ivans-workflow.git ~/projects/ivans-workflow
 
-# Navigate to your project
-cd /path/to/your/project
+# Set up IWO (the orchestrator)
+cd ~/projects/ivans-workflow
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
 
-# Run the installer
+# Configure for your project
+cp .env.example .env
+# Edit .env — at minimum, set IWO_PROJECT_ROOT
+
+# Install the framework into your project
+cd /path/to/your/project
 ~/projects/ivans-workflow/install.sh
 ```
 
-The installer will ask you about your project's tech stack, agent count, and preferences, then set up everything in your `.claude/` directory.
+The interactive installer configures agent skills, hooks, and rules based on your tech stack. The `.env` file configures IWO paths, memory services, and notifications.
 
 ## First Project Setup
 
@@ -115,6 +123,57 @@ Once agents are running:
 | /workflow-start TASK-ID | Initialize workflow for a task |
 | /workflow-next | Advance to next agent |
 | /workflow-status | Show task progress |
+
+## Using IWO (Orchestrator)
+
+IWO automates the agent-to-agent handoffs so you don't have to manually switch tmux windows and type `/workflow-next`.
+
+### 1. Configure .env
+
+```bash
+cd ~/projects/ivans-workflow
+cp .env.example .env
+```
+
+Edit `.env` and set at minimum:
+
+```bash
+IWO_PROJECT_ROOT=/path/to/your/project
+```
+
+For memory integration (optional), configure Qdrant, Neo4j, and Ollama endpoints. For push notifications, set `IWO_NTFY_TOPIC`. See `.env.example` for all available options.
+
+### 2. Launch Agents First
+
+```bash
+# Start the tmux agent session
+~/projects/ivans-workflow/scripts/launch-tmux-agents.sh /path/to/your/project
+```
+
+### 3. Launch IWO
+
+```bash
+cd ~/projects/ivans-workflow
+source .venv/bin/activate
+iwo-tui    # TUI dashboard (recommended)
+# or: iwo  # Headless daemon
+```
+
+### 4. Issue a Directive
+
+From the TUI, or via a desktop launcher script:
+
+```bash
+# Queue a start-spec directive
+echo '{"directive":"start-spec","specId":"MY-SPEC-001","context":"Build the login page"}' \
+  > $IWO_PROJECT_ROOT/docs/agent-comms/.directives/$(date +%s)-start-spec.json
+```
+
+IWO picks it up within 2 seconds, dispatches to Planner, and orchestrates the full pipeline automatically.
+
+### Desktop Launchers (Linux/GNOME)
+
+Run `scripts/setup-new-machine.sh` to install desktop launchers. Right-click the IWO launcher for actions: Plan Next Spec, Resolve Ops, Stop IWO.
 
 ## Next Steps
 

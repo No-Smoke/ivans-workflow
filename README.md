@@ -216,10 +216,60 @@ The installer generates stack-specific rules (e.g., "no Node builtins in Workers
 ## Documentation
 
 - [Getting Started](docs/GETTING-STARTED.md) — Prerequisites, installation, first workflow
+- [Architecture (IWO)](docs/ARCHITECTURE.md) — Orchestrator internals, config, dispatch, memory
 - [Customization](docs/CUSTOMIZATION.md) — Add agents, rules, hooks, credentials
 - [Agent Reference](docs/AGENT-REFERENCE.md) — Complete reference for all agents
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — Common issues and solutions
 - [Changelog](CHANGELOG.md) — Release history and fixes
+
+---
+
+## Ivan's Workflow Orchestrator (IWO)
+
+IWO is the automation layer that sits above the framework. While IWF defines agent roles, skills, and handoff protocols, IWO automates the handoff routing — monitoring for handoff JSON files, dispatching work via headless `claude -p` invocations, and managing pipeline state.
+
+### IWO Quick Start
+
+```bash
+# Already have the repo cloned from the IWF install above
+cd ~/projects/ivans-workflow
+
+# Set up Python environment
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+
+# Configure for your project
+cp .env.example .env
+# Edit .env — set IWO_PROJECT_ROOT to your project path
+
+# Launch the TUI
+iwo-tui
+```
+
+IWO requires a tmux session with agents already running (launched by `scripts/launch-tmux-agents.sh`). It watches `docs/agent-comms/` for handoff files and dispatches work automatically.
+
+### Key Features
+
+**Headless dispatch** — agents receive work via `claude -p` processes, not tmux send-keys injection. Deterministic idle detection via `pane_current_command`.
+
+**Directive processor** — external control via JSON files dropped into `.directives/`. Desktop launchers, cron jobs, and CLI scripts can queue directives like `start-spec`, `next-spec`, `pause`, `resolve-ops`.
+
+**Ops actions register** — tracks manual infrastructure tasks (migrations, secrets, DNS) auto-extracted from handoff JSON. Priority-based ntfy notifications.
+
+**Memory integration** (optional) — stores pipeline telemetry to Qdrant (semantic search) and Neo4j (graph queries). Degrades gracefully when unavailable.
+
+**Environment-driven config** — all paths and service URLs via `IWO_*` environment variables loaded from `.env`. No hardcoded paths in source. See [Architecture docs](docs/ARCHITECTURE.md) for the full variable reference.
+
+### IWO TUI
+
+```
+iwo-tui    # Interactive dashboard
+iwo        # Headless daemon (no TUI)
+```
+
+TUI keybindings: `q` quit, `d` approve deploy, `r` refresh, `p` pause, `a` toggle auto-deploy, `D` toggle auto-continue.
+
+For full IWO documentation see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
 

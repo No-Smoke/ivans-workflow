@@ -2,6 +2,47 @@
 
 All notable changes to Ivan's Workflow are documented in this file.
 
+## [3.0.0] — 2026-03-17
+
+### Changed
+
+- **Environment-driven configuration**: All hardcoded paths and service URLs in `iwo/config.py` replaced with `IWO_*` environment variables loaded from `.env` file. Zero `/home/vanya` or `192.168.x.x` references remain in source code.
+- **Portable across machines**: Fresh clone defaults to current working directory for project root, bundled skills, memory disabled, notifications disabled. Progressive configuration via `.env`.
+- **Version bump to 3.0.0**: Breaking change — `config.py` dataclass fields now read from environment instead of hardcoded defaults. Existing installations must create a `.env` file.
+
+### Added
+
+- `.env.example` — full documentation of all `IWO_*` environment variables with safe placeholder values.
+- Built-in `.env` parser in `config.py` (works without `python-dotenv` installed).
+- `python-dotenv` as a dependency (preferred loader, falls back to built-in parser).
+- `IWO_SKILLS_DIR` config field — bundled skills at `{repo}/skills`, overridable for custom locations.
+- Auto-source `.env` in all shell scripts (`directive-next-spec.sh`, `directive-resolve-ops.sh`, `kanban-dashboard-start.sh`, `test-ops-agent.sh`).
+- `EnvironmentFile` directive in `iwo.service` for systemd.
+- Graceful memory auto-disable when no Qdrant/Neo4j endpoints configured.
+
+### Fixed
+
+- `directives.py`: 3 hardcoded skill paths replaced with `self.config.skills_dir` references.
+- `tools/kanban-dashboard.py`: Added `.env` loading to `get_project_root()`, changed fallback from hardcoded path to `Path.cwd()`.
+- `scripts/setup-new-machine.sh`: Desktop launchers now use shell variable expansion at install time instead of hardcoded paths.
+- `skills/credential-manager/scripts/bw-auto-unlock.py`: Replaced hardcoded path in error message with generic `secret-tool` instruction.
+
+## [2.9.0] — 2026-02-25
+
+### Changed
+
+- **Headless dispatch**: Replaced interactive `send-keys` dispatch with headless `claude -p` process invocations. Each agent pane is an idle bash shell between tasks. Eliminates canary probes, state machine from dispatch path, and queue retry hacks.
+- **State model simplified**: 5-state machine (IDLE/PROCESSING/STUCK/WAITING_HUMAN/CRASHED) reduced to 3 states (IDLE/RUNNING/ERROR) derived from `pane_current_command`.
+- **Agent model tiering**: `AGENT_MODEL_MAP` assigns planner/builder/reviewer to Opus, tester/deployer/docs to Sonnet.
+
+### Added
+
+- `iwo/headless_commander.py` — new dispatch layer using `claude -p` with `--output-format stream-json`.
+- `iwo/directives.py` — DirectiveProcessor: polls `.directives/` every 2s for 9 JSON directive types (start-spec, next-spec, resume, reconcile, status, pause, unpause, cancel-spec, resolve-ops).
+- `iwo/ops_actions.py` — Ops Actions register: auto-extraction from handoffs, fingerprint dedup, priority classification, stale detection.
+- Desktop launcher scripts for directive injection (`scripts/directive-next-spec.sh`, `scripts/directive-resolve-ops.sh`).
+- `scripts/setup-new-machine.sh` — full machine setup script (venv, desktop launchers, verification).
+
 ## [1.0.2] — 2026-02-11
 
 ### Added
