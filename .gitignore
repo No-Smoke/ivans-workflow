@@ -40,6 +40,9 @@ _1.gitignore
 # PAL generated code (ephemeral)
 pal_generated.code
 
+# Environment (secrets — never commit)
+.env
+
 # OS
 .DS_Store
 Thumbs.db

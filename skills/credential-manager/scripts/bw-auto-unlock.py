@@ -26,7 +26,7 @@ def unlock_bitwarden():
         
         if not items:
             print("Error: Bitwarden master password not found in GNOME Keyring", file=sys.stderr)
-            print("Run: python3 /home/vanya/scripts/store-bw-password.py", file=sys.stderr)
+            print("Store it with: secret-tool store --label='Bitwarden' bitwarden master", file=sys.stderr)
             return None
         
         password = items[0].get_secret().decode('utf-8')

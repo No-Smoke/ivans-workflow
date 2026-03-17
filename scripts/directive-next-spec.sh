@@ -1,13 +1,21 @@
 #!/bin/bash
 # IWO Directive: Plan Next Spec
 # Called from desktop launcher right-click menu
-# v2: write-first design + debug logging
+# v3: env-driven paths, .env auto-load
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IWO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Load .env if IWO_PROJECT_ROOT not already set
+if [ -z "$IWO_PROJECT_ROOT" ] && [ -f "$IWO_ROOT/.env" ]; then
+    set -a; source "$IWO_ROOT/.env"; set +a
+fi
 
 LOGFILE="/tmp/iwo-directive-debug.log"
 echo "$(date -Iseconds) directive-next-spec.sh STARTED (PID $$)" >> "$LOGFILE"
-echo "  DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY XDG_SESSION_TYPE=$XDG_SESSION_TYPE" >> "$LOGFILE"
+echo "  IWO_PROJECT_ROOT=$IWO_PROJECT_ROOT" >> "$LOGFILE"
 
-DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"
+DIR="${IWO_PROJECT_ROOT:?IWO_PROJECT_ROOT not set — source .env or export it}/docs/agent-comms/.directives"
 mkdir -p "$DIR"
 
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)

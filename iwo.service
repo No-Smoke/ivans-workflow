@@ -4,6 +4,9 @@ After=default.target
 
 [Service]
 Type=simple
+# Load .env from either XDG config or the IWO repo
+EnvironmentFile=-%h/.config/iwo/env
+EnvironmentFile=-%h/Nextcloud/PROJECTS/ivans-workflow-orchestrator/.env
 ExecStart=%h/Nextcloud/PROJECTS/ivans-workflow-orchestrator/.venv/bin/python -m iwo.daemon
 WorkingDirectory=%h/Nextcloud/PROJECTS/ivans-workflow-orchestrator
 Restart=on-failure

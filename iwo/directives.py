@@ -430,8 +430,8 @@ These spec directories have completed the full pipeline (docs agent finished):
 ### Step 3: Check the Build Priority Queue and Spec Disposition
 
 ```bash
-cat ebatt-specs/v2-schema-first/BUILD-PRIORITY.md
-cat ebatt-specs/v2-schema-first/DISPOSITION.md
+cat docs/BUILD-PRIORITY.md
+cat docs/DISPOSITION.md
 ```
 
 BUILD-PRIORITY.md defines the Phase 1→2→3→4 build queue. Follow it top-to-bottom.
@@ -799,8 +799,10 @@ PLAN: docs/plans/{SPEC-ID}-implementation-plan.md
         prompt_path = prompt_dir / f"ops-agent-{ts}.md"
         prompt_path.write_text(prompt_content)
 
-        # Dispatch via HeadlessCommander
-        success = self.daemon.commander.launch_agent_007(prompt_path)
+        # Dispatch via HeadlessCommander — use ops-action-resolver skill, NOT supervisor
+        # The supervisor skill FORBIDS wrangler/npx which ops resolution requires.
+        ops_skill = self.config.skills_dir / "ops-action-resolver" / "SKILL.md"
+        success = self.daemon.commander.launch_agent_007(prompt_path, skill_override=ops_skill)
 
         if success:
             action_ids = [a.id for a in actions]
@@ -822,12 +824,22 @@ PLAN: docs/plans/{SPEC-ID}-implementation-plan.md
         register state for the specific actions to resolve.
         """
         # Read the ops-action-resolver skill
-        skill_path = Path("/home/vanya/Nextcloud/skills/personal/custom/ops-action-resolver/SKILL.md")
+        skill_path = self.config.skills_dir / "ops-action-resolver" / "SKILL.md"
         try:
             skill_content = skill_path.read_text()
         except Exception as e:
             log.warning(f"Could not read ops-action-resolver skill: {e}")
             skill_content = "(Skill file not found — use general ops resolution approach)"
+
+        # Read the reference files (resolution patterns + browser verification)
+        ref_dir = skill_path.parent / "references"
+        ref_content = ""
+        for ref_name in ("resolution-patterns.md", "browser-verification.md"):
+            ref_file = ref_dir / ref_name
+            try:
+                ref_content += f"\n\n### Reference: {ref_name}\n\n{ref_file.read_text()}"
+            except Exception as e:
+                log.warning(f"Could not read ops reference {ref_name}: {e}")
 
         # Build action details
         action_lines = []
@@ -860,6 +872,10 @@ the pending ops actions listed below.
 
 {skill_content}
 
+### Resolution Pattern References
+
+{ref_content}
+
 ### Actions to Resolve ({len(actions)} items)
 
 {actions_text}
@@ -890,7 +906,7 @@ the pending ops actions listed below.
 - Update the register ATOMICALLY using Python heredoc pattern (Step 5 of skill)
 - If a "POSSIBLY RESOLVED" item is verified working, mark it completed
 - For ANY credential/secret retrieval, use the credential-manager script:
-  `python3 /home/vanya/Nextcloud/skills/personal/custom/credential-manager/get_credential.py <service> --field secret --quiet`
+  `python3 {self.config.skills_dir}/credential-manager/get_credential.py <service> --field secret --quiet`
   NEVER run raw `bw unlock` or `bw get` — they fail in headless/tmux shells.
 """
         return prompt

@@ -24,10 +24,22 @@ def get_project_root(override: str = None) -> Path:
     import os
     if override:
         return Path(override)
+    # Load .env from IWO repo root
+    iwo_root = Path(__file__).resolve().parent.parent
+    env_file = iwo_root / ".env"
+    if env_file.exists() and "IWO_PROJECT_ROOT" not in os.environ:
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("IWO_PROJECT_ROOT="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if val:
+                    os.environ["IWO_PROJECT_ROOT"] = val
+                break
     root = os.environ.get("IWO_PROJECT_ROOT")
     if root:
         return Path(root)
-    return Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt"
+    # Final fallback: current working directory
+    return Path.cwd()
 
 
 AGENTS_ORDERED = ["planner", "builder", "reviewer", "tester", "deployer", "docs"]

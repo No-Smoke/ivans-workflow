@@ -1,5 +1,6 @@
 #!/bin/bash
 # IWO Kanban Dashboard — restart
-/home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/scripts/kanban-dashboard-stop.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$SCRIPT_DIR/kanban-dashboard-stop.sh"
 sleep 1
-/home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/scripts/kanban-dashboard-start.sh
+"$SCRIPT_DIR/kanban-dashboard-start.sh"

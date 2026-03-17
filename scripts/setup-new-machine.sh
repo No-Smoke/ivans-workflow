@@ -1,32 +1,50 @@
 #!/bin/bash
 # IWO + IWF Setup Script for new machines
-# Run this on any machine with Nextcloud synced to set up the full system.
+# Reads paths from .env (or prompts interactively if not found).
 #
 # Prerequisites:
-#   - Nextcloud synced with ~/Nextcloud/PROJECTS/
 #   - Python 3.11+, tmux, zenity, notify-send
 #   - Claude Code CLI authenticated (claude login)
+#   - IWO repo cloned (this script lives in it)
 
 set -e
 
-IWO_DIR="$HOME/Nextcloud/PROJECTS/ivans-workflow-orchestrator"
-EBATT_DIR="$HOME/Nextcloud/PROJECTS/ebatt-ai/ebatt"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IWO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DESKTOP_DIR="$HOME/.local/share/applications"
+
+# Load .env for IWO_PROJECT_ROOT
+if [ -f "$IWO_DIR/.env" ]; then
+    set -a; source "$IWO_DIR/.env"; set +a
+fi
+
+# Resolve project root — prompt if not set
+if [ -z "$IWO_PROJECT_ROOT" ]; then
+    echo "IWO_PROJECT_ROOT not set in .env"
+    read -rp "Path to target project (e.g. /home/you/projects/my-app): " IWO_PROJECT_ROOT
+    if [ -z "$IWO_PROJECT_ROOT" ]; then
+        echo "ERROR: IWO_PROJECT_ROOT is required."
+        exit 1
+    fi
+fi
+EBATT_DIR="$IWO_PROJECT_ROOT"
 
 echo "=== IWO + IWF Setup ==="
 echo ""
 
 # --- Step 1: Verify paths exist ---
-echo "[1/6] Checking Nextcloud paths..."
+echo "[1/6] Checking paths..."
 if [ ! -d "$IWO_DIR" ]; then
-    echo "ERROR: $IWO_DIR not found. Is Nextcloud synced?"
+    echo "ERROR: IWO directory not found at $IWO_DIR"
     exit 1
 fi
 if [ ! -d "$EBATT_DIR" ]; then
-    echo "ERROR: $EBATT_DIR not found. Is Nextcloud synced?"
+    echo "ERROR: Project directory not found at $EBATT_DIR"
+    echo "       Set IWO_PROJECT_ROOT in $IWO_DIR/.env"
     exit 1
 fi
-echo "  OK"
+echo "  IWO:     $IWO_DIR"
+echo "  Project: $EBATT_DIR"
 
 # --- Step 2: Python venv ---
 echo "[2/6] Setting up Python venv..."
@@ -54,106 +72,67 @@ fi
 echo "[4/6] Installing desktop launchers..."
 mkdir -p "$DESKTOP_DIR"
 
+# Helper: all desktop actions use a wrapper that sources .env for IWO_PROJECT_ROOT
+DIRECTIVE_HELPER="bash -c 'source $IWO_DIR/.env 2>/dev/null; DIR=\$IWO_PROJECT_ROOT/docs/agent-comms/.directives; mkdir -p \$DIR"
 
 # IWF launcher
-cat > "$DESKTOP_DIR/boris-workflow.desktop" << 'LAUNCHER'
+cat > "$DESKTOP_DIR/boris-workflow.desktop" <<LAUNCHER
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Ivan's Workflow
-Comment=Launch 7-agent headless workflow for ebatt-ai (v5.6)
+Comment=Launch agent workflow
 Icon=applications-development
-Exec=x-terminal-emulator -e bash -c 'cd /home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt && ./scripts/boris-workflow/launch-tmux-agents-v5.sh; exec bash'
+Exec=x-terminal-emulator -e bash -c 'cd $EBATT_DIR && ./scripts/boris-workflow/launch-tmux-agents-v5.sh; exec bash'
 Terminal=false
 Categories=Development;IDE;
 Keywords=claude;ai;development;workflow;tmux;
 StartupNotify=true
-Actions=KillSession;NextSpec;StartSpec;Resume;ViewLogs;LoadCredentials;
+Actions=KillSession;NextSpec;ViewLogs;
 
 [Desktop Action KillSession]
-Name=⬛ Kill Session
-Exec=bash -c 'tmux kill-session -t claude-agents 2>/dev/null && notify-send "Ivan'\''s Workflow" "Session terminated" || notify-send "Ivan'\''s Workflow" "No session to kill"'
+Name=Kill Session
+Exec=bash -c 'tmux kill-session -t claude-agents 2>/dev/null && notify-send "IWF" "Session terminated" || notify-send "IWF" "No session"'
 
 [Desktop Action NextSpec]
-Name=🧠 Plan Next Spec
-Exec=/home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/scripts/directive-next-spec.sh
-
-[Desktop Action StartSpec]
-Name=▶ Start Spec...
-Exec=bash -c 'SPEC=$(zenity --entry --title="Start Spec" --text="Spec ID (e.g. EBATT-011):" --width=400 2>/dev/null); if [ -n "$SPEC" ]; then CONTEXT=$(zenity --entry --title="Additional Context" --text="Optional instructions for Planner:" --width=500 2>/dev/null); DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"start-spec\",\"specId\":\"$SPEC\",\"context\":\"$CONTEXT\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-start-spec.json"; notify-send "Ivan'\''s Workflow" "Start directive queued for $SPEC"; fi'
-
-[Desktop Action Resume]
-Name=▶ Resume Spec...
-Exec=bash -c 'SPEC=$(zenity --entry --title="Resume Spec" --text="Spec ID to resume:" --width=400 2>/dev/null); if [ -n "$SPEC" ]; then DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"resume\",\"specId\":\"$SPEC\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-resume.json"; notify-send "Ivan'\''s Workflow" "Resume directive queued for $SPEC"; fi'
+Name=Plan Next Spec
+Exec=$IWO_DIR/scripts/directive-next-spec.sh
 
 [Desktop Action ViewLogs]
-Name=📋 View Git Log
-Exec=x-terminal-emulator -e bash -c 'cd /home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt && git log --oneline -30; exec bash'
-
-[Desktop Action LoadCredentials]
-Name=🔑 Load Credentials Only
-Exec=x-terminal-emulator -e bash -c 'source /home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/.claude/scripts/load-credentials.sh; echo ""; echo "Press Enter to close."; read'
+Name=View Git Log
+Exec=x-terminal-emulator -e bash -c 'cd $EBATT_DIR && git log --oneline -30; exec bash'
 LAUNCHER
 
-
 # IWO launcher
-cat > "$DESKTOP_DIR/iwo.desktop" << 'LAUNCHER'
+cat > "$DESKTOP_DIR/iwo.desktop" <<LAUNCHER
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=IWO — Orchestrator
-Comment=Ivan's Workflow Orchestrator — headless dispatch via claude -p (v2.9.1)
-Icon=/home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/assets/iwo-icon-256.png
-Exec=x-terminal-emulator -e bash -c 'cd /home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator && source .venv/bin/activate && python -m iwo.tui; exec bash'
+Comment=Ivan's Workflow Orchestrator
+Icon=$IWO_DIR/assets/iwo-icon-256.png
+Exec=x-terminal-emulator -e bash -c 'cd $IWO_DIR && source .venv/bin/activate && python -m iwo.tui; exec bash'
 Terminal=false
 Categories=Development;IDE;
-Keywords=iwo;orchestrator;workflow;tmux;agents;automation;
+Keywords=iwo;orchestrator;workflow;tmux;
 StartupNotify=true
-Actions=Headless;NextSpec;StartSpec;Resume;Reconcile;Status;Pause;Unpause;CancelSpec;Stop;Logs;
+Actions=Headless;NextSpec;ResolveOps;Stop;
 
 [Desktop Action Headless]
 Name=Run Headless (no TUI)
-Exec=x-terminal-emulator -e bash -c 'cd /home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator && source .venv/bin/activate && python -m iwo.daemon; exec bash'
+Exec=x-terminal-emulator -e bash -c 'cd $IWO_DIR && source .venv/bin/activate && python -m iwo.daemon; exec bash'
 
 [Desktop Action NextSpec]
-Name=🧠 Plan Next Spec
-Exec=/home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/scripts/directive-next-spec.sh
+Name=Plan Next Spec
+Exec=$IWO_DIR/scripts/directive-next-spec.sh
 
-[Desktop Action StartSpec]
-Name=▶ Start Spec...
-Exec=bash -c 'SPEC=$(zenity --entry --title="IWO: Start Spec" --text="Spec ID (e.g. EBATT-011):" --width=400 2>/dev/null); if [ -n "$SPEC" ]; then CONTEXT=$(zenity --entry --title="IWO: Additional Context" --text="Optional instructions for Planner:" --width=500 2>/dev/null); DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"start-spec\",\"specId\":\"$SPEC\",\"context\":\"$CONTEXT\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-start-spec.json"; notify-send "IWO" "Start directive queued for $SPEC"; fi'
-
-[Desktop Action Resume]
-Name=▶ Resume Spec...
-Exec=bash -c 'SPEC=$(zenity --entry --title="IWO: Resume Spec" --text="Spec ID to resume:" --width=400 2>/dev/null); if [ -n "$SPEC" ]; then DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"resume\",\"specId\":\"$SPEC\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-resume.json"; notify-send "IWO" "Resume directive queued for $SPEC"; fi'
-
-[Desktop Action Reconcile]
-Name=🔄 Reconcile Pipeline
-Exec=bash -c 'DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"reconcile\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-reconcile.json"; notify-send "IWO" "Reconcile directive queued"'
-
-[Desktop Action Status]
-Name=📊 Status Report
-Exec=bash -c 'DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"status\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-status.json"; notify-send "IWO" "Status report requested"'
-
-[Desktop Action Pause]
-Name=⏸ Pause Dispatch
-Exec=bash -c 'DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"pause\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-pause.json"; notify-send "IWO" "Pause directive queued"'
-
-[Desktop Action Unpause]
-Name=▶ Unpause Dispatch
-Exec=bash -c 'DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"unpause\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-unpause.json"; notify-send "IWO" "Unpause directive queued"'
-
-[Desktop Action CancelSpec]
-Name=🛑 Cancel Spec...
-Exec=bash -c 'SPEC=$(zenity --entry --title="IWO: Cancel Spec" --text="Spec ID to cancel:" --width=400 2>/dev/null); if [ -n "$SPEC" ]; then DIR="/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt/docs/agent-comms/.directives"; mkdir -p "$DIR"; echo "{\"directive\":\"cancel-spec\",\"specId\":\"$SPEC\",\"timestamp\":\"$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ)\"}" > "$DIR/$(date +%%s%%N)-cancel.json"; notify-send "IWO" "Cancel directive queued for $SPEC"; fi'
+[Desktop Action ResolveOps]
+Name=Resolve Ops Actions
+Exec=$IWO_DIR/scripts/directive-resolve-ops.sh
 
 [Desktop Action Stop]
-Name=⬛ Stop IWO
-Exec=bash -c 'pkill -f "python -m iwo" 2>/dev/null && notify-send "IWO" "Orchestrator stopped" || notify-send "IWO" "Not running"'
-
-[Desktop Action Logs]
-Name=📋 View Logs
-Exec=x-terminal-emulator -e bash -c 'less +F /home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator/logs/iwo.log 2>/dev/null || echo "No log file found."; exec bash'
+Name=Stop IWO
+Exec=bash -c 'pkill -f "python -m iwo" 2>/dev/null && notify-send "IWO" "Stopped" || notify-send "IWO" "Not running"'
 LAUNCHER
 
 echo "  boris-workflow.desktop installed"
