@@ -750,6 +750,8 @@ class IWOApp(App):
             else:
                 rich_log = self.query_one("#log-output", RichLog)
                 rich_log.write("[dim]No ops gate pending[/]")
+
+    def action_auto_deploy_toggle(self) -> None:
         """Toggle auto-deploy (bypass human gate for ALL deploys)."""
         cfg = self.daemon.config
         cfg.auto_deploy_all = not cfg.auto_deploy_all

@@ -635,11 +635,18 @@ Action: {handoff.nextAgent.action}
     # Agent 007 (headless, same pattern)
     # ------------------------------------------------------------------
 
-    def launch_agent_007(self, prompt_file: Path) -> bool:
+    def launch_agent_007(self, prompt_file: Path, skill_override: Path | None = None) -> bool:
         """Launch Agent 007 in its pane via headless claude -p.
 
         Agent 007 is a supervisory agent that already uses headless dispatch.
         This method aligns it with the same pattern as regular agents.
+
+        Args:
+            prompt_file: Path to the prompt markdown file.
+            skill_override: Optional path to a skill file to use instead of
+                the default agent-007-supervisor skill. Used by ops resolution
+                to avoid the supervisor's FORBIDDEN rules conflicting with
+                ops operations (wrangler, credential-manager, etc.).
 
         If agent-007 was not discovered during initial connect(), retries
         discovery once before giving up (lazy re-discovery).
@@ -664,10 +671,13 @@ Action: {handoff.nextAgent.action}
 
         project_root = self.config.agent_007_project_root
         budget = self.config.agent_007_budget_usd
-        skill_path = (
-            project_root / ".claude" / "skills"
-            / "agent-007-supervisor" / "SKILL.md"
-        )
+        if skill_override and skill_override.exists():
+            skill_path = skill_override
+        else:
+            skill_path = (
+                project_root / ".claude" / "skills"
+                / "agent-007-supervisor" / "SKILL.md"
+            )
         skill_flag = (
             f"--append-system-prompt-file {skill_path}"
             if skill_path.exists()

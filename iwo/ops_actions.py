@@ -28,6 +28,7 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "webhook": ["webhook", "n8n", "hook"],
     "verification": ["verify", "browser", "visual", "check", "confirm", "end-to-end"],
     "config": ["config", "wrangler.toml", "environment", "binding", "kv namespace", "r2 bucket"],
+    "bug": ["bug", "bugfix", "bug fix", "regression", "broken", "fix:"],
     "email_infra": ["email", "resend", "listmonk", "smtp", "spf record", "dkim"],
 }
 
@@ -70,7 +71,7 @@ OpsActionStatus = Literal["pending", "in_progress", "completed", "skipped"]
 OpsActionPriority = Literal["critical", "warning", "info"]
 OpsActionCategory = Literal[
     "migration", "secret", "dns", "webhook", "verification",
-    "config", "email_infra", "other"
+    "config", "email_infra", "bug", "other"
 ]
 
 
