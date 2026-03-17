@@ -215,7 +215,8 @@ The installer generates stack-specific rules (e.g., "no Node builtins in Workers
 
 ## Documentation
 
-- [Getting Started](docs/GETTING-STARTED.md) — Prerequisites, installation, first workflow
+- [Installation & Configuration](docs/INSTALLATION.md) — Full setup guide, .env reference, multi-machine deployment
+- [Getting Started](docs/GETTING-STARTED.md) — Prerequisites, first workflow walkthrough
 - [Architecture (IWO)](docs/ARCHITECTURE.md) — Orchestrator internals, config, dispatch, memory
 - [Customization](docs/CUSTOMIZATION.md) — Add agents, rules, hooks, credentials
 - [Agent Reference](docs/AGENT-REFERENCE.md) — Complete reference for all agents
