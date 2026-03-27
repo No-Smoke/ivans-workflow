@@ -7,16 +7,18 @@ Pane tagging, pipe-pane archival, reconciliation, deploy gate.
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
+import os
 
 
 @dataclass
 class IWOConfig:
     """Central configuration for Ivan's Workflow Orchestrator."""
 
-    # Paths
-    project_root: Path = Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt"
+    # Paths (overridable via IWO_* env vars — see tui.py main())
+    project_root: Path = Path(os.environ.get("IWO_PROJECT_ROOT",
+        str(Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt")))
     handoffs_dir: Path = field(default=None)
-    log_dir: Path = Path.home() / "Nextcloud/PROJECTS/ivans-workflow-orchestrator/logs"
+    log_dir: Path = field(default=None)
 
     # tmux
     tmux_session_name: str = "claude-agents"
@@ -71,7 +73,7 @@ class IWOConfig:
 
     # --- Pipeline staleness (Bug 3 fix) ---
     stale_pipeline_hours: float = 4.0  # pipelines with no handoff activity beyond this are stale
-    agent_007_project_root: Path = Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt"
+    agent_007_project_root: Path = field(default=None)  # defaults to project_root in __post_init__
 
     # Agents that require human approval before IWO sends the command
     human_gate_agents: set[str] = field(default_factory=lambda: {"deployer"})
@@ -100,15 +102,20 @@ class IWOConfig:
     # --- Memory Integration (Phase 2.1) ---
 
     enable_memory: bool = True
-    qdrant_url: str = "http://74.50.49.35:6333"
-    qdrant_api_key: str = "qdrant-ethospower-2025-secure-key"
-    neo4j_uri: str = "bolt://74.50.49.35:7687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: str = "ebatt2025"
-    ollama_url: str = "http://localhost:11434"
-    ollama_embed_model: str = "mxbai-embed-large"
+    qdrant_url: str = field(default_factory=lambda: os.environ.get("IWO_QDRANT_URL", "http://192.168.1.71:6333"))
+    qdrant_api_key: str = field(default_factory=lambda: os.environ.get("IWO_QDRANT_API_KEY", ""))
+    neo4j_uri: str = field(default_factory=lambda: os.environ.get("IWO_NEO4J_URI", "bolt://192.168.1.78:7687"))
+    neo4j_user: str = field(default_factory=lambda: os.environ.get("IWO_NEO4J_USER", "neo4j"))
+    neo4j_password: str = field(default_factory=lambda: os.environ.get("IWO_NEO4J_PASSWORD", ""))
+    ollama_url: str = field(default_factory=lambda: os.environ.get("IWO_OLLAMA_URL", "http://192.168.1.76:11434"))
+    ollama_embed_model: str = field(default_factory=lambda: os.environ.get("IWO_OLLAMA_MODEL", "mxbai-embed-large"))
 
     def __post_init__(self):
         if self.handoffs_dir is None:
             self.handoffs_dir = self.project_root / "docs" / "agent-comms"
+        if self.log_dir is None:
+            self.log_dir = Path(os.environ.get("IWO_LOG_DIR",
+                str(Path.home() / "PROJECTS/ivans-workflow-orchestrator/logs")))
+        if self.agent_007_project_root is None:
+            self.agent_007_project_root = self.project_root
         self.log_dir.mkdir(parents=True, exist_ok=True)
