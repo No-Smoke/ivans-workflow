@@ -275,8 +275,8 @@ Key node types relevant to IWO:
 Purpose-built bridge between Qdrant and Neo4j. Connected to both Claude.ai and Claude Code.
 
 - **Embedding model:** Ollama mxbai-embed-large (1024-dim)
-- **Qdrant endpoint:** http://74.50.49.35:6333
-- **Neo4j endpoint:** bolt://74.50.49.35:7687
+- **Qdrant endpoint:** http://192.168.1.71:6333
+- **Neo4j endpoint:** bolt://192.168.1.78:7687
 - **Key tools:** `search_with_graph`, `store_doc_with_graph`, `sync_to_tos`
 - **Repository:** [No-Smoke/tos-bridge](https://github.com/No-Smoke/tos-bridge)
 - **Local path:** ~/Nextcloud/PROJECTS/tos-bridge/
@@ -334,13 +334,13 @@ class IWOConfig:
 
     # Memory (Phase 2.1)
     enable_memory: bool = True
-    qdrant_url: str = "http://74.50.49.35:6333"
-    neo4j_uri: str = "bolt://74.50.49.35:7687"
+    qdrant_url: str = "http://192.168.1.71:6333"
+    neo4j_uri: str = "bolt://192.168.1.78:7687"
     ollama_url: str = "http://localhost:11434"
     ollama_embed_model: str = "mxbai-embed-large"
 ```
 
-Override the project root via environment variable: `IWO_PROJECT_ROOT=/path/to/project`
+Override paths via `IWO_*` environment variables in `.env` (must use `export` prefix). All paths and service URLs are configurable — see `iwo/config.py` for the full list. Key variables: `IWO_PROJECT_ROOT`, `IWO_LOG_DIR`, `IWO_QDRANT_URL`, `IWO_QDRANT_API_KEY`, `IWO_NEO4J_URI`, `IWO_OLLAMA_URL`.
 
 ## Running IWO
 
@@ -354,7 +354,7 @@ Override the project root via environment variable: `IWO_PROJECT_ROOT=/path/to/p
 
 **TUI mode (default):**
 ```bash
-cd ~/Nextcloud/PROJECTS/ivans-workflow-orchestrator
+cd ~/PROJECTS/ivans-workflow-orchestrator
 python3 -m iwo.tui
 ```
 
@@ -455,7 +455,7 @@ Claude Code's slash command processing can silently fail when CLAUDE.md exceeds 
 
 ### Memory storage failing
 
-Check services: Ollama (`curl http://localhost:11434/api/tags`), Qdrant (`curl http://74.50.49.35:6333/collections`), Neo4j (`curl http://74.50.49.35:7474`). Memory failures are non-fatal — IWO logs warnings and continues orchestrating.
+Check services: Ollama (`curl http://localhost:11434/api/tags`), Qdrant (`curl http://192.168.1.71:6333/collections`), Neo4j (`curl http://192.168.1.78:7474`). Memory failures are non-fatal — IWO logs warnings and continues orchestrating.
 
 ### No IWO log file for post-mortem
 

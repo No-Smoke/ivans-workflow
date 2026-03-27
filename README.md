@@ -22,11 +22,20 @@ Three-model consensus design (Claude Opus + GPT-5.2 + Gemini 3 Pro):
 ## Install
 
 ```bash
-cd /home/vanya/Nextcloud/PROJECTS/ivans-workflow-orchestrator
+cd /home/vanya/PROJECTS/ivans-workflow-orchestrator
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r <(grep -v "^-e git" requirements.txt)
 pip install -e .
 ```
+
+**Environment:** Copy `.env.example` to `.env` and set your paths and credentials. All variables must have the `export` prefix for Python `os.environ` visibility. Key variables:
+
+- `IWO_PROJECT_ROOT` — path to the ebatt project root
+- `IWO_LOG_DIR` — where agent logs go
+- `IWO_QDRANT_URL`, `IWO_QDRANT_API_KEY` — Qdrant vector DB
+- `IWO_NEO4J_URI`, `IWO_NEO4J_USER`, `IWO_NEO4J_PASSWORD` — Neo4j graph DB
+- `IWO_OLLAMA_URL`, `IWO_OLLAMA_MODEL` — embedding model
 
 ## Run
 
