@@ -182,6 +182,7 @@ class SafetyPanel(Container):
         yield Static("", id="safety-handoffs", classes="safety-row")
         yield Static("", id="safety-deploy", classes="safety-row")
         yield Static("", id="safety-pending", classes="safety-row")
+        yield Static("", id="safety-ops-gate", classes="safety-row")
 
 
 class HandoffPanel(Container):
@@ -262,10 +263,13 @@ class IWOApp(App):
     SUB_TITLE = "Phase 2 Dashboard"
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("d", "deploy_approve", "Deploy Approve"),
-        Binding("r", "force_reconcile", "Reconcile"),
-        Binding("p", "pause_toggle", "Pause/Resume"),
+        Binding("q", "quit", "Quit", priority=True),
+        Binding("d", "deploy_approve", "Deploy Approve", priority=True),
+        Binding("D", "auto_deploy_toggle", "Auto-Deploy", priority=True),
+        Binding("r", "force_reconcile", "Reconcile", priority=True),
+        Binding("p", "pause_toggle", "Pause/Resume", priority=True),
+        Binding("a", "auto_continue_toggle", "Auto-Continue", priority=True),
+        Binding("o", "ops_approve", "Ops Approve", priority=True),
     ]
 
     CSS = """
@@ -356,9 +360,20 @@ class IWOApp(App):
         root_logger.addHandler(handler)
         root_logger.setLevel(logging.INFO)
 
+        # Also log to file for post-mortem debugging (Bug 2 fix)
+        log_dir = self.daemon.config.log_dir
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_dir / "iwo.log")
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-5s %(name)s │ %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        root_logger.addHandler(file_handler)
+
         # Also capture watchdog logs
         wd_logger = logging.getLogger("watchdog")
         wd_logger.addHandler(handler)
+        wd_logger.addHandler(file_handler)
 
         # Start daemon (connect, tag, init state machines, start watcher)
         rich_log.write("[bold green]Starting IWO daemon...[/]")
@@ -377,6 +392,7 @@ class IWOApp(App):
         self._display_timer = self.set_interval(1.0, self._update_display)
         self._health_timer = self.set_interval(60.0, self._check_memory_health)
         self._metrics_timer = self.set_interval(60.0, self._refresh_metrics)
+        self._directive_timer = self.set_interval(poll_interval, self._poll_directives)
 
         # Run initial health check and metrics
         self._check_memory_health()
@@ -393,6 +409,13 @@ class IWOApp(App):
         if self._paused:
             return
         self.daemon._reconcile_filesystem()
+
+    def _poll_directives(self) -> None:
+        """Poll for operator directive files."""
+        try:
+            self.daemon.directive_processor.poll()
+        except Exception as e:
+            self.log_message(f"Directive poll error: {e}")
 
     def _update_display(self) -> None:
         """Refresh all display widgets from daemon state."""
@@ -631,6 +654,21 @@ class IWOApp(App):
         except Exception:
             pass
 
+        # Ops gate status
+        ops_gate = self.daemon.directive_processor._ops_gate_pending
+        try:
+            if ops_gate:
+                actions, _ = ops_gate
+                self.query_one("#safety-ops-gate", Static).update(
+                    f" Ops gate: [bold magenta]PENDING ({len(actions)} actions)[/] — press 'o'"
+                )
+            else:
+                self.query_one("#safety-ops-gate", Static).update(
+                    " Ops gate: [dim]—[/]"
+                )
+        except Exception:
+            pass
+
     def _update_handoffs(self) -> None:
         history = self.daemon.handoff_history
         for i in range(12):
@@ -650,21 +688,32 @@ class IWOApp(App):
     # ── Actions ──────────────────────────────────────────────────────
 
     def action_deploy_approve(self) -> None:
-        """Manually approve deploy gate — dispatch the pending deploy handoff."""
+        """Manually approve deploy gate — dispatch the oldest pending deploy (FIFO)."""
         rich_log = self.query_one("#log-output", RichLog)
         pending = self.daemon._deploy_gate_pending
         if not pending:
             rich_log.write("[bold red]Deploy gate: no pending deploy to approve[/]")
             return
 
-        handoff, path = pending
+        # Pop oldest from FIFO queue
+        handoff, path = pending.pop(0)
+        target = handoff.target_agent
+        remaining = len(pending)
         rich_log.write(
-            f"[bold yellow]Deploy gate: approving {handoff.spec_id}...[/]"
+            f"[bold yellow]Deploy gate: approving {handoff.spec_id} → {target}...[/]"
         )
-        # Clear pending BEFORE dispatching to prevent double-approval
-        self.daemon._deploy_gate_pending = None
-        self.daemon._activate_for_handoff("deployer", handoff, path)
-        rich_log.write("[bold green]Deploy gate: deployer activated![/]")
+        self.daemon._activate_for_handoff(target, handoff, path)
+
+        # Check if activation actually succeeded
+        from .state import AgentState
+        suffix = f" ({remaining} still queued)" if remaining else ""
+        if self.daemon.agent_states.get(target) == AgentState.PROCESSING:
+            rich_log.write(f"[bold green]Deploy gate: {target} activated!{suffix}[/]")
+        else:
+            rich_log.write(
+                f"[bold red]Deploy gate: {target} NOT idle — "
+                f"handoff re-queued, will dispatch when idle{suffix}[/]"
+            )
 
     def action_force_reconcile(self) -> None:
         """Force an immediate filesystem reconciliation."""
@@ -680,6 +729,44 @@ class IWOApp(App):
             rich_log.write("[bold yellow]⏸ Polling PAUSED[/]")
         else:
             rich_log.write("[bold green]▶ Polling RESUMED[/]")
+
+    def action_auto_continue_toggle(self) -> None:
+        """Toggle auto-continue on pipeline completion."""
+        cfg = self.daemon.config
+        cfg.auto_continue_on_completion = not cfg.auto_continue_on_completion
+        rich_log = self.query_one("#log-output", RichLog)
+        if cfg.auto_continue_on_completion:
+            rich_log.write("[bold green]🔄 Auto-continue ENABLED — next-spec will auto-queue on pipeline completion[/]")
+        else:
+            rich_log.write("[bold yellow]⏹ Auto-continue DISABLED — manual next-spec required[/]")
+
+    def action_ops_approve(self) -> None:
+        """Approve pending ops agent dispatch (human gate)."""
+        if self.daemon and self.daemon.directive_processor:
+            if self.daemon.directive_processor._ops_gate_pending:
+                self.daemon.directive_processor.approve_ops_gate()
+                rich_log = self.query_one("#log-output", RichLog)
+                rich_log.write("[bold green]✅ Ops gate approved — Agent 007 dispatching[/]")
+            else:
+                rich_log = self.query_one("#log-output", RichLog)
+                rich_log.write("[dim]No ops gate pending[/]")
+
+    def action_auto_deploy_toggle(self) -> None:
+        """Toggle auto-deploy (bypass human gate for ALL deploys)."""
+        cfg = self.daemon.config
+        cfg.auto_deploy_all = not cfg.auto_deploy_all
+        rich_log = self.query_one("#log-output", RichLog)
+        if cfg.auto_deploy_all:
+            rich_log.write("[bold red]🚀 Auto-deploy ALL ENABLED — deploy gate bypassed for all specs[/]")
+            # Flush any pending deploys immediately
+            if self.daemon._deploy_gate_pending:
+                count = len(self.daemon._deploy_gate_pending)
+                rich_log.write(f"[bold]   Releasing {count} pending deploy(s)...[/]")
+                while self.daemon._deploy_gate_pending:
+                    handoff, path = self.daemon._deploy_gate_pending.pop(0)
+                    self.daemon._activate_agent(handoff, path)
+        else:
+            rich_log.write("[bold green]🛡 Auto-deploy ALL DISABLED — deploy gate restored[/]")
 
     def action_quit(self) -> None:
         """Clean shutdown."""

@@ -19,15 +19,18 @@ Design: Three-model consensus (Claude Opus 4.6 + GPT-5.2 + Gemini 3 Pro).
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from pydantic import ValidationError
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileMovedEvent
 
 from .config import IWOConfig
 from .parser import Handoff
@@ -37,6 +40,15 @@ from .memory import IWOMemory
 from .pipeline import PipelineManager
 from .metrics import MetricsCollector
 from .auditor import Auditor, AuditorConfig
+from .directives import DirectiveProcessor
+from .ops_actions import (
+    OpsAction,
+    OpsActionsRegister,
+    classify_category,
+    classify_priority,
+    compute_fingerprint,
+    _next_id,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,27 +122,47 @@ class HandoffTracker:
 
 
 class HandoffHandler(FileSystemEventHandler):
-    """Watchdog handler for new handoff JSON files."""
+    """Watchdog handler for new handoff JSON files.
+
+    Handles both ``on_created`` and ``on_moved`` events because Nextcloud
+    sync clients (and many editors) write to a temp file then rename/move
+    into the final path.  The rename triggers ``on_moved`` (not
+    ``on_created``), so we must handle both to reliably detect handoffs.
+    """
 
     def __init__(self, daemon: "IWODaemon"):
         self.daemon = daemon
 
+    # -- public watchdog callbacks -----------------------------------------
+
     def on_created(self, event: FileCreatedEvent):
         if event.is_directory:
             return
-        path = Path(event.src_path)
+        self._handle_new_handoff(Path(event.src_path))
+
+    def on_moved(self, event: FileMovedEvent):
+        """Catch Nextcloud's atomic .tmp → .json rename pattern."""
+        if event.is_directory:
+            return
+        self._handle_new_handoff(Path(event.dest_path))
+
+    # -- shared logic ------------------------------------------------------
+
+    def _handle_new_handoff(self, path: Path) -> None:
+        """Validate *path* and forward to the daemon for processing."""
         if path.suffix != ".json":
             return
         if path.name == "LATEST.json":
             return
         if path.name.endswith(".tmp"):
             return
-        if path.name.startswith("007-"):
-            log.debug(f"Skipping 007 file: {path.name}")
-            return
         # Ignore audit trail files (written by auditor, not handoffs)
         if ".audit" in path.parts:
             log.debug(f"Skipping audit file: {path.name}")
+            return
+        # Ignore directive files (processed by DirectiveProcessor, not handoff pipeline)
+        if ".directives" in path.parts:
+            log.debug(f"Skipping directive file: {path.name}")
             return
         # Update LATEST.json symlink — IWO is the authority, not agents (Bug 2 fix)
         spec_dir = path.parent
@@ -183,14 +215,34 @@ class IWODaemon:
         self._respawn_attempts: dict[str, int] = {}  # agent_name → attempt count
         self._respawn_cooldown: dict[str, float] = {}  # agent_name → last attempt time
 
-        # Phase 3: Deploy gate — stores gated handoff for TUI approval
-        self._deploy_gate_pending: Optional[tuple[Handoff, Path]] = None
+        # Phase 3: Deploy gate — FIFO queue of gated handoffs for TUI approval
+        self._deploy_gate_pending: list[tuple[Handoff, Path]] = []
 
         # Phase 2.5.1: Metrics collector (initialized after memory)
         self.metrics: Optional[MetricsCollector] = None
 
         # Phase 3.0: Auditor module (Agent 007 Phase 1)
         self.auditor: Optional[Auditor] = None
+
+        # Directive processor — operator commands via filesystem
+        self.directive_processor = DirectiveProcessor(self.config, self)
+
+        # Ops Actions Register — tracks human-required operational tasks
+        ops_path = self.config.handoffs_dir / ".ops-actions.json"
+        self.ops_register = OpsActionsRegister(ops_path)
+        self.ops_register.load()
+
+        # Pause flag — set by pause directive, prevents new dispatches
+        self._paused: bool = False
+
+        # Ops agent: gate pending data + proactive check timer
+        self._ops_gate_pending: Optional[tuple] = None
+        self._last_ops_proactive_check: float = 0.0
+
+        # State-change notification debounce: agent_name → last notify timestamp
+        # Prevents notification spam when agents flicker between states rapidly
+        self._state_notify_debounce: dict[str, float] = {}
+        self._state_notify_cooldown: float = 30.0  # seconds between state notifications per agent
 
     def _init_agent_states(self):
         """Initialize agent state tracking for all discovered agents.
@@ -226,6 +278,8 @@ class IWODaemon:
             self._state_changed_at[name] = now
             if prev != AgentState.IDLE:
                 log.info(f"[{name}] {prev.value} → idle (completed)")
+                if prev == AgentState.PROCESSING:
+                    self._notify_state_change(name, prev, AgentState.IDLE, now)
 
         # Update all agent states
         for name in self.agent_states:
@@ -244,6 +298,7 @@ class IWODaemon:
                 self.agent_states[name] = new_state
                 self._state_changed_at[name] = now
                 log.info(f"[{name}] {prev.value} → {new_state.value}")
+                self._notify_state_change(name, prev, new_state, now)
 
         # Check if any pending activations can proceed
         self._process_pending_activations()
@@ -253,6 +308,32 @@ class IWODaemon:
         released = self.pipeline.release_stale_pipelines(stale_threshold)
         if released:
             self._notify(f"🧹 Released {len(released)} stale pipeline(s): {', '.join(released)}")
+
+    def _notify_state_change(
+        self, agent: str, prev: AgentState, new: AgentState, now: float
+    ):
+        """Send a push notification for significant agent state transitions.
+
+        Debounced per-agent to avoid notification spam when agents flicker
+        between states rapidly.  Only PROCESSING→IDLE and *→PROCESSING
+        transitions trigger notifications; other transitions are too noisy.
+        """
+        # Only notify on significant transitions
+        if new == AgentState.PROCESSING:
+            msg = f"🚀 {agent} started working"
+        elif new == AgentState.IDLE and prev == AgentState.PROCESSING:
+            msg = f"✅ {agent} finished work"
+        else:
+            return  # UNKNOWN transitions are not worth a push notification
+
+        # Debounce: skip if last notification for this agent was < cooldown ago
+        last = self._state_notify_debounce.get(agent, 0.0)
+        if now - last < self._state_notify_cooldown:
+            log.debug(f"State notification suppressed for {agent} (debounce)")
+            return
+
+        self._state_notify_debounce[agent] = now
+        self._notify(msg)
 
     def _attempt_respawn(self, agent_name: str):
         """Attempt to respawn a crashed agent. Max 3 attempts with 30s cooldown.
@@ -490,9 +571,9 @@ class IWODaemon:
                     details={
                         "agent": agent,
                         "sequence": handoff.sequence,
-                        "message": f"✅ {agent} activated for {handoff.spec_id} (#{handoff.sequence})",
+                        "message": f"✅ {agent} activated (verified) for {handoff.spec_id} (#{handoff.sequence})",
                     },
-                    action_taken=f"activated_{agent}",
+                    action_taken=f"activated_{agent}_verified",
                     recommended_action=None,
                 ))
         else:
@@ -500,31 +581,41 @@ class IWODaemon:
             self.pipeline.enqueue(handoff, path)
             self._notify(f"❌ Failed to activate {agent}, re-queued", critical=True)
 
-    def _should_auto_approve_deploy(self, path: Path, handoff: Handoff) -> bool:
+    def _should_auto_approve_deploy(
+        self, path: Path, handoff: Handoff
+    ) -> tuple[bool, str]:
         """Check if a deploy handoff can bypass the human gate.
 
+        Returns (approved, reason) where *reason* is a human-readable string
+        explaining why auto-approval succeeded or failed.  The caller uses
+        *reason* in both the log and the TUI notification so the operator
+        knows exactly what to check before pressing 'd'.
+
         Auto-approves when the handoff explicitly declares no infrastructure
-        changes (no new migrations, secrets, or wrangler vars). If the flags
-        are absent or any flag indicates changes, requires human approval.
+        changes (noNewMigrations, noNewSecrets, noNewWranglerVars all True).
 
-        Reads the raw JSON because these fields are in deploymentInstructions
+        Reads the raw JSON because these fields live in deploymentInstructions
         which is not part of the Pydantic Handoff model.
-
-        Industry best practice: auto-deploy for low-risk (code-only) changes,
-        require human approval for high-risk (infra/DB/secrets) changes.
         """
         if not self.config.auto_approve_safe_deploys:
-            return False  # Feature disabled — always gate
+            return False, "auto-approve disabled in config"
 
         try:
             with open(path) as f:
                 raw = json.load(f)
         except Exception:
             log.warning("Auto-approve: cannot read raw handoff, requiring manual approval")
-            return False
+            return False, "could not read handoff JSON"
 
         # Check deploymentInstructions block (used by Planner/Tester handoffs)
-        deploy_info = raw.get("deploymentInstructions", {})
+        deploy_info = raw.get("deploymentInstructions")
+
+        if deploy_info is None:
+            return (
+                False,
+                "no deploymentInstructions block in handoff — "
+                "safety flags not provided by source agent",
+            )
 
         no_migrations = deploy_info.get("noNewMigrations", False)
         no_secrets = deploy_info.get("noNewSecrets", False)
@@ -536,19 +627,302 @@ class IWODaemon:
                 f"Auto-approve check: migrations={no_migrations}, "
                 f"secrets={no_secrets}, vars={no_vars} → SAFE"
             )
-            return True
+            return True, "all safety flags True (no infra changes)"
 
-        # Log which flags are missing or false
+        # Build specific reason listing which flags are missing/false
         flags = {
             "noNewMigrations": no_migrations,
             "noNewSecrets": no_secrets,
             "noNewWranglerVars": no_vars,
         }
         missing = [k for k, v in flags.items() if not v]
-        log.info(
-            f"Auto-approve check: UNSAFE — missing or false: {missing}"
+        reason = f"infrastructure flags missing or false: {', '.join(missing)}"
+        log.info(f"Auto-approve check: UNSAFE — {reason}")
+        return False, reason
+
+    # --- Ops Actions Auto-Extraction ---
+
+    # Patterns that indicate a human operational task (not code review notes)
+    _OPS_PATTERNS = [
+        re.compile(p, re.IGNORECASE) for p in [
+            r'migration.*not\s+(yet\s+)?(applied|run)',
+            r'not\s+yet\s+(set|configured|created|applied|deployed|stored)',
+            r'wrangler\s+(secret|d1)',
+            r'must\s+(run|create|configure|set|apply|execute|deploy|store)',
+            r'secrets?\s+not\s+(set|configured)',
+            r'\bDNS\b.*\b(CNAME|A\s+record|MX|DKIM|SPF|DMARC)\b',
+            r'HUMAN\s+ACTION\s+REQUIRED',
+            r'human\s+(must|task)',
+            r'seed\s+data\s+not\s+(yet\s+)?loaded',
+            r'not\s+yet\s+deployed',
+            r'webhook.*not\s+(set|configured)',
+            r'SMTP.*not\s+configured',
+            r'Stripe\s+(product|webhook).*not\s+(yet\s+)?(created|configured)',
+            r'n8n\s+workflow',
+            r'KV\s+namespace.*not\s+(yet\s+)?created',
+            r'KV\s+namespace\s+ID\s+(is\s+)?empty',
+            r'npx\s+wrangler',
+        ]
+    ]
+
+    def _is_ops_action(self, text: str) -> bool:
+        """Check if text matches an operational action pattern."""
+        return any(p.search(text) for p in self._OPS_PATTERNS)
+
+    def _extract_ops_actions(self, handoff: Handoff, path: Path):
+        """Extract ops actions from a handoff and add to the register.
+
+        Scans unresolvedIssues, deploymentInstructions, and nextAgent for
+        human-required operational tasks. Deduplicates via fingerprinting.
+        Also runs stale detection for existing actions on this spec.
+        """
+        spec_id = handoff.spec_id
+        new_actions: list[OpsAction] = []
+
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+        except Exception as e:
+            log.warning(f"Ops extraction: cannot read {path.name}: {e}")
+            return
+
+        source_agent = handoff.source_agent
+        sequence = handoff.sequence
+        existing_ids = [a.id for a in self.ops_register.actions]
+
+        # Collect candidate texts for stale detection
+        current_texts: set[str] = set()
+
+        # 1. unresolvedIssues
+        for issue in raw.get("status", {}).get("unresolvedIssues", []):
+            if isinstance(issue, str) and len(issue.strip()) > 10:
+                current_texts.add(issue.strip().lower())
+                if self._is_ops_action(issue):
+                    fp = compute_fingerprint(spec_id, issue)
+                    new_actions.append(OpsAction(
+                        id=_next_id(existing_ids + [a.id for a in new_actions]),
+                        spec_id=spec_id,
+                        title=issue.strip()[:80],
+                        description=issue.strip(),
+                        category=classify_category(issue),
+                        priority=classify_priority(issue),
+                        source_agent=source_agent,
+                        source_sequence=sequence,
+                        fingerprint=fp,
+                        auto_extracted=True,
+                    ))
+
+        # 2. deploymentInstructions manual steps
+        deploy_info = raw.get("deploymentInstructions", {})
+        if isinstance(deploy_info, dict):
+            for field in ("preDeploySteps", "postDeploySteps", "manualSteps"):
+                steps = deploy_info.get(field, [])
+                if isinstance(steps, list):
+                    for step in steps:
+                        if isinstance(step, str) and len(step.strip()) > 10:
+                            current_texts.add(step.strip().lower())
+                            if self._is_ops_action(step):
+                                fp = compute_fingerprint(spec_id, step)
+                                new_actions.append(OpsAction(
+                                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                                    spec_id=spec_id,
+                                    title=step.strip()[:80],
+                                    description=step.strip(),
+                                    category=classify_category(step),
+                                    priority=classify_priority(step),
+                                    source_agent=source_agent,
+                                    source_sequence=sequence,
+                                    fingerprint=fp,
+                                    auto_extracted=True,
+                                ))
+
+            # Infrastructure flags
+            if deploy_info.get("noNewMigrations") is False:
+                text = f"D1 migration required for {spec_id} — noNewMigrations=false"
+                fp = compute_fingerprint(spec_id, text)
+                new_actions.append(OpsAction(
+                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                    spec_id=spec_id,
+                    title=f"D1 migration required for {spec_id}",
+                    description=text,
+                    category="migration",
+                    priority="critical",
+                    source_agent=source_agent,
+                    source_sequence=sequence,
+                    fingerprint=fp,
+                    auto_extracted=True,
+                ))
+
+            if deploy_info.get("noNewSecrets") is False:
+                text = f"Wrangler secrets must be configured for {spec_id} — noNewSecrets=false"
+                fp = compute_fingerprint(spec_id, text)
+                new_actions.append(OpsAction(
+                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                    spec_id=spec_id,
+                    title=f"Wrangler secrets needed for {spec_id}",
+                    description=text,
+                    category="secret",
+                    priority="critical",
+                    source_agent=source_agent,
+                    source_sequence=sequence,
+                    fingerprint=fp,
+                    auto_extracted=True,
+                ))
+
+        # 3. nextAgent targeting human
+        next_agent = raw.get("nextAgent", {})
+        if isinstance(next_agent, dict) and next_agent.get("target") == "human":
+            action_text = next_agent.get("action", "")
+            if isinstance(action_text, str) and len(action_text.strip()) > 10 and self._is_ops_action(action_text):
+                fp = compute_fingerprint(spec_id, action_text)
+                new_actions.append(OpsAction(
+                    id=_next_id(existing_ids + [a.id for a in new_actions]),
+                    spec_id=spec_id,
+                    title=action_text.strip()[:80],
+                    description=action_text.strip(),
+                    category=classify_category(action_text),
+                    priority=classify_priority(action_text),
+                    source_agent=source_agent,
+                    source_sequence=sequence,
+                    fingerprint=fp,
+                    auto_extracted=True,
+                ))
+
+        # Add new actions (dedup handled by register)
+        added = 0
+        for action in new_actions:
+            if self.ops_register.add(action):
+                added += 1
+                # Notify for critical/warning actions
+                if action.effective_priority == "critical":
+                    self._notify(
+                        f"⛔ OPS ACTION REQUIRED [{spec_id}]: {action.title}",
+                        critical=True,
+                    )
+                elif action.effective_priority == "warning":
+                    self._notify(
+                        f"⚠️ OPS ACTION [{spec_id}]: {action.title}",
+                    )
+
+        if added:
+            self.ops_register.save()
+            log.info(f"Ops extraction: {added} new action(s) from {handoff.spec_id} #{sequence}")
+
+        # 4. Stale detection: check if existing pending actions for this spec
+        # are no longer mentioned in current handoff's unresolvedIssues
+        if current_texts:
+            for action in self.ops_register.get_pending_for_spec(spec_id):
+                if not action.auto_extracted:
+                    continue
+                # Check if the action's description (normalized) still appears
+                desc_lower = action.description.lower().strip()
+                still_present = any(
+                    desc_lower in t or t in desc_lower
+                    for t in current_texts
+                )
+                if not still_present and not action.stale_since:
+                    self.ops_register.mark_stale(action.id)
+                    log.info(f"Ops stale: {action.id} ({action.title[:50]}) no longer in {spec_id} handoff")
+                elif still_present and action.stale_since:
+                    self.ops_register.clear_stale(action.id)
+                    log.info(f"Ops un-stale: {action.id} reappeared in {spec_id}")
+
+            # Save if any stale changes
+            self.ops_register.save()
+
+    # ------------------------------------------------------------------
+    # Ops Agent — reactive/proactive triggers and completion
+    # ------------------------------------------------------------------
+
+    def _schedule_resolve_ops(self, context: str = ""):
+        """Create a resolve-ops directive programmatically.
+
+        Called reactively when Planner is blocked by ops issues,
+        or proactively when critical actions have been pending too long.
+        """
+        if not self.config.ops_agent_enabled:
+            return
+
+        # Don't schedule if gate is already pending or agent is busy
+        if self.directive_processor._ops_gate_pending:
+            log.debug("_schedule_resolve_ops: gate already pending, skipping")
+            return
+
+        if not self.commander.check_agent_007_idle():
+            log.debug("_schedule_resolve_ops: Agent 007 busy, skipping")
+            return
+
+        # Create synthetic directive data (bypass filesystem)
+        directive_data = {
+            "directive": "resolve-ops",
+            "filter": "all",
+            "context": context or "Programmatic trigger",
+        }
+
+        log.info(f"_schedule_resolve_ops: triggering resolve-ops ({context})")
+        self.directive_processor._handle_resolve_ops(directive_data)
+
+    def _check_ops_proactive(self):
+        """Proactive ops resolution — fires when critical actions pending too long.
+
+        Called every 60s from run_loop. Checks if any critical ops actions
+        have been pending longer than ops_proactive_threshold_minutes.
+        """
+        if not self.config.ops_agent_enabled:
+            return
+
+        now = time.time()
+        # Throttle to once per 60 seconds
+        if now - self._last_ops_proactive_check < 60:
+            return
+        self._last_ops_proactive_check = now
+
+        # Reload register
+        self.ops_register.load()
+        if not self.ops_register.has_pending_critical():
+            return
+
+        # Check if any critical actions exceed threshold
+        from .ops_actions import OpsActionPriority
+        critical = self.ops_register.get_pending(priority=OpsActionPriority.CRITICAL)
+        if not critical:
+            return
+
+        threshold_seconds = self.config.ops_proactive_threshold_minutes * 60
+        oldest_age = max(
+            (now - datetime.fromisoformat(a.created_at).timestamp())
+            for a in critical
+            if a.created_at
         )
-        return False
+
+        if oldest_age >= threshold_seconds:
+            age_minutes = int(oldest_age / 60)
+            self._schedule_resolve_ops(
+                f"Proactive: {len(critical)} critical ops actions pending "
+                f"({age_minutes}m oldest, threshold={self.config.ops_proactive_threshold_minutes}m)"
+            )
+
+    def _handle_ops_completion(self, handoff: Handoff):
+        """Handle completion of an ops agent (Agent 007) run.
+
+        Called in process_handoff when handoff comes from Agent 007.
+        Reloads register and logs summary of what was resolved.
+        """
+        self.ops_register.load()
+
+        # Count resolved/skipped/pending
+        summary = self.ops_register.get_summary()
+        completed = summary.get("completed", 0)
+        skipped = summary.get("skipped", 0)
+        pending = summary.get("pending", 0)
+
+        outcome = handoff.status.outcome if handoff.status else "unknown"
+        msg = (
+            f"Ops agent completed ({outcome}): "
+            f"{completed} resolved, {skipped} skipped, {pending} still pending"
+        )
+        log.info(msg)
+        self._notify(f"🔧 {msg}")
 
     def process_handoff(self, path: Path):
         """Parse, validate, and route a handoff file.
@@ -642,27 +1016,51 @@ class IWODaemon:
         # 8. Human gate check (conditional: auto-approve if no infrastructure changes)
         target = handoff.target_agent
         if target in self.config.human_gate_agents:
-            if self._should_auto_approve_deploy(path, handoff):
+            # Auto-deploy-all: bypass gate entirely
+            if self.config.auto_deploy_all:
                 log.info(
                     f"Deploy auto-approved for {handoff.spec_id}: "
-                    f"no migrations, secrets, or wrangler vars"
+                    f"auto_deploy_all enabled (gate bypassed)"
                 )
                 self._notify(
-                    f"✅ AUTO-DEPLOY: {handoff.spec_id} → {target} "
-                    f"(no infra changes, bypassing gate)"
+                    f"🚀 AUTO-DEPLOY (all): {handoff.spec_id} → {target}"
                 )
-                # Fall through to step 9 routing instead of returning
+                # Fall through to step 9 routing
             else:
-                msg = (
-                    f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
-                    f"Infrastructure changes detected — manual approval required. "
-                    f"Action: {handoff.nextAgent.action[:100]}"
-                )
-                log.info(msg)
-                self._notify(msg, critical=True)
-                # Store for TUI 'd' key approval
-                self._deploy_gate_pending = (handoff, path)
-                return
+                approved, reason = self._should_auto_approve_deploy(path, handoff)
+                if approved:
+                    log.info(
+                        f"Deploy auto-approved for {handoff.spec_id}: {reason}"
+                    )
+                    self._notify(
+                        f"✅ AUTO-DEPLOY: {handoff.spec_id} → {target} "
+                        f"({reason})"
+                    )
+                    # Fall through to step 9 routing
+                else:
+                    # Build pending critical ops actions list for this spec
+                    ops_detail = ""
+                    pending_critical = self.ops_register.get_pending_for_spec(
+                        handoff.spec_id, "critical"
+                    )
+                    if pending_critical:
+                        ops_lines = [f"  - {a.title}" for a in pending_critical[:5]]
+                        ops_detail = (
+                            f"\n⛔ {len(pending_critical)} pending critical ops action(s):\n"
+                            + "\n".join(ops_lines)
+                        )
+                    msg = (
+                        f"🚦 DEPLOY GATE: {handoff.spec_id} ready for {target}. "
+                        f"Reason: {reason}. "
+                        f"Press 'd' to approve. "
+                        f"Action: {handoff.nextAgent.action[:100]}"
+                        f"{ops_detail}"
+                    )
+                    log.info(msg)
+                    self._notify(msg, critical=True)
+                    # Append to pending queue (FIFO — 'd' key approves oldest first)
+                    self._deploy_gate_pending.append((handoff, path))
+                    return
 
         # 8.5 Terminal targets — pipeline complete, no activation needed
         if target in ("human", "none"):
@@ -676,6 +1074,12 @@ class IWODaemon:
                 f"Pipeline complete: {handoff.spec_id} → {target} "
                 f"(terminal target, no activation)"
             )
+            # Auto-continue: queue next-spec directive if enabled
+            if (
+                self.config.auto_continue_on_completion
+                and handoff.status.outcome == "success"
+            ):
+                self._schedule_auto_continue(handoff.spec_id)
             return
 
         # 9. Route to target agent — deterministic idle check
@@ -724,6 +1128,31 @@ class IWODaemon:
             except Exception as e:
                 log.warning(f"Auditor post-handoff check failed (non-fatal): {e}")
 
+        # 12. Ops Actions: extract human-required tasks from handoff (best-effort)
+        try:
+            self._extract_ops_actions(handoff, path)
+        except Exception as e:
+            log.warning(f"Ops actions extraction failed (non-fatal): {e}")
+
+        # 13. Ops Agent: handle completion if handoff is from Agent 007
+        if source == "agent-007" or (hasattr(handoff.metadata, 'agent') and handoff.metadata.agent == "agent-007"):
+            try:
+                self._handle_ops_completion(handoff)
+            except Exception as e:
+                log.warning(f"Ops completion handler failed (non-fatal): {e}")
+
+        # 14. Reactive ops trigger: if Planner blocked by unresolved ops issues
+        if target == "human" and handoff.status and handoff.status.outcome in ("blocked", "failed"):
+            unresolved = getattr(handoff.status, 'unresolvedIssues', []) or []
+            ops_keywords = ["migration", "wrangler", "secret", "r2 bucket", "dns", "not yet"]
+            if any(kw in issue.lower() for issue in unresolved for kw in ops_keywords):
+                try:
+                    self._schedule_resolve_ops(
+                        f"Reactive: {source} blocked on ops issues for {spec_id}"
+                    )
+                except Exception as e:
+                    log.warning(f"Reactive ops schedule failed (non-fatal): {e}")
+
     def _reconcile_filesystem(self):
         """Periodic scan to catch missed inotify events. Called every 30s.
 
@@ -739,12 +1168,23 @@ class IWODaemon:
             if spec_dir.name.startswith("."):
                 continue  # Skip .current-spec etc.
 
+            # Skip specs whose LATEST.json is terminal (workflow complete)
+            latest_link = spec_dir / "LATEST.json"
+            if latest_link.exists():
+                try:
+                    with open(latest_link) as fh:
+                        latest_data = json.load(fh)
+                    latest_target = latest_data.get("nextAgent", {}).get("target", "")
+                    if latest_target in ("human", "none"):
+                        continue  # Pipeline complete, nothing to reconcile
+                except Exception:
+                    pass
+
             json_files = sorted(spec_dir.glob("*.json"))
             json_files = [
                 f for f in json_files
                 if f.name != "LATEST.json"
                 and not f.name.endswith(".tmp")
-                and not f.name.startswith("007-")
             ]
 
             missed = 0
@@ -775,6 +1215,64 @@ class IWODaemon:
         except Exception as e:
             log.warning(f"Failed to update LATEST.json: {e}")
 
+    def _schedule_auto_continue(self, completed_spec_id: str):
+        """Queue a next-spec directive after a pipeline completes successfully.
+
+        Creates a directive JSON in .directives/ so the normal directive processing
+        loop picks it up. Uses a delay to let file writes settle.
+
+        Only fires if:
+        - auto_continue_on_completion is True (already checked by caller)
+        - No other active pipelines (avoid overloading agents)
+        - Planner pane is idle
+        """
+        # Guard: don't auto-continue if other pipelines are active
+        active_count = self.pipeline.active_count
+        if active_count > 0:
+            log.info(
+                f"Auto-continue skipped: {active_count} active pipeline(s) remain"
+            )
+            return
+
+        # Guard: check planner is idle
+        from .state import AgentState
+        planner_state = self.agent_states.get("planner", AgentState.UNKNOWN)
+        if planner_state not in (AgentState.IDLE, AgentState.UNKNOWN):
+            log.info(
+                f"Auto-continue skipped: planner is {planner_state.value}"
+            )
+            return
+
+        # Write the directive file after a short delay
+        def _write_directive():
+            time.sleep(self.config.auto_continue_delay_seconds)
+            try:
+                directives_dir = self.config.handoffs_dir / ".directives"
+                directives_dir.mkdir(parents=True, exist_ok=True)
+                ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                ts_ns = time.time_ns()
+                filename = f"{ts_ns}-auto-next-spec.json"
+                directive = {
+                    "directive": "next-spec",
+                    "focus": f"Auto-continue after {completed_spec_id} completed successfully. Select the next logical spec.",
+                    "timestamp": ts_iso,
+                    "auto_generated": True,
+                }
+                directive_path = directives_dir / filename
+                directive_path.write_text(json.dumps(directive))
+                log.info(
+                    f"Auto-continue: queued next-spec directive after "
+                    f"{completed_spec_id} → {directive_path.name}"
+                )
+                self._notify(
+                    f"🔄 Auto-continue: next-spec queued after {completed_spec_id}"
+                )
+            except Exception as e:
+                log.error(f"Auto-continue failed to write directive: {e}")
+
+        thread = threading.Thread(target=_write_directive, daemon=True)
+        thread.start()
+
     def _write_active_specs(self):
         """Write .active-specs.json for external visibility (TUI, other tools).
 
@@ -800,14 +1298,69 @@ class IWODaemon:
             pass
 
     def _notify(self, message: str, critical: bool = False):
-        """Send notification via configured channels (desktop, webhook, or both)."""
+        """Send notification via configured channels."""
         channels = self.config.notification_channels
+
+        if "ntfy" in channels:
+            self._notify_ntfy(message, critical)
 
         if "desktop" in channels:
             self._notify_desktop(message, critical)
 
         if "webhook" in channels:
             self._notify_webhook(message, critical)
+
+    def _notify_ntfy(self, message: str, critical: bool = False):
+        """Send push notification via ntfy (mobile phone).
+
+        ntfy is a simple HTTP-based pub/sub notification service.
+        Subscribe to the topic in the ntfy Android/iOS app to receive
+        all IWO notifications on your phone.
+        """
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError
+
+        url = f"{self.config.ntfy_server.rstrip('/')}/{self.config.ntfy_topic}"
+        priority = (
+            self.config.ntfy_priority_critical if critical
+            else self.config.ntfy_priority_normal
+        )
+
+        # Determine a short tag/emoji for the notification
+        if "OPS ACTION REQUIRED" in message:
+            tags = "rotating_light"
+        elif "OPS ACTION" in message and critical:
+            tags = "rotating_light"
+        elif "OPS ACTION" in message:
+            tags = "warning"
+        elif "AUTO-DEPLOY" in message or "activated" in message:
+            tags = "rocket"
+        elif "DEPLOY GATE" in message:
+            tags = "construction"
+        elif "FAIL" in message.upper() or "CRASH" in message.upper():
+            tags = "warning"
+        elif "STALE" in message.upper():
+            tags = "snail"
+        else:
+            tags = "robot"
+
+        # Extract a short title from the message (first ~50 chars)
+        # Strip non-ASCII to avoid latin-1 encoding errors in HTTP headers
+        title_raw = message[:60].split(".")[0].split("→")[0].strip()
+        title = title_raw.encode("ascii", errors="ignore").decode("ascii").strip()
+
+        req = Request(url, data=message.encode("utf-8"))
+        req.add_header("Title", f"IWO: {title}")
+        req.add_header("Priority", str(priority))
+        req.add_header("Tags", tags)
+
+        try:
+            with urlopen(req, timeout=self.config.ntfy_timeout) as resp:
+                log.debug(f"ntfy notification sent: {resp.status}")
+        except URLError as e:
+            log.warning(f"ntfy notification failed: {e}")
+        except Exception as e:
+            log.warning(f"ntfy notification error: {e}")
 
     def _notify_desktop(self, message: str, critical: bool = False):
         """Send desktop notification via notify-send."""
@@ -914,6 +1467,10 @@ class IWODaemon:
             self.auditor = None
 
         self._notify("IWO v1.0 started — state machine active")
+
+        # 9. Initialize directive processor directories
+        self.directive_processor.ensure_dirs()
+        log.info(f"Directive processor active: {self.directive_processor.directives_dir}")
         return True
 
     def run_loop(self):
@@ -935,6 +1492,17 @@ class IWODaemon:
 
                 if tick % recon_every == 0:
                     self._reconcile_filesystem()
+
+                # Poll for operator directives every 2 seconds
+                if tick % poll_every == 0:
+                    self.directive_processor.poll()
+
+                # Proactive ops check every 60 seconds
+                if tick % 60 == 0:
+                    try:
+                        self._check_ops_proactive()
+                    except Exception as e:
+                        log.warning(f"Proactive ops check failed (non-fatal): {e}")
 
                 # Auditor periodic checks (self-throttles to 5-min intervals)
                 if self.auditor:
@@ -985,13 +1553,30 @@ class IWODaemon:
             if spec_dir.name.startswith("."):
                 continue
 
+            # Fast-path: skip specs whose LATEST.json is terminal
+            latest_link = spec_dir / "LATEST.json"
+            if latest_link.exists():
+                try:
+                    with open(latest_link) as fh:
+                        latest_data = json.load(fh)
+                    latest_target = latest_data.get("nextAgent", {}).get("target", "")
+                    if latest_target in ("human", "none"):
+                        # Mark completed in pipeline state and move on
+                        spec_id = spec_dir.name
+                        pipeline = self.pipeline.get_or_create_pipeline(spec_id)
+                        pipeline.status = "completed"
+                        pipeline.current_agent = None
+                        total_specs += 1
+                        continue
+                except Exception:
+                    pass
+
             spec_id = spec_dir.name
             json_files = sorted(spec_dir.glob("*.json"))
             json_files = [
                 f for f in json_files
                 if f.name != "LATEST.json"
                 and not f.name.endswith(".tmp")
-                and not f.name.startswith("007-")
             ]
 
             if not json_files:

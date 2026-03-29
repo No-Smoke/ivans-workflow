@@ -1,21 +1,24 @@
-"""HeadlessCommander — Phase 1: Headless `claude -p` dispatch.
+"""HeadlessCommander — Headless-only agent dispatch.
 
-Replaces TmuxCommander's send-keys injection with subprocess-based
-headless invocations. Each agent runs as:
+All agent panes start as idle bash shells. When IWO detects a handoff
+targeting an agent, it launches `claude -p` in the pane with the handoff
+context. When claude -p exits, the pane returns to idle bash.
 
-    cd $PROJECT && cat prompt.md | claude -p \
-        --output-format stream-json \
-        --permission-mode bypassPermissions \
-        --append-system-prompt-file .claude/skills/$SKILL/SKILL.md \
+Dispatch:
+    cd $PROJECT && cat prompt.md | claude -p \\
+        --model opus \\
+        --output-format stream-json \\
+        --permission-mode bypassPermissions \\
+        --append-system-prompt-file .claude/skills/$SKILL/SKILL.md \\
         2>&1 | tee $LOG
 
-Idle detection is deterministic: pane_current_command == "bash" means idle.
-
-Design: Three-model consensus (Claude Opus 4.6, GPT-5.2, Gemini 3 Pro).
+Idle detection: pane_current_command ∈ IDLE_SHELLS AND no child processes
+(pgrep -P $pane_pid). The child-process check catches claude -p which tmux
+reports as "bash" because it runs as a child of the shell process.
+No interactive prompt matching, no canary probes, no send-keys injection.
 """
 
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -37,6 +40,18 @@ SKILL_DIR_MAP: dict[str, str] = {
     "docs": "boris-docs-agent",
 }
 
+# IWO agent name → Claude model to use for headless dispatch.
+# Planner/Builder/Reviewer need Opus for quality; Tester/Deployer/Docs
+# can use Sonnet for speed since their tasks are more mechanical.
+AGENT_MODEL_MAP: dict[str, str] = {
+    "planner": "opus",
+    "builder": "opus",
+    "reviewer": "opus",
+    "tester": "sonnet",
+    "deployer": "sonnet",
+    "docs": "sonnet",
+}
+
 # Shell names that indicate an idle pane (no claude process running)
 IDLE_SHELLS = frozenset(("bash", "zsh", "sh", "fish"))
 
@@ -56,6 +71,19 @@ class HeadlessCommander:
         completed = commander.check_completions()       # poll for done
     """
 
+    # Minimum seconds between dispatch attempts to the same agent.
+    # Prevents rapid C-u/workflow-next injection from poll loops and
+    # state recovery bursts.
+    _DISPATCH_COOLDOWN_SECONDS = 10.0
+
+    # Exponential backoff for failed dispatch attempts.
+    # After a dispatch failure, subsequent attempts are delayed:
+    #   cooldown = min(BASE * 2^(fail_count-1), MAX)
+    # i.e. 30s → 60s → 120s → 300s → 300s ...
+    # Resets to zero on successful dispatch.
+    _DISPATCH_FAIL_BASE_COOLDOWN = 30.0
+    _DISPATCH_FAIL_MAX_COOLDOWN = 300.0
+
     def __init__(self, config: IWOConfig):
         self.config = config
         self._server: Optional[libtmux.Server] = None
@@ -67,6 +95,13 @@ class HeadlessCommander:
 
         # Session IDs from stream-json output (for potential resumption)
         self._session_ids: dict[str, str] = {}
+
+        # Dispatch rate limiting: agent_name → last dispatch timestamp
+        self._last_dispatch_time: dict[str, float] = {}
+
+        # Failed dispatch backoff: tracks consecutive failures per agent
+        self._dispatch_fail_count: dict[str, int] = {}
+        self._dispatch_fail_time: dict[str, float] = {}
 
         # Ensure prompt and log directories exist
         self._prompt_dir = config.log_dir / "prompts"
@@ -195,22 +230,134 @@ class HeadlessCommander:
             agent_pane.setup_pipe_pane(str(self.config.log_dir))
 
     # ------------------------------------------------------------------
+    # Pane Identity Validation (dispatch safety)
+    # ------------------------------------------------------------------
+
+    def _validate_pane_identity(self, agent_name: str, agent: AgentPane) -> bool:
+        """Verify a pane is genuinely an IWO agent before dispatching.
+
+        Three checks prevent injecting C-u/workflow-next into wrong panes:
+
+        1. **Tag check**: The pane must have the @iwo-agent user option set
+           to this agent's name.  Without the tag, the pane was discovered
+           by window-index fallback and may be an unrelated session.
+
+        2. **Working directory check**: The pane's current working directory
+           must be within the configured project_root.  An agent pane
+           running ebatt code should be in the ebatt project tree.
+
+        3. **Rate limiting**: Dispatch to the same agent must not happen
+           more than once per _DISPATCH_COOLDOWN_SECONDS to prevent
+           rapid repeated C-u/workflow-next injection from poll loops.
+
+        Returns True only if all checks pass.
+        """
+        import subprocess
+
+        # --- Check 1: @iwo-agent tag matches ---
+        try:
+            result = subprocess.run(
+                ["tmux", "show-options", "-p", "-t", agent.pane.pane_id,
+                 "-v", self.config.pane_tag_key],
+                capture_output=True, text=True, timeout=5,
+            )
+            tag_value = result.stdout.strip() if result.returncode == 0 else ""
+            if tag_value != agent_name:
+                log.warning(
+                    f"[{agent_name}] Pane identity REJECTED: "
+                    f"@iwo-agent tag is {tag_value!r}, expected {agent_name!r} "
+                    f"(pane {agent.pane.pane_id}). "
+                    f"This pane may not be a Boris agent — refusing dispatch."
+                )
+                return False
+        except Exception as e:
+            log.warning(
+                f"[{agent_name}] Cannot verify @iwo-agent tag "
+                f"(pane {agent.pane.pane_id}): {e} — refusing dispatch"
+            )
+            return False
+
+        # --- Check 2: Working directory within project root ---
+        try:
+            pane_path = agent.pane.pane_current_path
+            if pane_path:
+                project_root_str = str(self.config.project_root)
+                if not pane_path.startswith(project_root_str):
+                    log.warning(
+                        f"[{agent_name}] Pane identity REJECTED: "
+                        f"pane cwd is {pane_path!r}, expected prefix "
+                        f"{project_root_str!r} — refusing dispatch"
+                    )
+                    return False
+        except Exception as e:
+            # pane_current_path may not be available — log but don't block
+            log.debug(f"[{agent_name}] Could not check pane cwd: {e}")
+
+        # --- Check 3: Rate limiting ---
+        now = time.time()
+        last = self._last_dispatch_time.get(agent_name, 0.0)
+        elapsed = now - last
+        if elapsed < self._DISPATCH_COOLDOWN_SECONDS:
+            log.warning(
+                f"[{agent_name}] Dispatch THROTTLED: only {elapsed:.1f}s "
+                f"since last dispatch (cooldown={self._DISPATCH_COOLDOWN_SECONDS}s)"
+            )
+            return False
+
+        log.debug(
+            f"[{agent_name}] Pane identity VERIFIED: "
+            f"tag={agent_name!r}, pane={agent.pane.pane_id}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
     # Idle Detection (deterministic)
     # ------------------------------------------------------------------
 
     def is_agent_idle(self, agent_name: str) -> bool:
-        """Check if agent pane is idle (shell prompt, no claude running).
+        """Check if agent pane is idle (running a shell, no child processes).
 
-        Deterministic: pane_current_command ∈ IDLE_SHELLS means idle.
-        No regex, no canary probes, no state machine.
+        Two-layer check:
+        1. pane_current_command ∈ IDLE_SHELLS (fast path)
+        2. Shell has no child processes (catches claude -p which tmux
+           reports as "bash" because it's a child of the shell)
+
+        Without check 2, tmux's pane_current_command returns "bash" even
+        while `claude -p` is running as a child, causing double-dispatch.
         """
         agent = self._agents.get(agent_name)
         if not agent:
+            log.debug(f"[{agent_name}] not in _agents — cannot check idle")
             return False
         try:
             cmd = agent.pane.pane_current_command
-            return cmd in IDLE_SHELLS
-        except Exception:
+            log.debug(f"[{agent_name}] pane_current_command = {cmd!r}")
+            if cmd not in IDLE_SHELLS:
+                return False
+
+            # Check 2: verify the shell has no child processes.
+            # pane_pid is the shell PID; if claude -p is running, it's a
+            # child of that shell and pgrep will find it.
+            pane_pid = agent.pane.pane_pid
+            if pane_pid:
+                import subprocess
+                result = subprocess.run(
+                    ["pgrep", "-P", str(pane_pid)],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if result.stdout.strip():
+                    # Shell has child processes — not idle
+                    log.debug(
+                        f"[{agent_name}] pane_current_command=bash but shell "
+                        f"(PID {pane_pid}) has children: "
+                        f"{result.stdout.strip().replace(chr(10), ', ')} "
+                        f"— NOT idle"
+                    )
+                    return False
+
+            return True
+        except Exception as e:
+            log.warning(f"[{agent_name}] pane read failed: {e}")
             return False
 
     # ------------------------------------------------------------------
@@ -225,10 +372,12 @@ class HeadlessCommander:
     ) -> bool:
         """Dispatch work to an agent via headless claude -p.
 
-        1. Verify pane is idle
-        2. Build prompt file with handoff context
-        3. Launch: cat prompt.md | claude -p ... 2>&1 | tee log
-        4. Track as active
+        Requires the agent pane to be at an idle shell prompt.
+        If the pane is running claude or any other process, dispatch
+        is refused — the agent must finish or be terminated first.
+
+        Failed dispatches trigger exponential backoff (30s → 60s → 120s →
+        300s max) to prevent the 2-second poll loop from hammering a pane.
 
         Returns True if dispatch succeeded.
         """
@@ -239,6 +388,23 @@ class HeadlessCommander:
             log.error(f"Agent '{agent_name}' not found")
             return False
 
+        # --- Failed dispatch backoff ---
+        fail_count = self._dispatch_fail_count.get(agent_name, 0)
+        if fail_count > 0:
+            fail_time = self._dispatch_fail_time.get(agent_name, 0.0)
+            cooldown = min(
+                self._DISPATCH_FAIL_BASE_COOLDOWN * (2 ** (fail_count - 1)),
+                self._DISPATCH_FAIL_MAX_COOLDOWN,
+            )
+            elapsed = time.time() - fail_time
+            if elapsed < cooldown:
+                log.info(
+                    f"[{agent_name}] Dispatch BACKOFF: {fail_count} consecutive "
+                    f"failures, {cooldown - elapsed:.0f}s remaining "
+                    f"(cooldown={cooldown:.0f}s)"
+                )
+                return False
+
         if not self.is_agent_idle(agent_name):
             log.warning(f"Agent '{agent_name}' is not idle, cannot dispatch")
             return False
@@ -247,6 +413,52 @@ class HeadlessCommander:
             log.warning(f"Agent '{agent_name}' already tracked as active")
             return False
 
+        # --- Pane identity validation ---
+        if not self._validate_pane_identity(agent_name, agent):
+            log.error(
+                f"[{agent_name}] Dispatch ABORTED: pane identity check failed."
+            )
+            self._record_dispatch_failure(agent_name)
+            return False
+
+        # --- Headless dispatch (only mode) ---
+        success = self._dispatch_headless(agent_name, agent, handoff, handoff_path)
+
+        if success:
+            self._dispatch_fail_count.pop(agent_name, None)
+            self._dispatch_fail_time.pop(agent_name, None)
+        else:
+            self._record_dispatch_failure(agent_name)
+
+        return success
+
+    def _record_dispatch_failure(self, agent_name: str):
+        """Record a dispatch failure for exponential backoff tracking."""
+        count = self._dispatch_fail_count.get(agent_name, 0) + 1
+        self._dispatch_fail_count[agent_name] = count
+        self._dispatch_fail_time[agent_name] = time.time()
+        cooldown = min(
+            self._DISPATCH_FAIL_BASE_COOLDOWN * (2 ** (count - 1)),
+            self._DISPATCH_FAIL_MAX_COOLDOWN,
+        )
+        log.warning(
+            f"[{agent_name}] Dispatch failure #{count} — "
+            f"next attempt in {cooldown:.0f}s"
+        )
+
+    def _dispatch_headless(
+        self,
+        agent_name: str,
+        agent: AgentPane,
+        handoff: "Handoff",
+        handoff_path: Path,
+    ) -> bool:
+        """Dispatch work via headless `claude -p` (original mode).
+
+        1. Build prompt file with handoff context
+        2. Launch: cat prompt.md | claude -p ... 2>&1 | tee log
+        3. Track as active
+        """
         # Build prompt file
         prompt_path = self._build_prompt_file(agent_name, handoff, handoff_path)
         if not prompt_path:
@@ -266,10 +478,12 @@ class HeadlessCommander:
 
         # Build the full command
         project_root = self.config.project_root
+        model = AGENT_MODEL_MAP.get(agent_name, "sonnet")
         cmd = (
             f"{CLEAN_ENV_PREFIX} "
             f"cd {project_root} && "
             f"cat {prompt_path} | claude -p "
+            f"--model {model} "
             f"--output-format stream-json "
             f"--permission-mode bypassPermissions "
             f"{skill_flag} "
@@ -280,9 +494,10 @@ class HeadlessCommander:
         success = agent.send_command(cmd)
         if success:
             self._active_agents.add(agent_name)
+            self._last_dispatch_time[agent_name] = time.time()
             log.info(
                 f"[{agent_name}] Dispatched headless claude -p "
-                f"(spec={handoff.spec_id}, seq={seq})"
+                f"(spec={handoff.spec_id}, seq={seq}, model={model})"
             )
         else:
             log.error(f"[{agent_name}] Failed to send command to pane")
@@ -365,21 +580,25 @@ Action: {handoff.nextAgent.action}
     def check_completions(self) -> list[str]:
         """Poll all active agents for completion.
 
-        Returns list of agent names that have completed (pane returned
-        to idle shell).
+        An agent is complete when pane_current_command returns to a shell
+        (claude -p has exited). Returns list of agent names that completed.
         """
         completed = []
         for agent_name in list(self._active_agents):
-            if self.is_agent_idle(agent_name):
+            if self._is_agent_complete(agent_name):
                 completed.append(agent_name)
                 self._active_agents.discard(agent_name)
-
-                # Try to extract session ID from log
                 self._try_extract_session_id(agent_name)
-
-                log.info(f"[{agent_name}] Completed (pane idle)")
-
+                log.info(f"[{agent_name}] Completed (pane returned to shell)")
         return completed
+
+    def _is_agent_complete(self, agent_name: str) -> bool:
+        """Check if an active agent has finished (pane back at shell, no children).
+
+        Uses is_agent_idle() which checks both pane_current_command AND
+        child processes to avoid false completion detection.
+        """
+        return self.is_agent_idle(agent_name)
 
     def _try_extract_session_id(self, agent_name: str):
         """Parse the most recent log file for session_id."""
@@ -416,16 +635,35 @@ Action: {handoff.nextAgent.action}
     # Agent 007 (headless, same pattern)
     # ------------------------------------------------------------------
 
-    def launch_agent_007(self, prompt_file: Path) -> bool:
+    def launch_agent_007(self, prompt_file: Path, skill_override: Path | None = None) -> bool:
         """Launch Agent 007 in its pane via headless claude -p.
 
         Agent 007 is a supervisory agent that already uses headless dispatch.
         This method aligns it with the same pattern as regular agents.
+
+        Args:
+            prompt_file: Path to the prompt markdown file.
+            skill_override: Optional path to a skill file to use instead of
+                the default agent-007-supervisor skill. Used by ops resolution
+                to avoid the supervisor's FORBIDDEN rules conflicting with
+                ops operations (wrangler, credential-manager, etc.).
+
+        If agent-007 was not discovered during initial connect(), retries
+        discovery once before giving up (lazy re-discovery).
         """
         agent = self._agents.get("agent-007")
         if not agent:
-            log.error("Agent 007 pane not found")
-            return False
+            # Lazy re-discovery: tmux window may not have existed at startup
+            log.info("[agent-007] Not in _agents, attempting re-discovery...")
+            self._discover_agent_007()
+            agent = self._agents.get("agent-007")
+            if not agent:
+                log.error(
+                    "[agent-007] Pane not found even after re-discovery. "
+                    f"Expected window index {self.config.agent_007_window} "
+                    f"in session '{self.config.tmux_session_name}'"
+                )
+                return False
 
         if not self.is_agent_idle("agent-007"):
             log.warning("Agent 007 is not idle")
@@ -433,10 +671,13 @@ Action: {handoff.nextAgent.action}
 
         project_root = self.config.agent_007_project_root
         budget = self.config.agent_007_budget_usd
-        skill_path = (
-            project_root / ".claude" / "skills"
-            / "agent-007-supervisor" / "SKILL.md"
-        )
+        if skill_override and skill_override.exists():
+            skill_path = skill_override
+        else:
+            skill_path = (
+                project_root / ".claude" / "skills"
+                / "agent-007-supervisor" / "SKILL.md"
+            )
         skill_flag = (
             f"--append-system-prompt-file {skill_path}"
             if skill_path.exists()
