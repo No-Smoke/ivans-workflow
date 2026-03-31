@@ -193,6 +193,22 @@ class IWOConfig:
     ops_max_minutes_per_run: int = 10
     ops_proactive_threshold_minutes: int = 30
 
+    # ─── Bug Fix Pipeline ─────────────────────────────────────
+    bugs_enabled: bool = True
+    bugs_github_repo: str = field(default_factory=lambda: _env(
+        "IWO_BUGS_GITHUB_REPO", "ebatt-ai/ebatt"
+    ))
+    bugs_auto_approve_priorities: set[str] = field(
+        default_factory=lambda: {"medium", "low"}
+    )
+    bugs_human_gate_priorities: set[str] = field(
+        default_factory=lambda: {"critical", "high"}
+    )
+    bugs_max_per_run: int = 10
+    bugs_label_approved: str = "status:approved"
+    bugs_label_in_progress: str = "status:in-progress"
+    bugs_label_verify: str = "status:verify"
+
     # ─── Pipeline Staleness ───────────────────────────────────
     stale_pipeline_hours: float = 4.0
 

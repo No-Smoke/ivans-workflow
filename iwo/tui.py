@@ -183,6 +183,7 @@ class SafetyPanel(Container):
         yield Static("", id="safety-deploy", classes="safety-row")
         yield Static("", id="safety-pending", classes="safety-row")
         yield Static("", id="safety-ops-gate", classes="safety-row")
+        yield Static("", id="safety-bug-gate", classes="safety-row")
 
 
 class HandoffPanel(Container):
@@ -270,6 +271,8 @@ class IWOApp(App):
         Binding("p", "pause_toggle", "Pause/Resume", priority=True),
         Binding("a", "auto_continue_toggle", "Auto-Continue", priority=True),
         Binding("o", "ops_approve", "Ops Approve", priority=True),
+        Binding("B", "bug_approve", "Bug Approve", priority=True),
+        Binding("b", "resolve_bugs", "Resolve Bugs", priority=True),
     ]
 
     CSS = """
@@ -669,6 +672,28 @@ class IWOApp(App):
         except Exception:
             pass
 
+        # Bug gate status
+        try:
+            bug_gate = self.daemon.directive_processor._bug_gate_pending
+            if bug_gate:
+                bug, _ = bug_gate
+                self.query_one("#safety-bug-gate", Static).update(
+                    f" Bug gate: [bold magenta]PENDING (#{bug['number']})[/] — press 'B'"
+                )
+            else:
+                queue_len = len(self.daemon.directive_processor._bug_queue)
+                if queue_len:
+                    processed = self.daemon.directive_processor._bugs_processed_count
+                    self.query_one("#safety-bug-gate", Static).update(
+                        f" Bugs: [yellow]{queue_len} queued[/] | {processed} done"
+                    )
+                else:
+                    self.query_one("#safety-bug-gate", Static).update(
+                        " Bug gate: [dim]—[/]"
+                    )
+        except Exception:
+            pass
+
     def _update_handoffs(self) -> None:
         history = self.daemon.handoff_history
         for i in range(12):
@@ -750,6 +775,42 @@ class IWOApp(App):
             else:
                 rich_log = self.query_one("#log-output", RichLog)
                 rich_log.write("[dim]No ops gate pending[/]")
+
+    def action_bug_approve(self) -> None:
+        """Approve pending bug-fix dispatch (human gate for critical/high bugs)."""
+        rich_log = self.query_one("#log-output", RichLog)
+        if self.daemon and self.daemon.directive_processor:
+            if self.daemon.directive_processor._bug_gate_pending:
+                bug, _ = self.daemon.directive_processor._bug_gate_pending
+                self.daemon.directive_processor.approve_bug_gate()
+                rich_log.write(
+                    f"[bold green]✅ Bug gate approved — "
+                    f"Planner dispatching for #{bug['number']}[/]"
+                )
+            else:
+                rich_log.write("[dim]No bug gate pending[/]")
+
+    def action_resolve_bugs(self) -> None:
+        """Drop a resolve-bugs directive (convenience binding)."""
+        rich_log = self.query_one("#log-output", RichLog)
+        try:
+            directives_dir = self.daemon.config.handoffs_dir / ".directives"
+            directives_dir.mkdir(parents=True, exist_ok=True)
+            import time as _time
+            ts = int(_time.time())
+            directive_path = directives_dir / f"resolve-bugs-{ts}.json"
+            import json as _json
+            directive_path.write_text(_json.dumps({
+                "directive": "resolve-bugs",
+                "filter": "all",
+                "context": "TUI 'b' key trigger",
+            }))
+            rich_log.write(
+                f"[bold green]🐛 resolve-bugs directive queued — "
+                f"will process on next poll[/]"
+            )
+        except Exception as e:
+            rich_log.write(f"[bold red]Failed to write resolve-bugs directive: {e}[/]")
 
     def action_auto_deploy_toggle(self) -> None:
         """Toggle auto-deploy (bypass human gate for ALL deploys)."""

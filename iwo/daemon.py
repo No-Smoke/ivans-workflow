@@ -924,6 +924,90 @@ class IWODaemon:
         log.info(msg)
         self._notify(f"🔧 {msg}")
 
+    def _handle_bug_completion(self, handoff: Handoff):
+        """Handle completion of a bug-fix pipeline (BUG-FIX-* spec).
+
+        Called in process_handoff step 15 when a BUG-FIX-* spec reaches
+        a terminal target (human/none). Updates GitHub labels, posts a
+        summary comment, sends notification, and advances the bug queue.
+        """
+        import urllib.request
+        import urllib.error
+
+        spec_id = handoff.spec_id
+        try:
+            issue_num = int(spec_id.replace("BUG-FIX-", ""))
+        except ValueError:
+            log.warning(f"Could not parse issue number from {spec_id}")
+            return
+
+        outcome = handoff.status.outcome if handoff.status else "unknown"
+        source = handoff.source_agent
+
+        # Retrieve GitHub token from directive processor (set during resolve-bugs)
+        token = self.directive_processor._bugs_github_token
+        if not token:
+            # Try to fetch fresh token
+            try:
+                result = subprocess.run(
+                    [
+                        "python3",
+                        str(self.config.skills_dir / "credential-manager" / "get_credential.py"),
+                        "github", "--field", "secret", "--quiet",
+                    ],
+                    capture_output=True, text=True, timeout=30,
+                )
+                token = result.stdout.strip()
+            except Exception as e:
+                log.warning(f"Bug completion: could not retrieve GitHub PAT: {e}")
+
+        repo = self.config.bugs_github_repo
+
+        if token:
+            # Update GitHub label: in-progress → verify
+            self.directive_processor._bugs_github_token = token
+            bug_stub = {"number": issue_num}
+            self.directive_processor._update_github_label(
+                bug_stub,
+                remove_label=self.config.bugs_label_in_progress,
+                add_label=self.config.bugs_label_verify,
+            )
+
+            # Post summary comment on the issue
+            try:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                comment_body = (
+                    f"Fix deployed to production via IWO pipeline.\n"
+                    f"Spec: {spec_id} | Agents: Planner → Builder → Reviewer → "
+                    f"Tester → Deployer → Docs\n"
+                    f"Final agent: {source} | Outcome: {outcome}\n"
+                    f"Awaiting human verification. — IWO [{ts}]"
+                )
+                url = f"https://api.github.com/repos/{repo}/issues/{issue_num}/comments"
+                body = json.dumps({"body": comment_body}).encode()
+                req = urllib.request.Request(url, data=body, method="POST", headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "IWO-resolve-bugs/1.0",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                })
+                urllib.request.urlopen(req, timeout=15)
+                log.info(f"Bug completion: posted comment on #{issue_num}")
+            except Exception as e:
+                log.warning(f"Bug completion: failed to post comment on #{issue_num}: {e}")
+
+        # Send ntfy notification
+        self._notify(
+            f"🐛 {spec_id} deployed — verify on production (#{issue_num})",
+            critical=True,
+        )
+
+        log.info(f"Bug completion: {spec_id} ({outcome}) — advancing queue")
+
+        # Advance to next bug in queue
+        self.directive_processor._advance_bug_queue()
+
     def process_handoff(self, path: Path):
         """Parse, validate, and route a handoff file.
 
@@ -1074,6 +1158,14 @@ class IWODaemon:
                 f"Pipeline complete: {handoff.spec_id} → {target} "
                 f"(terminal target, no activation)"
             )
+
+            # 8.6 Bug-fix pipeline completion (before return)
+            if handoff.spec_id.startswith("BUG-FIX-"):
+                try:
+                    self._handle_bug_completion(handoff)
+                except Exception as e:
+                    log.warning(f"Bug completion handler failed (non-fatal): {e}")
+
             # Auto-continue: queue next-spec directive if enabled
             if (
                 self.config.auto_continue_on_completion
@@ -1152,6 +1244,8 @@ class IWODaemon:
                     )
                 except Exception as e:
                     log.warning(f"Reactive ops schedule failed (non-fatal): {e}")
+
+        # (Step 15 removed — bug completion handled in step 8.6 before terminal return)
 
     def _reconcile_filesystem(self):
         """Periodic scan to catch missed inotify events. Called every 30s.
