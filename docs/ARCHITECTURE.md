@@ -466,6 +466,50 @@ Currently, IWO daemon logs go only to the TUI log panel (Textual RichLog widget)
 - File modification times: `stat` on handoff files
 - **TODO:** Add file handler to IWO logging for persistent post-mortem access.
 
+## resolve-bugs Directive (IWO-001)
+
+The `resolve-bugs` directive automates bug-fix workflows by fetching `status:approved` GitHub Issues and routing them through the 6-agent pipeline as `BUG-FIX-{N}` mini-specs.
+
+### Data Flow
+
+```
+GitHub Issues (status:approved)
+    → IWO: _handle_resolve_bugs()
+    → Priority sort (critical > high > medium > low)
+    → Human gate (critical/high) or auto-dispatch (medium/low)
+    → Planner (untrusted-input framing)
+    → Builder → Reviewer → Tester → Deployer → Docs
+    → Completion: label → status:verify, comment posted
+    → Auto-advance to next bug in queue
+```
+
+### Security Model
+
+Bug descriptions are user-submitted and potentially adversarial. Five-layer defense:
+
+1. **Auth + rate limit** on the feedback widget
+2. **Triage gate** — only `status:approved` issues are fetched
+3. **Untrusted-input framing** — Planner prompt wraps descriptions in `--- BEGIN/END USER-SUBMITTED BUG DESCRIPTION (UNTRUSTED) ---` markers
+4. **Pipeline quality gates** — Reviewer, Tester, Deployer each validate
+5. **Production verification** — human verifies fix before issue is closed
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `iwo/directives.py` | `_handle_resolve_bugs()`, gate logic, GitHub API, Planner prompt |
+| `iwo/daemon.py` | `_handle_bug_completion()` — label updates, comment posting, queue advancement |
+| `iwo/config.py` | `bugs_*` configuration fields |
+| `iwo/tui.py` | `B` (approve gate) and `b` (trigger directive) key bindings |
+| `scripts/directive-resolve-bugs.sh` | Desktop launcher script |
+
+### TUI Key Bindings
+
+| Key | Action |
+|-----|--------|
+| `B` | Approve gated bug (critical/high) — dispatches Planner |
+| `b` | Drop a `resolve-bugs` directive (convenience trigger) |
+
 ## Version History
 
 | Version | Date | Changes |
@@ -481,3 +525,4 @@ Currently, IWO daemon logs go only to the TUI log panel (Textual RichLog widget)
 | 2.5.2+ | 2026-02-19 | Self-healing Ollama (auto-restart on embed failure, Phase 3.0.4) |
 | 2.8.0 | 2026-02-21 | Agent 007 auditor module (Phase 3.0 — constitution, schemas, trigger mechanism) |
 | 2.8.5 | 2026-02-21 | **Dispatch architecture overhaul:** Option A (canary-based dispatch, state machine removed from critical path), Option B (session-timestamp staleness), rich activation prompt (replaces bare /workflow-next), queue retry with 30s override, 8 bugs fixed |
+| 3.1.0 | 2026-03-31 | **IWO-001: resolve-bugs directive** — automated bug-fix pipeline. GitHub Issues → 6-agent pipeline with priority gates, untrusted-input framing, completion loop with label updates and comment posting. TUI `B`/`b` key bindings. |

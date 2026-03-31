@@ -2,6 +2,25 @@
 
 All notable changes to Ivan's Workflow are documented in this file.
 
+## [3.1.0] — 2026-03-31
+
+### Added
+
+- **resolve-bugs directive** (IWO-001): Automated bug-fix pipeline that fetches `status:approved` GitHub Issues from `ebatt-ai/ebatt`, wraps each as a `BUG-FIX-{N}` mini-spec, and routes through the 6-agent pipeline.
+- **Priority gates**: Critical/high bugs require human approval (`B` key), medium/low auto-dispatch.
+- **Untrusted-input framing**: Planner prompts wrap user-submitted bug descriptions in security markers to prevent prompt injection.
+- **Bug completion handler**: On pipeline completion, automatically updates GitHub labels (`status:in-progress` → `status:verify`), posts a summary comment on the issue, sends ntfy notification, and advances to the next bug in queue.
+- **TUI key bindings**: `B` (approve gated bug), `b` (trigger resolve-bugs directive). SafetyPanel shows bug gate status and queue depth.
+- **Config fields**: `bugs_enabled`, `bugs_github_repo`, `bugs_auto_approve_priorities`, `bugs_human_gate_priorities`, `bugs_max_per_run`, `bugs_label_approved`, `bugs_label_in_progress`, `bugs_label_verify`.
+- `scripts/directive-resolve-bugs.sh` — desktop launcher script with optional zenity filter selection.
+- `tests/test_resolve_bugs.py` — 24 unit tests covering fetch, gate logic, prompt security, completion, queue advancement, and edge cases.
+- `docs/specs/IWO-001.md` — full specification for the resolve-bugs directive.
+
+### Fixed
+
+- **Unreachable step 15 in process_handoff**: Bug completion detection was placed after the terminal-target early return (step 8.5). Moved to step 8.6, inside the terminal target block.
+- **URL-encoding for GitHub label DELETE requests**: Labels containing colons (e.g., `status:approved`) are now properly URL-encoded.
+
 ## [3.0.0] — 2026-03-17
 
 ### Changed

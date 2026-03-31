@@ -61,9 +61,14 @@ The IWO TUI Dashboard is a live terminal interface that monitors and controls yo
 | Key | Action | When to Use |
 |-----|--------|-------------|
 | `q` | Quit | Clean shutdown — stops observer, exits |
-| `d` | Deploy Approve | When deployer is gated — sends `/workflow-next` to deployer |
+| `d` | Deploy Approve | When deployer is gated — approves oldest pending deploy (FIFO) |
+| `D` | Auto-Deploy Toggle | Bypasses deploy gate for ALL specs (use with caution) |
 | `r` | Force Reconcile | Immediate filesystem scan for missed handoffs |
 | `p` | Pause / Resume | Toggles state polling and reconciliation on/off |
+| `a` | Auto-Continue Toggle | Auto-queues next-spec when a pipeline completes |
+| `o` | Ops Approve | Approves gated ops actions for Agent 007 dispatch |
+| `B` | Bug Approve | Approves a gated bug (critical/high priority) — dispatches Planner |
+| `b` | Resolve Bugs | Drops a `resolve-bugs` directive to start the bug-fix pipeline |
 
 ## Agent States
 
