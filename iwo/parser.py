@@ -1,7 +1,7 @@
 """Handoff JSON parser with Pydantic validation."""
 
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
 
@@ -47,6 +47,31 @@ class Deliverables(BaseModel):
     filesReviewed: list[str] = []
     testsStatus: Optional[TestsStatus] = None
     typecheckPassed: Optional[bool] = None
+    lintPassed: Optional[bool] = None
+    buildPassed: Optional[bool] = None
+
+    @field_validator('typecheckPassed', 'lintPassed', 'buildPassed', mode='before')
+    @classmethod
+    def coerce_check_status(cls, v):
+        """Coerce string status values to booleans.
+
+        Tester agents sometimes write strings like 'not run' instead of
+        null/boolean. This validator normalises them so the pipeline
+        doesn't stall on a Pydantic validation error.
+        """
+        if v is None or isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            lowered = v.strip().lower()
+            if lowered in ('not run', 'not executed', 'skipped', 'n/a', ''):
+                return None
+            if lowered in ('true', 'passed', 'pass', 'yes', 'ok'):
+                return True
+            if lowered in ('false', 'failed', 'fail', 'no', 'error'):
+                return False
+            # Unknown string — treat as None rather than crashing
+            return None
+        return v
 
 
 class Evidence(BaseModel):
