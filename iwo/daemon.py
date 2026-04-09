@@ -218,6 +218,13 @@ class IWODaemon:
         # Phase 3: Deploy gate — FIFO queue of gated handoffs for TUI approval
         self._deploy_gate_pending: list[tuple[Handoff, Path]] = []
 
+        # Phase 2.9.1: Stall detection — alert when agent completes without handoff
+        # Maps agent_name → (idle_timestamp, spec_id) — set on PROCESSING→IDLE,
+        # cleared when handoff is processed for that spec. If entry survives 60s,
+        # fire ntfy alert.
+        self._stall_watchdog: dict[str, tuple[float, str]] = {}
+        self._stall_alert_sent: set[str] = set()  # avoid duplicate alerts
+
         # Phase 2.5.1: Metrics collector (initialized after memory)
         self.metrics: Optional[MetricsCollector] = None
 
@@ -280,6 +287,10 @@ class IWODaemon:
                 log.info(f"[{name}] {prev.value} → idle (completed)")
                 if prev == AgentState.PROCESSING:
                     self._notify_state_change(name, prev, AgentState.IDLE, now)
+                    # Stall watchdog: record that this agent finished work
+                    spec_id = self.pipeline.agent_current_spec(name) or "unknown"
+                    self._stall_watchdog[name] = (now, spec_id)
+                    self._stall_alert_sent.discard(name)
 
         # Update all agent states
         for name in self.agent_states:
@@ -302,6 +313,27 @@ class IWODaemon:
 
         # Check if any pending activations can proceed
         self._process_pending_activations()
+
+        # Phase 2.9.1: Stall detection — alert if agent went idle 60s ago with no handoff
+        stall_timeout = 60.0
+        stale_watchdogs = []
+        for agent_name, (idle_at, spec_id) in self._stall_watchdog.items():
+            elapsed = now - idle_at
+            if elapsed >= stall_timeout and agent_name not in self._stall_alert_sent:
+                log.warning(f"STALL DETECTED: {agent_name} completed {spec_id} "
+                            f"{int(elapsed)}s ago but no handoff written")
+                self._notify(
+                    f"⚠️ STALL: {agent_name} finished {spec_id} but wrote no handoff "
+                    f"({int(elapsed)}s elapsed). Manual handoff or resume directive needed.",
+                    critical=True,
+                )
+                self._stall_alert_sent.add(agent_name)
+            # Clean up watchdogs older than 5 minutes (already alerted or false positive)
+            if elapsed > 300:
+                stale_watchdogs.append(agent_name)
+        for agent_name in stale_watchdogs:
+            self._stall_watchdog.pop(agent_name, None)
+            self._stall_alert_sent.discard(agent_name)
 
         # Periodic staleness cleanup (Bug 3 fix) — release agents from idle pipelines
         stale_threshold = self.config.stale_pipeline_hours * 3600
@@ -1033,6 +1065,10 @@ class IWODaemon:
             f"{handoff.source_agent} → {handoff.target_agent} "
             f"[{handoff.status.outcome}] ({handoff.spec_id})"
         )
+
+        # Clear stall watchdog — this agent successfully wrote its handoff
+        self._stall_watchdog.pop(handoff.source_agent, None)
+        self._stall_alert_sent.discard(handoff.source_agent)
 
         # 2. Idempotency check (with supersede support for same-sequence redos)
         if self.tracker.already_processed(handoff, path):
