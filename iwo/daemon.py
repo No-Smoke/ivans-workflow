@@ -314,21 +314,78 @@ class IWODaemon:
         # Check if any pending activations can proceed
         self._process_pending_activations()
 
-        # Phase 2.9.1: Stall detection — alert if agent went idle 60s ago with no handoff
-        stall_timeout = 60.0
+        # Phase 2.9.2: Stall detection + auto-handoff recovery
+        from iwo.auto_handoff import generate_auto_handoff
+
+        stall_timeout = self.config.stall_alert_timeout
+        auto_handoff_timeout = self.config.stall_auto_handoff_timeout
         stale_watchdogs = []
-        for agent_name, (idle_at, spec_id) in self._stall_watchdog.items():
+        for agent_name, (idle_at, spec_id) in list(self._stall_watchdog.items()):
             elapsed = now - idle_at
-            if elapsed >= stall_timeout and agent_name not in self._stall_alert_sent:
-                log.warning(f"STALL DETECTED: {agent_name} completed {spec_id} "
-                            f"{int(elapsed)}s ago but no handoff written")
-                self._notify(
-                    f"⚠️ STALL: {agent_name} finished {spec_id} but wrote no handoff "
-                    f"({int(elapsed)}s elapsed). Manual handoff or resume directive needed.",
-                    critical=True,
-                )
+
+            if (
+                elapsed >= auto_handoff_timeout
+                and agent_name not in self._stall_alert_sent
+            ):
+                if self.config.stall_auto_handoff_enabled:
+                    log.warning(
+                        f"STALL AUTO-RECOVERY: generating handoff for "
+                        f"{agent_name}/{spec_id} (idle {int(elapsed)}s)"
+                    )
+                    spec_dir = self.config.handoffs_dir / spec_id
+                    existing = (
+                        sorted(spec_dir.glob("*.json"))
+                        if spec_dir.exists()
+                        else []
+                    )
+                    last_seq = len(existing)
+
+                    result = generate_auto_handoff(
+                        agent_name=agent_name,
+                        spec_id=spec_id,
+                        last_sequence=last_seq,
+                        project_dir=self.config.project_root,
+                        handoffs_dir=self.config.handoffs_dir,
+                    )
+
+                    if result:
+                        log.info(f"STALL AUTO-RECOVERY: wrote {result.name}")
+                        self._notify(
+                            f"🔧 Auto-recovered stall: {agent_name}/{spec_id} "
+                            f"— generated {result.name}",
+                            critical=True,
+                        )
+                    else:
+                        log.error(
+                            f"STALL AUTO-RECOVERY: failed for {agent_name}/{spec_id}"
+                        )
+                        self._notify(
+                            f"⚠️ STALL: {agent_name}/{spec_id} — auto-recovery "
+                            f"FAILED, manual intervention needed",
+                            critical=True,
+                        )
+                else:
+                    log.warning(
+                        f"STALL DETECTED: {agent_name}/{spec_id} idle "
+                        f"{int(elapsed)}s (auto-recovery disabled)"
+                    )
+                    self._notify(
+                        f"⚠️ STALL: {agent_name} finished {spec_id} but wrote no "
+                        f"handoff ({int(elapsed)}s elapsed). Auto-recovery disabled.",
+                        critical=True,
+                    )
                 self._stall_alert_sent.add(agent_name)
-            # Clean up watchdogs older than 5 minutes (already alerted or false positive)
+
+            elif (
+                elapsed >= stall_timeout
+                and agent_name not in self._stall_alert_sent
+            ):
+                log.warning(
+                    f"STALL WARNING: {agent_name} completed {spec_id} "
+                    f"{int(elapsed)}s ago, no handoff. Auto-recovery in "
+                    f"{int(auto_handoff_timeout - elapsed)}s"
+                )
+
             if elapsed > 300:
                 stale_watchdogs.append(agent_name)
         for agent_name in stale_watchdogs:

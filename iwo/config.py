@@ -199,10 +199,10 @@ class IWOConfig:
         "IWO_BUGS_GITHUB_REPO", "ebatt-ai/ebatt"
     ))
     bugs_auto_approve_priorities: set[str] = field(
-        default_factory=lambda: {"medium", "low"}
+        default_factory=lambda: {"high", "medium", "low"}
     )
     bugs_human_gate_priorities: set[str] = field(
-        default_factory=lambda: {"critical", "high"}
+        default_factory=lambda: {"critical"}
     )
     bugs_max_per_run: int = 10
     bugs_label_approved: str = "status:approved"
@@ -212,21 +212,28 @@ class IWOConfig:
     # ─── Pipeline Staleness ───────────────────────────────────
     stale_pipeline_hours: float = 4.0
 
+    # ─── Stall Recovery (Phase 2.9.2) ─────────────────────────
+    stall_alert_timeout: float = 60.0         # seconds before warning log
+    stall_auto_handoff_timeout: float = 90.0  # seconds before auto-generating handoff
+    stall_auto_handoff_enabled: bool = field(default_factory=lambda: _env_bool(
+        "IWO_STALL_AUTO_HANDOFF", True
+    ))
+
     # Agent 007 project root — defaults to same as project_root
     agent_007_project_root: Path = field(default=None)
 
     # ─── Deploy Gates ───────────────────────────────────────────
     human_gate_agents: set[str] = field(
-        default_factory=lambda: {"deployer"}
+        default_factory=lambda: set()
     )
     auto_approve_safe_deploys: bool = field(default_factory=lambda: _env_bool(
         "IWO_AUTO_APPROVE_SAFE_DEPLOYS", True
     ))
     auto_deploy_all: bool = field(default_factory=lambda: _env_bool(
-        "IWO_AUTO_DEPLOY_ALL", False
+        "IWO_AUTO_DEPLOY_ALL", True
     ))
     auto_continue_on_completion: bool = field(default_factory=lambda: _env_bool(
-        "IWO_AUTO_CONTINUE", False
+        "IWO_AUTO_CONTINUE", True
     ))
     auto_continue_delay_seconds: float = 10.0
 
