@@ -2,6 +2,19 @@
 
 All notable changes to Ivan's Workflow are documented in this file.
 
+## [3.1.1] — 2026-04-10
+
+### Added
+
+- **Phase 2.9.2 stall auto-recovery**: When an agent exits headless mode without writing its handoff JSON, IWO now auto-generates the missing handoff after 90 seconds. Inspects `git diff HEAD~1..HEAD`, runs `npx vitest` and `npx tsc --noEmit`, and writes a handoff with `auto_generated: true` metadata. Partial outcomes for test/typecheck failures.
+- `iwo/auto_handoff.py` — new module with `generate_auto_handoff()` function.
+- Config fields: `stall_alert_timeout` (60s), `stall_auto_handoff_timeout` (90s), `stall_auto_handoff_enabled` (`IWO_STALL_AUTO_HANDOFF` env kill switch).
+- `tests/test_auto_handoff.py` — 7 unit tests covering success, test failures, typecheck failures, nested directory creation, and subprocess timeout.
+
+### Changed
+
+- **Stall watchdog upgraded**: Phase 2.9.1 alert-only block in `daemon.py` `_poll_agent_states` replaced with two-tier system: warning at 60s, auto-recovery at 90s. Timeouts now use config fields instead of hardcoded values.
+
 ## [3.1.0] — 2026-03-31
 
 ### Added

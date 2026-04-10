@@ -526,3 +526,4 @@ Bug descriptions are user-submitted and potentially adversarial. Five-layer defe
 | 2.8.0 | 2026-02-21 | Agent 007 auditor module (Phase 3.0 — constitution, schemas, trigger mechanism) |
 | 2.8.5 | 2026-02-21 | **Dispatch architecture overhaul:** Option A (canary-based dispatch, state machine removed from critical path), Option B (session-timestamp staleness), rich activation prompt (replaces bare /workflow-next), queue retry with 30s override, 8 bugs fixed |
 | 3.1.0 | 2026-03-31 | **IWO-001: resolve-bugs directive** — automated bug-fix pipeline. GitHub Issues → 6-agent pipeline with priority gates, untrusted-input framing, completion loop with label updates and comment posting. TUI `B`/`b` key bindings. |
+| 3.1.1 | 2026-04-10 | **Phase 2.9.2: Stall auto-recovery** — `iwo/auto_handoff.py` generates missing handoff JSON when agents exit without writing one. Two-tier watchdog: warning at 60s, auto-handoff at 90s. Config kill switch `IWO_STALL_AUTO_HANDOFF`. |

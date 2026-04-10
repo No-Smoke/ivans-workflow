@@ -22,6 +22,7 @@ iwo/                    # Core Python package
 ├── parser.py           # Handoff JSON parser with Pydantic models
 ├── ops_actions.py      # OpsActionsRegister: ops action data model, persistence, deduplication
 ├── tui.py              # Textual TUI dashboard (~790 lines)
+├── auto_handoff.py     # Phase 2.9.2: auto-generate missing handoff on stall
 ├── auditor.py          # Agent 007 auditor module
 ├── memory.py           # Qdrant + Neo4j memory integration
 ├── metrics.py          # Pipeline metrics collection
