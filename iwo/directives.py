@@ -172,6 +172,12 @@ class DirectiveProcessor:
             self.daemon._notify("❌ start-spec failed: missing specId")
             return
 
+        # Check for sprint continuation context
+        sprint_ctx = data.get("sprintContext")
+        if sprint_ctx:
+            self._handle_sprint_continuation(spec_id, sprint_ctx, data)
+            return
+
         # Find the spec file
         spec_content = self._find_spec_content(spec_id, data.get("specFile"))
         context = data.get("context", "")
@@ -239,6 +245,192 @@ Follow the handoff schema at .claude/skills/workflow-handoff/HANDOFF-SCHEMA.md
         else:
             self.daemon._notify(f"start-spec failed: Planner not idle or dispatch error")
             log.error(f"start-spec: failed to dispatch Planner for {spec_id}")
+
+    def _handle_sprint_continuation(self, spec_id: str, sprint_ctx: dict, data: dict):
+        """Handle multi-sprint continuation by dispatching Planner with sprint-specific prompt.
+
+        Unlike generic start-spec, this tells the Planner exactly which sprint to plan
+        and provides context from the previous sprint's completion.
+        """
+        sprint_num = sprint_ctx.get("next_sprint", 2)
+        total = sprint_ctx.get("total_sprints", "unknown")
+        plan_path = sprint_ctx.get("plan_path", "")
+
+        # Read spec content
+        spec_content = self._find_spec_content(spec_id)
+        spec_block = ""
+        if spec_content:
+            spec_block = f"\n\n## Spec Content (truncated)\n\n{spec_content[:3000]}\n"
+
+        # Read previous sprint's LATEST.json for context
+        latest_path = self.config.handoffs_dir / spec_id / "LATEST.json"
+        prev_sprint_context = ""
+        if latest_path.exists():
+            try:
+                latest_data = json.loads(latest_path.read_text())
+                ctx = latest_data.get("nextAgent", {}).get("context", "")
+                open_items = latest_data.get("nextAgent", {}).get("openItems", [])
+                unresolved = latest_data.get("status", {}).get("unresolvedIssues", [])
+                prev_sprint_context = f"""
+## Previous Sprint Completion Context
+
+**Sprint {sprint_num - 1} outcome:** {latest_data.get('status', {}).get('outcome', 'unknown')}
+**Context from Docs agent:** {ctx}
+**Open items carried forward:**
+"""
+                for item in open_items:
+                    prev_sprint_context += f"- {item}\n"
+                if unresolved:
+                    prev_sprint_context += "\n**Unresolved issues:**\n"
+                    for issue in unresolved:
+                        prev_sprint_context += f"- {issue}\n"
+            except Exception as e:
+                log.warning(f"Failed to read LATEST.json for {spec_id}: {e}")
+
+        prompt = f"""## MANDATORY INSTRUCTIONS — READ YOUR SKILL FIRST
+
+You are the Planner agent. Before doing ANYTHING else, execute these two commands:
+
+```bash
+cat .claude/skills/boris-planner-agent/SKILL.md
+cat .claude/skills/workflow-handoff/HANDOFF-SCHEMA.md
+```
+
+You MUST read both files completely. This is non-negotiable.
+
+---
+
+## Task: Plan Sprint {sprint_num} of {spec_id}
+
+**THIS IS A MULTI-SPRINT CONTINUATION.** You are NOT selecting a new spec.
+You are planning Sprint {sprint_num} of {total} for {spec_id}.
+
+The previous sprint (Sprint {sprint_num - 1}) completed successfully and the
+pipeline is automatically continuing to the next sprint.
+
+### Step 1: Read the Implementation Plan
+
+```bash
+cat {plan_path}
+```
+
+Read the FULL plan. Find the section for Sprint {sprint_num} (look for
+"### Sprint {sprint_num}" or "### Phase {sprint_num}"). This defines your scope.
+
+### Step 2: Read the Previous Sprint's Handoff Chain
+
+```bash
+ls docs/agent-comms/{spec_id}/
+cat docs/agent-comms/{spec_id}/LATEST.json
+```
+
+Understand what was built in Sprint {sprint_num - 1} and what open items
+were carried forward.
+
+{prev_sprint_context}
+
+### Step 3: Read the Spec
+
+```bash
+cat <spec-file-path>
+```
+
+Read the original spec for full context.
+{spec_block}
+
+### Step 4: Create the Sprint {sprint_num} Plan
+
+Write the implementation plan for Sprint {sprint_num} ONLY to:
+`docs/plans/{spec_id}-implementation-plan.md`
+
+If the plan file already exists with Sprint {sprint_num} details, update it
+with any adjustments based on Sprint {sprint_num - 1}'s outcomes. If Sprint
+{sprint_num} scope needs changes based on what was learned, document the
+changes and rationale.
+
+### Step 5: Write the Handoff JSON
+
+Re-read the handoff schema:
+```bash
+cat .claude/skills/workflow-handoff/HANDOFF-SCHEMA.md
+```
+
+Write handoff to: `docs/agent-comms/{spec_id}/{{sequence}}-planner-{{timestamp}}.json`
+
+CRITICAL: The sequence number must continue from the existing handoff chain.
+Check `ls docs/agent-comms/{spec_id}/` and use the next number.
+
+### Step 6: Update .current-spec
+
+```bash
+echo "{spec_id}" > docs/agent-comms/.current-spec
+```
+
+### Step 7: Print Completion Signal
+
+```
+PLANNER STATUS: COMPLETE
+SPEC: {spec_id} — Sprint {sprint_num} of {total}
+PLAN: docs/plans/{spec_id}-implementation-plan.md
+```
+
+## CRITICAL REMINDERS
+
+- You are planning Sprint {sprint_num}, NOT Sprint 1. Do not re-plan work already done.
+- The implementation plan already exists with sprint decomposition — read it.
+- Open items from Sprint {sprint_num - 1} should be addressed in this sprint if applicable.
+- Handoff sequence must continue from existing chain (do not restart at 001).
+- Be honest about risks and effort — no optimistic estimates.
+"""
+
+        # Write prompt file
+        prompt_dir = self.config.log_dir / "prompts"
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time())
+        prompt_path = prompt_dir / f"planner-sprint-continue-{spec_id}-s{sprint_num}-{ts}.md"
+        prompt_path.write_text(prompt)
+
+        # Create synthetic handoff
+        from .parser import Handoff, HandoffMetadata, HandoffStatus, NextAgent
+
+        synthetic = Handoff(
+            metadata=HandoffMetadata(
+                specId=spec_id,
+                agent="operator",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                sequence=0,
+            ),
+            status=HandoffStatus(outcome="success"),
+            nextAgent=NextAgent(
+                target="planner",
+                action=f"Plan Sprint {sprint_num} of {total} for {spec_id}",
+                context=f"Multi-sprint continuation. Previous sprint completed successfully.",
+            ),
+        )
+
+        # Create the spec's agent-comms directory
+        spec_dir = self.config.handoffs_dir / spec_id
+        spec_dir.mkdir(parents=True, exist_ok=True)
+
+        # Update .current-spec
+        current_spec_file = self.config.handoffs_dir / ".current-spec"
+        current_spec_file.write_text(spec_id)
+
+        success = self.daemon.commander.activate_agent(
+            "planner", handoff=synthetic, handoff_path=prompt_path,
+        )
+
+        if success:
+            from .state import AgentState
+            self.daemon.agent_states["planner"] = AgentState.PROCESSING
+            self.daemon.pipeline.assign_agent("planner", spec_id)
+            self.daemon._notify(
+                f"Sprint continuation: {spec_id} Sprint {sprint_num}/{total} — Planner dispatched"
+            )
+            log.info(f"sprint-continue: dispatched Planner for {spec_id} Sprint {sprint_num}")
+        else:
+            self.daemon._notify(f"Sprint continuation failed: Planner not idle or dispatch error")
+            log.error(f"sprint-continue: failed to dispatch Planner for {spec_id}")
 
     def _find_spec_content(self, spec_id: str, spec_file: Optional[str] = None) -> Optional[str]:
         """Locate and read spec content. Returns None if not found."""

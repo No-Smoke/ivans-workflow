@@ -1450,27 +1450,135 @@ class IWODaemon:
                 directives_dir.mkdir(parents=True, exist_ok=True)
                 ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 ts_ns = time.time_ns()
-                filename = f"{ts_ns}-auto-next-spec.json"
-                directive = {
-                    "directive": "next-spec",
-                    "focus": f"Auto-continue after {completed_spec_id} completed successfully. Select the next logical spec.",
-                    "timestamp": ts_iso,
-                    "auto_generated": True,
-                }
+
+                # Check for remaining sprints before deciding directive type
+                sprint_info = self._detect_remaining_sprints(completed_spec_id)
+
+                if sprint_info:
+                    # Multi-sprint continuation: issue start-spec for same specId
+                    filename = f"{ts_ns}-auto-continue-sprint.json"
+                    directive = {
+                        "directive": "start-spec",
+                        "specId": completed_spec_id,
+                        "sprintContext": sprint_info,
+                        "timestamp": ts_iso,
+                        "auto_generated": True,
+                    }
+                    log.info(
+                        f"Auto-continue: sprint continuation for {completed_spec_id} "
+                        f"Sprint {sprint_info['next_sprint']}/{sprint_info['total_sprints']}"
+                    )
+                else:
+                    # Single-sprint or final sprint: existing behaviour
+                    filename = f"{ts_ns}-auto-next-spec.json"
+                    directive = {
+                        "directive": "next-spec",
+                        "focus": (
+                            f"Auto-continue after {completed_spec_id} completed "
+                            f"successfully. Select the next logical spec."
+                        ),
+                        "timestamp": ts_iso,
+                        "auto_generated": True,
+                    }
+
                 directive_path = directives_dir / filename
                 directive_path.write_text(json.dumps(directive))
                 log.info(
-                    f"Auto-continue: queued next-spec directive after "
-                    f"{completed_spec_id} → {directive_path.name}"
+                    f"Auto-continue: queued {directive['directive']} directive "
+                    f"→ {directive_path.name}"
                 )
                 self._notify(
-                    f"🔄 Auto-continue: next-spec queued after {completed_spec_id}"
+                    f"🔄 Auto-continue: {directive['directive']} queued "
+                    f"after {completed_spec_id}"
                 )
             except Exception as e:
                 log.error(f"Auto-continue failed to write directive: {e}")
 
         thread = threading.Thread(target=_write_directive, daemon=True)
         thread.start()
+
+    def _detect_remaining_sprints(self, spec_id: str) -> Optional[dict]:
+        """Detect if a spec has remaining sprints by parsing its implementation plan.
+
+        Returns dict with sprint info if more sprints remain, None otherwise.
+        Format: {"next_sprint": int, "total_sprints": int, "plan_path": str}
+        """
+        # Locate implementation plan
+        plan_patterns = [
+            self.config.project_root / "docs" / "plans" / f"{spec_id}-implementation-plan.md",
+            self.config.project_root / "docs" / "plans" / f"{spec_id.lower()}-implementation-plan.md",
+        ]
+
+        plan_path = None
+        for p in plan_patterns:
+            if p.exists():
+                plan_path = p
+                break
+
+        if not plan_path:
+            log.info(f"No implementation plan found for {spec_id} — treating as single-sprint")
+            return None
+
+        # Parse sprint/phase headers
+        try:
+            content = plan_path.read_text()
+        except Exception as e:
+            log.warning(f"Failed to read plan for {spec_id}: {e}")
+            return None
+
+        # Match both "### Sprint N" and "### Phase N (Sprint N)" patterns
+        sprint_pattern = re.compile(
+            r'^###\s+(?:Sprint\s+(\d+)|Phase\s+\d+\s*\(?\s*Sprint\s+(\d+)\s*\)?)',
+            re.MULTILINE | re.IGNORECASE
+        )
+        matches = sprint_pattern.findall(content)
+
+        if not matches:
+            log.info(f"No sprint headers found in plan for {spec_id}")
+            return None
+
+        # Extract sprint numbers (either group 1 or group 2 will match)
+        sprint_numbers = sorted(set(
+            int(m[0] or m[1]) for m in matches
+        ))
+        total_sprints = max(sprint_numbers)
+
+        if total_sprints <= 1:
+            return None  # Single-sprint spec
+
+        # Count completed sprint pipelines from handoff history
+        comms_dir = self.config.handoffs_dir / spec_id
+        if not comms_dir.exists():
+            log.warning(f"No agent-comms directory for {spec_id}")
+            return None
+
+        # Count distinct completed pipeline runs (each ends with a docs-agent handoff)
+        completed_runs = 0
+        for h in sorted(comms_dir.glob("*-docs-*.json")):
+            try:
+                data = json.loads(h.read_text())
+                target = data.get("nextAgent", {}).get("target", "")
+                outcome = data.get("status", {}).get("outcome", "")
+                if target in ("human", "none") and outcome == "success":
+                    completed_runs += 1
+            except Exception:
+                continue
+
+        if completed_runs >= total_sprints:
+            log.info(f"{spec_id}: all {total_sprints} sprints completed")
+            return None
+
+        next_sprint = completed_runs + 1
+        log.info(
+            f"{spec_id}: sprint {completed_runs}/{total_sprints} completed, "
+            f"next sprint: {next_sprint}"
+        )
+
+        return {
+            "next_sprint": next_sprint,
+            "total_sprints": total_sprints,
+            "plan_path": str(plan_path.relative_to(self.config.project_root)),
+        }
 
     def _write_active_specs(self):
         """Write .active-specs.json for external visibility (TUI, other tools).
