@@ -1892,6 +1892,21 @@ class IWODaemon:
                 f"Recovery: {len(self._pending_activations)} unrouted "
                 f"handoff(s) queued for activation"
             )
+
+        # Post-recovery auto-continue: if all pipelines are complete/stale
+        # and no unrouted handoffs need activation, fire a next-spec directive
+        # so the pipeline resumes work from the queue automatically.
+        if (
+            self.config.auto_continue_on_completion
+            and not self._pending_activations
+            and self.pipeline.active_count == 0
+            and total_specs > 0
+        ):
+            log.info(
+                "Recovery: all pipelines complete — scheduling auto-continue"
+            )
+            self._schedule_auto_continue("recovery-restart")
+
         self._write_active_specs()
 
 
