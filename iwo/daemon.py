@@ -288,9 +288,12 @@ class IWODaemon:
                 if prev == AgentState.PROCESSING:
                     self._notify_state_change(name, prev, AgentState.IDLE, now)
                     # Stall watchdog: record that this agent finished work
-                    spec_id = self.pipeline.agent_current_spec(name) or "unknown"
-                    self._stall_watchdog[name] = (now, spec_id)
-                    self._stall_alert_sent.discard(name)
+                    # Only arm if agent has a real pipeline assignment —
+                    # otherwise we create phantom "unknown" pipelines (Bug 1)
+                    spec_id = self.pipeline.agent_current_spec(name)
+                    if spec_id:
+                        self._stall_watchdog[name] = (now, spec_id)
+                        self._stall_alert_sent.discard(name)
 
         # Update all agent states
         for name in self.agent_states:
@@ -1277,6 +1280,15 @@ class IWODaemon:
             # Release any stale assignment on the target agent before dispatching
             stale_spec = self.pipeline.agent_current_spec(target)
             if stale_spec and stale_spec != handoff.spec_id:
+                # Bug 2 fix: never pre-empt real work for phantom/auto-generated handoffs
+                is_auto = getattr(handoff.metadata, 'auto_generated', False) if handoff.metadata else False
+                if handoff.spec_id == "unknown" or is_auto:
+                    log.warning(
+                        f"Refusing to pre-empt {target}/{stale_spec} for "
+                        f"auto-generated {handoff.spec_id} — queuing instead"
+                    )
+                    self.pipeline.enqueue(handoff, path)
+                    return
                 log.info(
                     f"Releasing stale assignment: {target} was on {stale_spec}, "
                     f"now dispatching {handoff.spec_id}"

@@ -213,8 +213,8 @@ class IWOConfig:
     stale_pipeline_hours: float = 4.0
 
     # ─── Stall Recovery (Phase 2.9.2) ─────────────────────────
-    stall_alert_timeout: float = 60.0         # seconds before warning log
-    stall_auto_handoff_timeout: float = 90.0  # seconds before auto-generating handoff
+    stall_alert_timeout: float = 120.0        # seconds before warning log
+    stall_auto_handoff_timeout: float = 240.0  # seconds before auto-generating handoff
     stall_auto_handoff_enabled: bool = field(default_factory=lambda: _env_bool(
         "IWO_STALL_AUTO_HANDOFF", True
     ))

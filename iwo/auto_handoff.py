@@ -102,6 +102,13 @@ def generate_auto_handoff(
 
     Returns the path to the written handoff file, or None on failure.
     """
+    # Bug 4 fix: never generate handoffs for phantom/system specs
+    PHANTOM_SPECS = {"unknown", "NEXT-SPEC-SELECTION", "QUEUE-EXHAUSTED"}
+    if spec_id in PHANTOM_SPECS:
+        log.warning(
+            f"auto_handoff: refusing to generate for phantom spec '{spec_id}'"
+        )
+        return None
     next_seq = last_sequence + 1
     target = _next_agent(agent_name)
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
