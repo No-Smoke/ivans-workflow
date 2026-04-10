@@ -215,8 +215,11 @@ class IWOConfig:
     # ─── Stall Recovery (Phase 2.9.2) ─────────────────────────
     stall_alert_timeout: float = 120.0        # seconds before warning log
     stall_auto_handoff_timeout: float = 240.0  # seconds before auto-generating handoff
+    # Default OFF after 2026-04-10 phantom-handoff cascade incident.
+    # See docs/incidents/2026-04-10-fix-plan.md Phase 1.
+    # Re-enable only via explicit env var after Phase 2–4 fixes land.
     stall_auto_handoff_enabled: bool = field(default_factory=lambda: _env_bool(
-        "IWO_STALL_AUTO_HANDOFF", True
+        "IWO_STALL_AUTO_HANDOFF_ENABLED", False
     ))
 
     # Agent 007 project root — defaults to same as project_root
