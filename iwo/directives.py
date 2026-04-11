@@ -10,6 +10,7 @@ Directives are processed once and archived to .directives/.processed/.
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import time
@@ -442,8 +443,11 @@ PLAN: docs/plans/{spec_id}-implementation-plan.md
 
         # Search common spec locations
         spec_dirs = [
+            Path(os.environ.get("IWO_EBATT_SPECS_DIR", "/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt-specs/v2-schema-first")),
             self.config.project_root / "ebatt-specs",
+            self.config.project_root / "ebatt-specs" / "v2-schema-first",
             self.config.project_root.parent / "ebatt-specs",
+            self.config.project_root.parent / "ebatt-specs" / "v2-schema-first",
             self.config.project_root.parent / "shared-unified" / "shared-specs" / "v2-schema-first",
         ]
 
@@ -558,6 +562,7 @@ PLAN: docs/plans/{spec_id}-implementation-plan.md
         projects_root = self.config.project_root.parent.parent  # .../PROJECTS/
         if spec_type == "ebatt":
             dirs = [
+                Path(os.environ.get("IWO_EBATT_SPECS_DIR", "/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt-specs/v2-schema-first")),
                 self.config.project_root / "ebatt-specs",
                 self.config.project_root.parent / "ebatt-specs",
             ]
