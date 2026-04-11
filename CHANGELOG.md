@@ -2,6 +2,12 @@
 
 All notable changes to Ivan's Workflow are documented in this file.
 
+## [3.1.2] — 2026-04-11
+
+### Fixed
+
+- **Spec file lookup paths broken**: `_find_spec_content` and `_list_spec_files` in `directives.py` could not locate ebatt specs because all candidates were relative to `config.project_root` (the IWO repo), not the eBatt repo. Prepended `IWO_EBATT_SPECS_DIR` env var (defaults to `/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt-specs/v2-schema-first`) as the first search candidate in both methods.
+
 ## [3.1.1] — 2026-04-10
 
 ### Added
