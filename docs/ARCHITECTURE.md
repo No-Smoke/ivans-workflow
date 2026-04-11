@@ -466,6 +466,19 @@ Currently, IWO daemon logs go only to the TUI log panel (Textual RichLog widget)
 - File modification times: `stat` on handoff files
 - **TODO:** Add file handler to IWO logging for persistent post-mortem access.
 
+## Spec File Resolution
+
+Directive handlers that need to read specification files (`_find_spec_content()` and `_list_spec_files()` in `directives.py`) search these locations in order:
+
+1. `IWO_EBATT_SPECS_DIR` environment variable (default: `/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt-specs/v2-schema-first`)
+2. `{project_root}/ebatt-specs`
+3. `{project_root}/ebatt-specs/v2-schema-first`
+4. `{project_root}/../ebatt-specs`
+5. `{project_root}/../ebatt-specs/v2-schema-first`
+6. `{project_root}/../shared-unified/shared-specs/v2-schema-first`
+
+**Note:** `project_root` points to the IWO repo, not the eBatt repo. On most setups only candidate 1 will resolve, so set `IWO_EBATT_SPECS_DIR` if specs are in a non-standard location.
+
 ## resolve-bugs Directive (IWO-001)
 
 The `resolve-bugs` directive automates bug-fix workflows by fetching `status:approved` GitHub Issues and routing them through the 6-agent pipeline as `BUG-FIX-{N}` mini-specs.

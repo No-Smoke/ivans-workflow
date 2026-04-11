@@ -32,6 +32,7 @@ pip install -e .
 **Environment:** Copy `.env.example` to `.env` and set your paths and credentials. All variables must have the `export` prefix for Python `os.environ` visibility. Key variables:
 
 - `IWO_PROJECT_ROOT` — path to the ebatt project root
+- `IWO_EBATT_SPECS_DIR` — path to eBatt spec files (v2-schema-first)
 - `IWO_LOG_DIR` — where agent logs go
 - `IWO_QDRANT_URL`, `IWO_QDRANT_API_KEY` — Qdrant vector DB
 - `IWO_NEO4J_URI`, `IWO_NEO4J_USER`, `IWO_NEO4J_PASSWORD` — Neo4j graph DB

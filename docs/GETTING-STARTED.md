@@ -141,6 +141,12 @@ Edit `.env` and set at minimum:
 IWO_PROJECT_ROOT=/path/to/your/project
 ```
 
+If your eBatt spec files are in a non-standard location, also set:
+
+```bash
+IWO_EBATT_SPECS_DIR=/path/to/ebatt-specs/v2-schema-first
+```
+
 For memory integration (optional), configure Qdrant, Neo4j, and Ollama endpoints. For push notifications, set `IWO_NTFY_TOPIC`. See `.env.example` for all available options.
 
 ### 2. Launch Agents First

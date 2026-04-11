@@ -317,10 +317,14 @@ All configuration is in `iwo/config.py`. Key settings:
 | `agent_timeout_seconds` | 1800 | 30 min timeout for stuck agents |
 | `file_debounce_seconds` | 1.5 | Wait after file creation before reading |
 
+| `ebatt_specs_dir` | (see below) | Path to eBatt specification files (v2-schema-first) |
+
 Override `project_root` via environment variable:
 ```bash
 IWO_PROJECT_ROOT=/path/to/other/project python -m iwo.daemon
 ```
+
+`IWO_EBATT_SPECS_DIR` controls where `_find_spec_content()` and `_list_spec_files()` search for spec files. If unset, defaults to `/home/vanya/Nextcloud/PROJECTS/ebatt-ai/ebatt-specs/v2-schema-first`. Additional fallback paths relative to `project_root` are also searched.
 
 ---
 

@@ -223,6 +223,7 @@ All variables are optional except `IWO_PROJECT_ROOT`.
 | `IWO_PROJECT_ROOT` | current directory | Absolute path to the project being orchestrated |
 | `IWO_LOG_DIR` | `{repo}/logs` | Directory for agent execution logs |
 | `IWO_SKILLS_DIR` | `{repo}/skills` | Directory containing agent skills (bundled default, overridable) |
+| `IWO_EBATT_SPECS_DIR` | hardcoded Nextcloud path | Directory containing eBatt spec files (v2-schema-first). Used by `start-spec` and `next-spec` directives. |
 | `IWO_TMUX_SESSION` | `claude-agents` | Name of the tmux session |
 
 **Memory Services (all optional — IWO works without them):**
