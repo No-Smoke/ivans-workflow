@@ -26,6 +26,7 @@ def config(tmp_path):
         handoffs_dir=tmp_path / "agent-comms",
         log_dir=tmp_path / "logs",
         skills_dir=tmp_path / "skills",
+        bugs_human_gate_priorities={"critical", "high"},
     )
 
 

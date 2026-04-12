@@ -146,6 +146,9 @@ def generate_auto_handoff(
             "timestamp": timestamp,
             "sequence": next_seq,
             "auto_generated": True,
+            # Phase 5 fix 5d: Audit marker for traceability.
+            # Downstream consumers can filter/flag auto-recovered handoffs.
+            "auto_recovery": True,
         },
         "status": {
             "outcome": outcome,

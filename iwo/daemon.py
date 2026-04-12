@@ -150,6 +150,14 @@ class HandoffHandler(FileSystemEventHandler):
 
     def _handle_new_handoff(self, path: Path) -> None:
         """Validate *path* and forward to the daemon for processing."""
+        # ── Phase 4 fix 4a: Resolve symlinks to canonical path ────────
+        # Nextcloud sometimes creates symlinks or intermediate paths that
+        # differ from the canonical path, causing duplicate processing or
+        # path comparison mismatches.  See incident 2026-04-11.
+        try:
+            path = path.resolve()
+        except OSError:
+            pass  # Fall through with original path if resolve fails
         if path.suffix != ".json":
             return
         if path.name == "LATEST.json":
@@ -164,17 +172,15 @@ class HandoffHandler(FileSystemEventHandler):
         if ".directives" in path.parts:
             log.debug(f"Skipping directive file: {path.name}")
             return
-        # Update LATEST.json symlink — IWO is the authority, not agents (Bug 2 fix)
-        spec_dir = path.parent
-        latest = spec_dir / "LATEST.json"
-        try:
-            if latest.is_symlink() or latest.exists():
-                latest.unlink()
-            latest.symlink_to(path.name)
-            log.info(f"Updated LATEST.json → {path.name}")
-        except Exception as e:
-            log.warning(f"Failed to update LATEST.json for {path.name}: {e}")
-        log.info(f"New handoff detected: {path.name}")
+        # Ignore quarantined files (moved by _quarantine_file, not real handoffs)
+        if ".quarantine" in path.parts:
+            log.debug(f"Skipping quarantined file: {path.name}")
+            return
+        # NOTE: LATEST.json is updated ONLY in process_handoff() after
+        # validation (via _update_latest). We must NOT update it here
+        # pre-validation — a rogue file would corrupt the symlink and
+        # poison the reconciliation fast-path. See incident 2026-04-11.
+        log.info(f"New handoff detected (inotify): {path.name}")
         time.sleep(self.daemon.config.file_debounce_seconds)
         self.daemon.process_handoff(path)
 
@@ -224,6 +230,16 @@ class IWODaemon:
         # fire ntfy alert.
         self._stall_watchdog: dict[str, tuple[float, str]] = {}
         self._stall_alert_sent: set[str] = set()  # avoid duplicate alerts
+
+        # Phase 5: Auto-recovery cascade guards (incident 2026-04-11)
+        # Tracks recovery attempts to prevent phantom-handoff cascades.
+        # spec_id → count of auto-recovery attempts this pipeline run
+        self._auto_recovery_count: dict[str, int] = {}
+        # spec_id → timestamp of last auto-recovery attempt
+        self._auto_recovery_last: dict[str, float] = {}
+        # Set of (agent_name, spec_id) tuples that already fired once
+        # for the current stall event (cleared when watchdog is cleared)
+        self._auto_recovery_fired: set[tuple[str, str]] = set()
 
         # Phase 2.5.1: Metrics collector (initialized after memory)
         self.metrics: Optional[MetricsCollector] = None
@@ -318,65 +334,199 @@ class IWODaemon:
         self._process_pending_activations()
 
         # Phase 2.9.2: Stall detection + auto-handoff recovery
+        # Refactored in Phase 3 fix (incident 2026-04-11):
+        #  - Pre-stall scan: before declaring stall, check for unprocessed handoffs
+        #  - Never silently drop watchdog entries for active pipelines
+        #  - Escalate to Ops Register + mark pipeline halted instead of silent cleanup
         from iwo.auto_handoff import generate_auto_handoff
 
         stall_timeout = self.config.stall_alert_timeout
         auto_handoff_timeout = self.config.stall_auto_handoff_timeout
-        stale_watchdogs = []
+        resolved_watchdogs = []
         for agent_name, (idle_at, spec_id) in list(self._stall_watchdog.items()):
             elapsed = now - idle_at
+
+            # ── Phase 3 fix 3c: Pre-stall directory scan ──────────────
+            # Before declaring a stall at the warning threshold, do an
+            # explicit scan of the spec's agent-comms directory.  If
+            # unprocessed handoff files exist, process them — this is the
+            # last-resort catch for inotify + reconciliation both missing
+            # a file.  See incident 2026-04-11.
+            if elapsed >= stall_timeout and agent_name not in self._stall_alert_sent:
+                spec_dir = self.config.handoffs_dir / spec_id
+                if spec_dir.exists():
+                    for f in sorted(spec_dir.glob("*.json")):
+                        if f.name == "LATEST.json" or f.name.endswith(".tmp"):
+                            continue
+                        # Mtime stabilization (same as reconciliation Phase 4b)
+                        try:
+                            if time.time() - f.stat().st_mtime < 1.0:
+                                log.debug(f"Pre-stall scan: skipping {f.name} (mtime unstable)")
+                                continue
+                        except OSError:
+                            continue
+                        try:
+                            with open(f) as fh:
+                                data = json.load(fh)
+                            handoff = Handoff(**data)
+                            if not self.tracker.already_processed(handoff):
+                                log.warning(
+                                    f"PRE-STALL SCAN: found unprocessed {f.name} "
+                                    f"for {agent_name}/{spec_id} — processing now"
+                                )
+                                self.process_handoff(f)
+                        except Exception as e:
+                            log.debug(f"Pre-stall scan: skip {f.name}: {e}")
+                    # Re-check: if watchdog was cleared by process_handoff
+                    # (which discards stall_alert_sent), we're done
+                    if agent_name not in self._stall_watchdog:
+                        continue
 
             if (
                 elapsed >= auto_handoff_timeout
                 and agent_name not in self._stall_alert_sent
             ):
                 if self.config.stall_auto_handoff_enabled:
-                    log.warning(
-                        f"STALL AUTO-RECOVERY: generating handoff for "
-                        f"{agent_name}/{spec_id} (idle {int(elapsed)}s)"
-                    )
-                    spec_dir = self.config.handoffs_dir / spec_id
-                    existing = (
-                        sorted(spec_dir.glob("*.json"))
-                        if spec_dir.exists()
-                        else []
-                    )
-                    last_seq = len(existing)
+                    # ── Phase 5: Cascade guards ───────────────────────
+                    # All four guards must pass before auto-recovery fires.
+                    # If any guard blocks, fall through to the escalation
+                    # path (Phase 3 fix 3b) which halts the pipeline.
 
-                    result = generate_auto_handoff(
-                        agent_name=agent_name,
-                        spec_id=spec_id,
-                        last_sequence=last_seq,
-                        project_dir=self.config.project_root,
-                        handoffs_dir=self.config.handoffs_dir,
-                    )
-
-                    if result:
-                        log.info(f"STALL AUTO-RECOVERY: wrote {result.name}")
+                    # Guard 5a: Once per spec per stall event
+                    guard_key = (agent_name, spec_id)
+                    if guard_key in self._auto_recovery_fired:
+                        log.warning(
+                            f"AUTO-RECOVERY BLOCKED (5a): already fired for "
+                            f"{agent_name}/{spec_id} this stall event"
+                        )
+                    # Guard 5b: Cooldown between attempts for same spec
+                    # NOTE: Don't add to _stall_alert_sent here — we want
+                    # to re-evaluate after cooldown expires on next poll.
+                    elif (
+                        spec_id in self._auto_recovery_last
+                        and now - self._auto_recovery_last[spec_id]
+                        < self.config.auto_recovery_cooldown_seconds
+                    ):
+                        remaining = int(
+                            self.config.auto_recovery_cooldown_seconds
+                            - (now - self._auto_recovery_last[spec_id])
+                        )
+                        log.debug(
+                            f"AUTO-RECOVERY BLOCKED (5b): cooldown for "
+                            f"{spec_id}, {remaining}s remaining"
+                        )
+                        continue  # Skip _stall_alert_sent — retry later
+                    # Guard 5c: Max attempts per spec per pipeline run
+                    elif (
+                        self._auto_recovery_count.get(spec_id, 0)
+                        >= self.config.auto_recovery_max_per_spec
+                    ):
+                        log.warning(
+                            f"AUTO-RECOVERY BLOCKED (5c): {spec_id} hit max "
+                            f"{self.config.auto_recovery_max_per_spec} attempts"
+                        )
+                        # Exceeded retries — escalate to halt
+                        self.pipeline.mark_halted(
+                            spec_id,
+                            f"auto-recovery exhausted: {self._auto_recovery_count[spec_id]} "
+                            f"attempts for {agent_name}"
+                        )
+                        self._clear_auto_recovery_state(spec_id)
                         self._notify(
-                            f"🔧 Auto-recovered stall: {agent_name}/{spec_id} "
-                            f"— generated {result.name}",
+                            f"🛑 PIPELINE HALTED: {agent_name}/{spec_id} — "
+                            f"auto-recovery exhausted after "
+                            f"{self._auto_recovery_count[spec_id]} attempts.",
                             critical=True,
                         )
                     else:
-                        log.error(
-                            f"STALL AUTO-RECOVERY: failed for {agent_name}/{spec_id}"
+                        # All guards passed — proceed with auto-recovery
+                        log.warning(
+                            f"STALL AUTO-RECOVERY: generating handoff for "
+                            f"{agent_name}/{spec_id} (idle {int(elapsed)}s)"
                         )
-                        self._notify(
-                            f"⚠️ STALL: {agent_name}/{spec_id} — auto-recovery "
-                            f"FAILED, manual intervention needed",
-                            critical=True,
+                        spec_dir = self.config.handoffs_dir / spec_id
+                        existing = (
+                            sorted(spec_dir.glob("*.json"))
+                            if spec_dir.exists()
+                            else []
                         )
+                        last_seq = len(existing)
+
+                        result = generate_auto_handoff(
+                            agent_name=agent_name,
+                            spec_id=spec_id,
+                            last_sequence=last_seq,
+                            project_dir=self.config.project_root,
+                            handoffs_dir=self.config.handoffs_dir,
+                        )
+
+                        if result:
+                            # Track for cascade guards
+                            self._auto_recovery_fired.add(guard_key)
+                            self._auto_recovery_last[spec_id] = now
+                            self._auto_recovery_count[spec_id] = (
+                                self._auto_recovery_count.get(spec_id, 0) + 1
+                            )
+                            log.info(
+                                f"STALL AUTO-RECOVERY: wrote {result.name} "
+                                f"(attempt {self._auto_recovery_count[spec_id]}/"
+                                f"{self.config.auto_recovery_max_per_spec})"
+                            )
+                            self._notify(
+                                f"🔧 Auto-recovered stall: {agent_name}/{spec_id} "
+                                f"— generated {result.name} "
+                                f"(attempt {self._auto_recovery_count[spec_id]}/"
+                                f"{self.config.auto_recovery_max_per_spec})",
+                                critical=True,
+                            )
+                        else:
+                            log.error(
+                                f"STALL AUTO-RECOVERY: failed for {agent_name}/{spec_id}"
+                            )
+                            self._notify(
+                                f"⚠️ STALL: {agent_name}/{spec_id} — auto-recovery "
+                                f"FAILED, manual intervention needed",
+                                critical=True,
+                            )
                 else:
+                    # ── Phase 3 fix 3b: Escalate instead of silent alert ──
+                    # Mark pipeline as halted and escalate to Ops Register.
+                    # This replaces the old silent stall alert that did nothing
+                    # actionable.  See incident 2026-04-11.
                     log.warning(
-                        f"STALL DETECTED: {agent_name}/{spec_id} idle "
-                        f"{int(elapsed)}s (auto-recovery disabled)"
+                        f"STALL DETECTED → HALTING: {agent_name}/{spec_id} idle "
+                        f"{int(elapsed)}s (auto-recovery disabled) — escalating"
                     )
+                    self.pipeline.mark_halted(
+                        spec_id,
+                        f"stall: {agent_name} idle {int(elapsed)}s, no handoff detected"
+                    )
+                    self._clear_auto_recovery_state(spec_id)
                     self._notify(
-                        f"⚠️ STALL: {agent_name} finished {spec_id} but wrote no "
-                        f"handoff ({int(elapsed)}s elapsed). Auto-recovery disabled.",
+                        f"🛑 PIPELINE HALTED: {agent_name}/{spec_id} — stall "
+                        f"after {int(elapsed)}s, no handoff. Escalated to Ops Register.",
                         critical=True,
                     )
+                    # Add ops action for human intervention
+                    try:
+                        from iwo.ops_actions import OpsAction
+                        action = OpsAction(
+                            id=f"stall-{spec_id}-{int(now)}",
+                            spec_id=spec_id,
+                            title=f"Stall: {agent_name}/{spec_id} — no handoff after {int(elapsed)}s",
+                            description=f"Pipeline halted: {agent_name} stalled after "
+                                        f"{int(elapsed)}s with no handoff. Check agent-comms "
+                                        f"directory and agent logs.",
+                            priority="critical",
+                            source_agent="stall-watchdog",
+                            category="other",
+                        )
+                        if self.ops_register.add(action):
+                            self.ops_register.save()
+                            log.info(f"Ops Register: added stall action {action.id}")
+                    except Exception as e:
+                        log.warning(f"Failed to add stall to Ops Register: {e}")
+
                 self._stall_alert_sent.add(agent_name)
 
             elif (
@@ -389,9 +539,22 @@ class IWODaemon:
                     f"{int(auto_handoff_timeout - elapsed)}s"
                 )
 
-            if elapsed > 300:
-                stale_watchdogs.append(agent_name)
-        for agent_name in stale_watchdogs:
+            # ── Phase 3 fix 3a: Only clean up watchdog entries for
+            # pipelines that have reached a terminal state.  The old code
+            # silently dropped entries at 300s, creating a monitoring gap
+            # where no detection layer watched the spec.  Now entries
+            # persist until the pipeline is completed/halted/stale.
+            # See incident 2026-04-11.
+            pipeline = self.pipeline.get_pipeline(spec_id)
+            if pipeline and pipeline.status in ("completed", "halted", "stale"):
+                resolved_watchdogs.append(agent_name)
+
+        for agent_name in resolved_watchdogs:
+            # Look up spec_id before popping so we can clean up Phase 5 state
+            entry = self._stall_watchdog.get(agent_name)
+            if entry:
+                _, resolved_spec = entry
+                self._auto_recovery_fired.discard((agent_name, resolved_spec))
             self._stall_watchdog.pop(agent_name, None)
             self._stall_alert_sent.discard(agent_name)
 
@@ -1126,14 +1289,68 @@ class IWODaemon:
             f"[{handoff.status.outcome}] ({handoff.spec_id})"
         )
 
-        # Clear stall watchdog — this agent successfully wrote its handoff
-        self._stall_watchdog.pop(handoff.source_agent, None)
-        self._stall_alert_sent.discard(handoff.source_agent)
-
-        # 2. Idempotency check (with supersede support for same-sequence redos)
+        # 2. Idempotency check FIRST (before validation) — catches legitimate
+        # retries and supersedes before source agent validation would
+        # false-positive on them.  See review finding M3: after record_handoff
+        # flips current_agent to target, a retry from the source agent would
+        # fail source validation despite being a harmless duplicate.
         if self.tracker.already_processed(handoff, path):
             log.info(f"Already processed {handoff.idempotency_key}, skipping")
             return
+
+        # ── Phase 2 fix: Validate handoffs on ingestion ──────────────
+        # Reject rogue writes by checking source agent assignment and
+        # sequence continuity.  Quarantine invalid files so they don't
+        # pollute future reconciliation scans.  See incident 2026-04-11.
+
+        # 2a. Source agent validation: handoff must come from the agent
+        # currently assigned to this spec in PipelineManager.
+        pipeline_for_val = self.pipeline.get_pipeline(handoff.spec_id)
+        if pipeline_for_val and pipeline_for_val.current_agent:
+            expected_agent = pipeline_for_val.current_agent
+            if handoff.source_agent != expected_agent:
+                log.critical(
+                    f"DESYNC: {path.name} claims source={handoff.source_agent} "
+                    f"but PipelineManager expects {expected_agent} for "
+                    f"{handoff.spec_id}. Possible rogue write — quarantining."
+                )
+                self._notify(
+                    f"🚨 DESYNC: {handoff.source_agent} wrote handoff for "
+                    f"{handoff.spec_id} but {expected_agent} is assigned. "
+                    f"File quarantined: {path.name}",
+                    critical=True,
+                )
+                self._quarantine_file(path, "source_agent_mismatch")
+                return
+
+        # 2b. Sequence validation: handoff sequence should be
+        # last_processed + 1.  Out-of-order files indicate corruption
+        # or duplicate writes.  We allow sequence == handoff_count + 1
+        # (next expected) or sequence <= handoff_count (already processed,
+        # caught by idempotency check above).
+        if pipeline_for_val:
+            expected_seq = pipeline_for_val.handoff_count + 1
+            if handoff.sequence > expected_seq:
+                log.critical(
+                    f"SEQUENCE GAP: {path.name} has seq={handoff.sequence} "
+                    f"but expected {expected_seq} for {handoff.spec_id}. "
+                    f"Missing handoff(s) — quarantining."
+                )
+                self._notify(
+                    f"🚨 SEQUENCE GAP: {path.name} seq={handoff.sequence}, "
+                    f"expected {expected_seq}. Quarantined.",
+                    critical=True,
+                )
+                self._quarantine_file(path, "sequence_gap")
+                return
+
+        # Clear stall watchdog — this agent successfully wrote its handoff
+        self._stall_watchdog.pop(handoff.source_agent, None)
+        self._stall_alert_sent.discard(handoff.source_agent)
+        # Phase 5: Clear the once-per-stall guard so next stall can fire
+        self._auto_recovery_fired.discard(
+            (handoff.source_agent, handoff.spec_id)
+        )
 
         # 3. Safety rails
         if self.tracker.check_handoff_limit(handoff, self.config.max_handoffs_per_spec):
@@ -1141,6 +1358,7 @@ class IWODaemon:
             log.error(msg)
             self._notify(msg, critical=True)
             self.pipeline.mark_halted(handoff.spec_id, "handoff limit exceeded")
+            self._clear_auto_recovery_state(handoff.spec_id)
             return
 
         if self.tracker.check_rejection_loop(handoff, self.config.max_rejection_loops):
@@ -1148,6 +1366,7 @@ class IWODaemon:
             log.error(msg)
             self._notify(msg, critical=True)
             self.pipeline.mark_halted(handoff.spec_id, "rejection loop")
+            self._clear_auto_recovery_state(handoff.spec_id)
             return
 
         # 4. Mark processed and record in history
@@ -1245,6 +1464,7 @@ class IWODaemon:
         # 8.5 Terminal targets — pipeline complete, no activation needed
         if target in ("human", "none"):
             self.pipeline.mark_completed(handoff.spec_id)
+            self._clear_auto_recovery_state(handoff.spec_id)
             self._write_active_specs()
             self._notify(
                 f"🏁 {handoff.spec_id} → {target} (pipeline complete, "
@@ -1367,17 +1587,19 @@ class IWODaemon:
             if spec_dir.name.startswith("."):
                 continue  # Skip .current-spec etc.
 
-            # Skip specs whose LATEST.json is terminal (workflow complete)
-            latest_link = spec_dir / "LATEST.json"
-            if latest_link.exists():
-                try:
-                    with open(latest_link) as fh:
-                        latest_data = json.load(fh)
-                    latest_target = latest_data.get("nextAgent", {}).get("target", "")
-                    if latest_target in ("human", "none"):
-                        continue  # Pipeline complete, nothing to reconcile
-                except Exception:
-                    pass
+            # Skip specs whose pipeline is already completed/stale in
+            # PipelineManager.  We no longer read LATEST.json here — it is
+            # agent-writable and can be corrupted by rogue files.  The
+            # authoritative state is PipelineManager (control plane), not
+            # the filesystem (data plane).  See incident 2026-04-11.
+            pipeline = self.pipeline.get_pipeline(spec_dir.name)
+            if pipeline and pipeline.status in ("completed", "stale", "halted"):
+                # ── Phase 6 fix 6c: Fast-path skip telemetry ──────────
+                log.debug(
+                    f"Reconciliation: skipping {spec_dir.name} "
+                    f"(pipeline status={pipeline.status})"
+                )
+                continue
 
             json_files = sorted(spec_dir.glob("*.json"))
             json_files = [
@@ -1389,18 +1611,74 @@ class IWODaemon:
             missed = 0
             for f in json_files:
                 try:
+                    # ── Phase 4 fix 4a: Resolve symlinks ──────────────
+                    f = f.resolve()
+                    # ── Phase 4 fix 4b: File stabilization ────────────
+                    # Nextcloud syncs files incrementally — a half-written
+                    # file will have a recent mtime.  Skip files whose
+                    # mtime changed in the last 1s to avoid reading
+                    # partial writes.  They'll be caught on the next
+                    # reconciliation cycle (30s).
+                    try:
+                        mtime = f.stat().st_mtime
+                        if time.time() - mtime < 1.0:
+                            log.debug(f"Reconciliation: skipping {f.name} (mtime unstable)")
+                            continue
+                    except OSError:
+                        continue  # File disappeared between glob and stat
                     with open(f) as fh:
                         data = json.load(fh)
                     handoff = Handoff(**data)
                     if not self.tracker.already_processed(handoff):
-                        log.info(f"Reconciliation: found missed handoff {f.name}")
+                        # ── Phase 4 fix 4c: Detection layer attribution ──
+                        log.info(
+                            f"Reconciliation: found missed handoff {f.name} "
+                            f"(inotify missed — reconciliation layer catch)"
+                        )
                         self.process_handoff(f)
                         missed += 1
                 except Exception:
                     pass
 
             if missed > 0:
-                log.info(f"Reconciliation: processed {missed} missed handoff(s) for {spec_dir.name}")
+                # ── Phase 4 fix 4c: Alert if reconciliation is consistently
+                # catching files that inotify should have caught
+                log.warning(
+                    f"Reconciliation: processed {missed} missed handoff(s) "
+                    f"for {spec_dir.name} — inotify may be unreliable"
+                )
+
+    def _clear_auto_recovery_state(self, spec_id: str):
+        """Reset Phase 5 auto-recovery cascade guard state for a spec.
+
+        Called when a pipeline reaches a terminal state (completed/halted)
+        so that a future sprint on the same spec starts with fresh counters.
+        Without this, stale counts/cooldowns from Sprint N block legitimate
+        auto-recovery on Sprint N+1.  See review finding H1/M4.
+        """
+        self._auto_recovery_count.pop(spec_id, None)
+        self._auto_recovery_last.pop(spec_id, None)
+        # Clear any fired guards for this spec (across all agents)
+        self._auto_recovery_fired = {
+            (agent, sid) for agent, sid in self._auto_recovery_fired
+            if sid != spec_id
+        }
+
+    def _quarantine_file(self, path: Path, reason: str):
+        """Move a rogue/invalid handoff file to .quarantine/ subdirectory.
+
+        Phase 2 fix: quarantine files that fail ingestion validation
+        (source agent mismatch, sequence gap) so they don't pollute
+        future reconciliation scans.  See incident 2026-04-11.
+        """
+        quarantine_dir = path.parent / ".quarantine"
+        try:
+            quarantine_dir.mkdir(exist_ok=True)
+            dest = quarantine_dir / f"{reason}__{path.name}"
+            path.rename(dest)
+            log.warning(f"Quarantined {path.name} → .quarantine/{dest.name}")
+        except Exception as e:
+            log.error(f"Failed to quarantine {path.name}: {e}")
 
     def _update_latest(self, handoff_path: Path, handoff: Handoff):
         """Update LATEST.json as a symlink to the current handoff."""
@@ -1588,6 +1866,16 @@ class IWODaemon:
         try:
             specs_file = self.config.handoffs_dir / ".active-specs.json"
             state = self.pipeline.to_dict()
+            # ── Phase 6 fix 6b: Surface watchdog state ────────────
+            now = time.time()
+            state["watchdog"] = {
+                agent: {
+                    "spec_id": spec_id,
+                    "idle_seconds": int(now - idle_at),
+                    "alert_sent": agent in self._stall_alert_sent,
+                }
+                for agent, (idle_at, spec_id) in self._stall_watchdog.items()
+            }
             with open(specs_file, "w") as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
@@ -1860,24 +2148,10 @@ class IWODaemon:
             if spec_dir.name.startswith("."):
                 continue
 
-            # Fast-path: skip specs whose LATEST.json is terminal
-            latest_link = spec_dir / "LATEST.json"
-            if latest_link.exists():
-                try:
-                    with open(latest_link) as fh:
-                        latest_data = json.load(fh)
-                    latest_target = latest_data.get("nextAgent", {}).get("target", "")
-                    if latest_target in ("human", "none"):
-                        # Mark completed in pipeline state and move on
-                        spec_id = spec_dir.name
-                        pipeline = self.pipeline.get_or_create_pipeline(spec_id)
-                        pipeline.status = "completed"
-                        pipeline.current_agent = None
-                        total_specs += 1
-                        continue
-                except Exception:
-                    pass
-
+            # Gather actual handoff files (skip LATEST.json symlink — it is
+            # agent-writable and cannot be trusted for control-plane decisions).
+            # We determine terminal status from the highest-sequence handoff
+            # file content instead.  See incident 2026-04-11.
             spec_id = spec_dir.name
             json_files = sorted(spec_dir.glob("*.json"))
             json_files = [
@@ -1888,6 +2162,53 @@ class IWODaemon:
 
             if not json_files:
                 continue
+
+            # Fast-path: check last file for terminal target.  This avoids
+            # parsing all files for specs that completed long ago.
+            #
+            # IMPORTANT (review finding C1): The last file is agent-written
+            # and could be a rogue file (as in the 2026-04-11 incident where
+            # a deployer wrote 018-docs with target:human).  To mitigate:
+            #  - We validate chain continuity: if there are >=2 files, the
+            #    second-to-last file's target must match the last file's
+            #    source.  A rogue file inserted at the end breaks this chain.
+            #  - We set handoff_count = len(json_files) so Phase 2 sequence
+            #    validation has the correct baseline on future handoffs.
+            try:
+                with open(json_files[-1]) as fh:
+                    last_data = json.load(fh)
+                last_target = last_data.get("nextAgent", {}).get("target", "")
+                last_source = last_data.get("metadata", {}).get("agent", "")
+                if last_target in ("human", "none"):
+                    # Chain validation: verify the last file is a legitimate
+                    # successor to the second-to-last file.  If the chain
+                    # breaks, fall through to full scan which will catch the
+                    # inconsistency.
+                    if len(json_files) >= 2:
+                        try:
+                            with open(json_files[-2]) as fh2:
+                                prev_data = json.load(fh2)
+                            prev_target = prev_data.get("nextAgent", {}).get("target", "")
+                            if prev_target != last_source and last_source:
+                                log.warning(
+                                    f"Recovery: {spec_id} chain break — "
+                                    f"penultimate targets {prev_target} but "
+                                    f"last claims source={last_source}. "
+                                    f"Falling through to full scan."
+                                )
+                                raise ValueError("chain break")
+                        except (json.JSONDecodeError, OSError):
+                            pass  # Can't read penultimate — trust last file
+                    pipeline = self.pipeline.get_or_create_pipeline(spec_id)
+                    pipeline.status = "completed"
+                    pipeline.current_agent = None
+                    pipeline.handoff_count = len(json_files)
+                    total_specs += 1
+                    continue
+            except ValueError:
+                pass  # Chain break — fall through to full scan
+            except Exception:
+                pass  # Parse error — fall through to full scan
 
             handoff_pairs: list[tuple[Handoff, Path]] = []
             for f in json_files:

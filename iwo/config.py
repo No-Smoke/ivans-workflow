@@ -217,9 +217,23 @@ class IWOConfig:
     stall_auto_handoff_timeout: float = 240.0  # seconds before auto-generating handoff
     # Default OFF after 2026-04-10 phantom-handoff cascade incident.
     # See docs/incidents/2026-04-10-fix-plan.md Phase 1.
-    # Re-enable only via explicit env var after Phase 2–4 fixes land.
+    # Re-enable only via explicit env var after Phases 1–4 fixes have landed.
     stall_auto_handoff_enabled: bool = field(default_factory=lambda: _env_bool(
         "IWO_STALL_AUTO_HANDOFF_ENABLED", False
+    ))
+
+    # ─── Auto-Recovery Cascade Guards (Phase 5 fix, incident 2026-04-11) ──
+    # These guards prevent phantom-handoff cascades when auto-recovery is
+    # re-enabled.  All four must pass before auto-recovery fires.
+    #
+    # 5a: Once per spec per stall event (enforced in daemon, no config needed)
+    # 5b: Minimum cooldown between auto-recovery attempts for same spec
+    auto_recovery_cooldown_seconds: float = field(default_factory=lambda: _env_float(
+        "IWO_AUTO_RECOVERY_COOLDOWN", 600.0  # 10 minutes
+    ))
+    # 5c: Max auto-recovery attempts per spec per pipeline run
+    auto_recovery_max_per_spec: int = field(default_factory=lambda: _env_int(
+        "IWO_AUTO_RECOVERY_MAX_PER_SPEC", 3
     ))
 
     # Agent 007 project root — defaults to same as project_root
