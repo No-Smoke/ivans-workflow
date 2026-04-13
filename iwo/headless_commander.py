@@ -9,7 +9,7 @@ Dispatch:
         --model opus \\
         --output-format stream-json \\
         --permission-mode bypassPermissions \\
-        --append-system-prompt-file .claude/skills/$SKILL/SKILL.md \\
+        --append-system-prompt-file skills/$SKILL/SKILL.md \\
         2>&1 | tee $LOG
 
 Idle detection: pane_current_command ∈ IDLE_SHELLS AND no child processes
@@ -557,21 +557,35 @@ Action: {handoff.nextAgent.action}
             return None
 
     def _get_skill_path(self, agent_name: str) -> Optional[Path]:
-        """Resolve the SKILL.md path for an agent."""
+        """Resolve the SKILL.md path for an agent.
+
+        Looks in config.skills_dir (defaults to {iwo_repo}/skills/) first,
+        then falls back to {project_root}/.claude/skills/ for backwards
+        compatibility.
+        """
         skill_dir_name = SKILL_DIR_MAP.get(agent_name)
         if not skill_dir_name:
             log.debug(f"No skill mapping for agent '{agent_name}'")
             return None
 
-        skill_path = (
+        # Primary: IWO repo skills directory
+        skill_path = self.config.skills_dir / skill_dir_name / "SKILL.md"
+        if skill_path.exists():
+            return skill_path
+
+        # Fallback: project .claude/skills (legacy path)
+        fallback = (
             self.config.project_root
             / ".claude" / "skills" / skill_dir_name / "SKILL.md"
         )
-        if not skill_path.exists():
-            log.warning(f"Skill file not found: {skill_path}")
-            return None
+        if fallback.exists():
+            log.info(f"Skill found at legacy path: {fallback}")
+            return fallback
 
-        return skill_path
+        log.warning(
+            f"Skill file not found: {skill_path} (also checked {fallback})"
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Completion Detection

@@ -290,14 +290,8 @@ Follow the handoff schema at .claude/skills/workflow-handoff/HANDOFF-SCHEMA.md
 
         prompt = f"""## MANDATORY INSTRUCTIONS — READ YOUR SKILL FIRST
 
-You are the Planner agent. Before doing ANYTHING else, execute these two commands:
-
-```bash
-cat .claude/skills/boris-planner-agent/SKILL.md
-cat .claude/skills/workflow-handoff/HANDOFF-SCHEMA.md
-```
-
-You MUST read both files completely. This is non-negotiable.
+You are the Planner agent. Your skill file has been injected via --append-system-prompt-file.
+The IWO Pydantic handoff schema is inlined in your skill — follow it exactly.
 
 ---
 
@@ -594,15 +588,8 @@ PLAN: docs/plans/{spec_id}-implementation-plan.md
         """Build the deterministic Planner prompt for next-spec selection."""
         prompt = """## MANDATORY INSTRUCTIONS — READ YOUR SKILL FIRST
 
-You are the Planner agent. Before doing ANYTHING else, execute these two commands:
-
-```bash
-cat .claude/skills/boris-planner-agent/SKILL.md
-cat .claude/skills/workflow-handoff/HANDOFF-SCHEMA.md
-```
-
-You MUST read both files completely. Your plan and handoff MUST follow the formats
-defined in those files exactly. This is non-negotiable.
+You are the Planner agent. Your skill file has been injected via --append-system-prompt-file.
+The IWO Pydantic handoff schema is inlined in your skill — follow it exactly.
 
 ---
 
@@ -1351,15 +1338,8 @@ the pending ops actions listed below.
 
         prompt = f"""## MANDATORY INSTRUCTIONS — READ YOUR SKILL FIRST
 
-You are the Planner agent. Before doing ANYTHING else, execute these two commands:
-
-```bash
-cat .claude/skills/boris-planner-agent/SKILL.md
-cat .claude/skills/workflow-handoff/HANDOFF-SCHEMA.md
-```
-
-You MUST read both files completely. Your plan and handoff MUST follow the formats
-defined in those files exactly. This is non-negotiable.
+You are the Planner agent. Your skill file has been injected via --append-system-prompt-file.
+The IWO Pydantic handoff schema is inlined in your skill — follow it exactly.
 
 ---
 

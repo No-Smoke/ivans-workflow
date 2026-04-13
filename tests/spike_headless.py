@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 EBATT_ROOT = Path.home() / "Nextcloud/PROJECTS/ebatt-ai/ebatt"
-SKILL_FILE = EBATT_ROOT / ".claude/skills/boris-builder-agent/SKILL.md"
+IWO_ROOT = Path.home() / "PROJECTS/ivans-workflow-orchestrator"
+SKILL_FILE = IWO_ROOT / "skills/boris-builder-agent/SKILL.md"
 CLAUDE_BIN = "claude"
 TIMEOUT = 120  # generous timeout for claude -p
 
