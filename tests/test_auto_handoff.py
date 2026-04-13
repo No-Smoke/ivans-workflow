@@ -143,8 +143,8 @@ def test_generate_auto_handoff_creates_spec_dir(tmp_path: Path, patched_cmds):
 
 
 def test_run_cmd_timeout_returns_negative(tmp_path: Path):
-    rc, out = auto_handoff._run_cmd(
+    rc, stdout, stderr = auto_handoff._run_cmd(
         ["sleep", "5"], tmp_path, timeout=1
     )
     assert rc == -1
-    assert out == "timeout"
+    assert stderr == "timeout"

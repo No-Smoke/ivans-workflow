@@ -224,6 +224,9 @@ class IWODaemon:
         # Phase 3: Deploy gate — FIFO queue of gated handoffs for TUI approval
         self._deploy_gate_pending: list[tuple[Handoff, Path]] = []
 
+        # Pause queue — handoff paths queued while paused, drained on unpause
+        self._pause_pending: list[Path] = []
+
         # Phase 2.9.1: Stall detection — alert when agent completes without handoff
         # Maps agent_name → (idle_timestamp, spec_id) — set on PROCESSING→IDLE,
         # cleared when handoff is processed for that spec. If entry survives 60s,
@@ -240,6 +243,14 @@ class IWODaemon:
         # Set of (agent_name, spec_id) tuples that already fired once
         # for the current stall event (cleared when watchdog is cleared)
         self._auto_recovery_fired: set[tuple[str, str]] = set()
+
+        # Targeted session-exit detection: when an agent transitions
+        # PROCESSING→IDLE, we schedule a quick handoff check after a short
+        # grace period (15s). If no handoff appeared, we generate a synthetic
+        # one immediately — much faster than the full 240s stall watchdog.
+        # Maps agent_name → (idle_timestamp, spec_id).
+        self._session_exit_checks: dict[str, tuple[float, str]] = {}
+        self._session_exit_grace_seconds: float = 15.0
 
         # Phase 2.5.1: Metrics collector (initialized after memory)
         self.metrics: Optional[MetricsCollector] = None
@@ -310,6 +321,12 @@ class IWODaemon:
                     if spec_id:
                         self._stall_watchdog[name] = (now, spec_id)
                         self._stall_alert_sent.discard(name)
+                        # Targeted session-exit detection: schedule a
+                        # quick check after a short grace period. This
+                        # catches the common case where an agent exits
+                        # without writing its handoff — much faster than
+                        # the full stall watchdog (15s vs 240s).
+                        self._session_exit_checks[name] = (now, spec_id)
 
         # Update all agent states
         for name in self.agent_states:
@@ -332,6 +349,97 @@ class IWODaemon:
 
         # Check if any pending activations can proceed
         self._process_pending_activations()
+
+        # ── Targeted session-exit detection ──────────────────────────
+        # Fast path: after the grace period, check if the agent wrote a
+        # handoff. If not, generate a synthetic one immediately. This
+        # catches the most common stall scenario (agent exits without
+        # writing handoff) in ~15s instead of waiting for the full 240s
+        # stall watchdog. Keeps stall_auto_handoff_enabled=False — this
+        # is a separate, targeted mechanism.
+        from iwo.auto_handoff import generate_auto_handoff, has_downstream_handoff
+
+        resolved_exit_checks = []
+        for agent_name, (idle_at, spec_id) in list(self._session_exit_checks.items()):
+            elapsed = now - idle_at
+            if elapsed < self._session_exit_grace_seconds:
+                continue  # Still in grace period
+
+            resolved_exit_checks.append(agent_name)
+
+            # Check if a handoff appeared during the grace period
+            spec_dir = self.config.handoffs_dir / spec_id
+            handoff_found = False
+            if spec_dir.exists():
+                for f in sorted(spec_dir.glob("*.json")):
+                    if f.name == "LATEST.json" or f.name.endswith(".tmp"):
+                        continue
+                    if f"-{agent_name}-" in f.name:
+                        try:
+                            mtime = f.stat().st_mtime
+                            # Only count handoffs written around or after the
+                            # agent started (not old ones from previous runs)
+                            if mtime >= idle_at - 60:
+                                handoff_found = True
+                                break
+                        except OSError:
+                            continue
+
+            if handoff_found:
+                log.debug(
+                    f"Session-exit check: {agent_name}/{spec_id} — "
+                    f"handoff found within grace period"
+                )
+                # Clear the stall watchdog too — no need to watch further
+                self._stall_watchdog.pop(agent_name, None)
+                self._stall_alert_sent.discard(agent_name)
+            elif has_downstream_handoff(agent_name, spec_id, self.config.handoffs_dir):
+                log.debug(
+                    f"Session-exit check: {agent_name}/{spec_id} — "
+                    f"downstream already progressed, skipping"
+                )
+                self._stall_watchdog.pop(agent_name, None)
+                self._stall_alert_sent.discard(agent_name)
+            else:
+                log.warning(
+                    f"SESSION-EXIT RECOVERY: {agent_name}/{spec_id} completed "
+                    f"{int(elapsed)}s ago with no handoff — generating synthetic"
+                )
+                existing = (
+                    sorted(spec_dir.glob("*.json")) if spec_dir.exists() else []
+                )
+                last_seq = len([
+                    f for f in existing
+                    if f.name != "LATEST.json" and not f.name.endswith(".tmp")
+                ])
+                result = generate_auto_handoff(
+                    agent_name=agent_name,
+                    spec_id=spec_id,
+                    last_sequence=last_seq,
+                    project_dir=self.config.project_root,
+                    handoffs_dir=self.config.handoffs_dir,
+                )
+                if result:
+                    log.info(
+                        f"SESSION-EXIT RECOVERY: wrote {result.name} for "
+                        f"{agent_name}/{spec_id}"
+                    )
+                    self._notify(
+                        f"🔧 Session-exit recovery: {agent_name}/{spec_id} "
+                        f"— generated {result.name}",
+                        critical=False,
+                    )
+                    # Clear stall watchdog — we've handled it
+                    self._stall_watchdog.pop(agent_name, None)
+                    self._stall_alert_sent.discard(agent_name)
+                else:
+                    log.error(
+                        f"SESSION-EXIT RECOVERY: failed for {agent_name}/{spec_id} "
+                        f"— falling through to stall watchdog"
+                    )
+
+        for name in resolved_exit_checks:
+            self._session_exit_checks.pop(name, None)
 
         # Phase 2.9.2: Stall detection + auto-handoff recovery
         # Refactored in Phase 3 fix (incident 2026-04-11):
@@ -1263,12 +1371,29 @@ class IWODaemon:
         # Advance to next bug in queue
         self.directive_processor._advance_bug_queue()
 
+    def drain_pause_queue(self):
+        """Process all handoffs that were queued while paused."""
+        if self._pause_pending:
+            count = len(self._pause_pending)
+            log.info(f"Draining {count} handoff(s) queued during pause")
+            pending = list(self._pause_pending)
+            self._pause_pending.clear()
+            for p in pending:
+                self.process_handoff(p)
+
     def process_handoff(self, path: Path):
         """Parse, validate, and route a handoff file.
 
         Phase 2.3: Pipeline-aware routing with per-agent queuing and
         rejection-first priority.
         """
+        # Pause gate: queue handoff for later processing, don't drop it
+        if self._paused:
+            log.info(f"PAUSED: queuing handoff {path.name} for later processing")
+            self._notify(f"⏸️ Queued (paused): {path.name}")
+            self._pause_pending.append(path)
+            return
+
         # 1. Parse and validate
         try:
             with open(path) as f:

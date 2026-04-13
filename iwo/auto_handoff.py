@@ -19,6 +19,30 @@ log = logging.getLogger("iwo.auto_handoff")
 AGENT_ORDER = ["planner", "builder", "reviewer", "tester", "deployer", "docs"]
 
 
+def has_downstream_handoff(agent_name: str, spec_id: str, handoffs_dir: Path) -> bool:
+    """Check if a downstream agent already wrote a handoff for this spec.
+
+    If so, the pipeline already progressed past this agent — generating a
+    synthetic handoff would be redundant or harmful.
+    """
+    next_agent = _next_agent(agent_name)
+    if next_agent == "human":
+        return False
+    spec_dir = handoffs_dir / spec_id
+    if not spec_dir.exists():
+        return False
+    for f in spec_dir.glob("*.json"):
+        if f.name == "LATEST.json":
+            continue
+        if f"-{next_agent}-" in f.name:
+            log.info(
+                f"auto_handoff: downstream handoff exists ({f.name}) — "
+                f"skipping synthetic for {agent_name}/{spec_id}"
+            )
+            return True
+    return False
+
+
 def _next_agent(current: str) -> str:
     """Determine the next agent in the pipeline."""
     try:
@@ -30,22 +54,22 @@ def _next_agent(current: str) -> str:
     return "human"
 
 
-def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 30) -> tuple[int, str]:
-    """Run a subprocess and return (returncode, stdout+stderr)."""
+def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 30) -> tuple[int, str, str]:
+    """Run a subprocess and return (returncode, stdout, stderr)."""
     try:
         result = subprocess.run(
             cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout
         )
-        return result.returncode, (result.stdout or "") + (result.stderr or "")
+        return result.returncode, result.stdout or "", result.stderr or ""
     except subprocess.TimeoutExpired:
-        return -1, "timeout"
+        return -1, "", "timeout"
     except Exception as e:  # pragma: no cover - defensive
-        return -1, str(e)
+        return -1, "", str(e)
 
 
 def _get_git_diff_stat(project_dir: Path) -> tuple[list[str], list[str]]:
     """Return (created, modified) file lists from HEAD~1..HEAD."""
-    rc, output = _run_cmd(
+    rc, output, _ = _run_cmd(
         ["git", "diff", "--name-status", "HEAD~1..HEAD"], project_dir
     )
     created: list[str] = []
@@ -65,29 +89,34 @@ def _get_git_diff_stat(project_dir: Path) -> tuple[list[str], list[str]]:
 
 
 def _run_tests(project_dir: Path, spec_id: str) -> dict:
-    """Run vitest and report pass/fail counts."""
-    test_dir = "src/__tests__/hybrid-calculator/"
-    rc, output = _run_cmd(
-        ["npx", "vitest", "run", test_dir, "--reporter=json"],
+    """Run the full vitest suite and report pass/fail counts.
+
+    Uses --reporter=json which writes JSON to stdout. stderr is kept
+    separate to avoid corrupting the JSON parse.
+    """
+    rc, stdout, stderr = _run_cmd(
+        ["npx", "vitest", "run", "--reporter=json"],
         project_dir,
-        timeout=60,
+        timeout=120,
     )
     try:
-        json_output = json.loads(output)
+        json_output = json.loads(stdout)
         return {
             "passed": json_output.get("numPassedTests", 0),
             "failed": json_output.get("numFailedTests", 0),
-            "skipped": 0,
+            "skipped": json_output.get("numPendingTests", 0),
         }
     except (json.JSONDecodeError, KeyError, ValueError):
-        if "Tests" in output and "passed" in output:
+        # Fallback: try to parse summary line from combined output
+        combined = stdout + stderr
+        if "Tests" in combined and "passed" in combined:
             return {"passed": -1, "failed": 0, "skipped": 0}
         return {"passed": 0, "failed": -1, "skipped": 0}
 
 
 def _run_typecheck(project_dir: Path) -> bool:
     """Run `npx tsc --noEmit` and return True if it passes."""
-    rc, _ = _run_cmd(["npx", "tsc", "--noEmit"], project_dir, timeout=60)
+    rc, _, _ = _run_cmd(["npx", "tsc", "--noEmit"], project_dir, timeout=60)
     return rc == 0
 
 
@@ -102,6 +131,10 @@ def generate_auto_handoff(
 
     Returns the path to the written handoff file, or None on failure.
     """
+    # Guard: if downstream agent already has a handoff, skip
+    if has_downstream_handoff(agent_name, spec_id, handoffs_dir):
+        return None
+
     # Bug 4 fix: never generate handoffs for phantom/system specs
     PHANTOM_SPECS = {"unknown", "NEXT-SPEC-SELECTION", "QUEUE-EXHAUSTED"}
     if spec_id in PHANTOM_SPECS:

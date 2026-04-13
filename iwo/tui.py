@@ -639,10 +639,19 @@ class IWOApp(App):
         except Exception:
             pass
 
-        # Deploy gate
+        # Deploy gate — show actual state of both auto-deploy paths
         try:
+            cfg = self.daemon.config
+            if cfg.auto_deploy_all:
+                gate_label = "[bold red]OPEN (auto-all)[/]"
+            elif cfg.auto_approve_safe_deploys:
+                gate_label = "[bold yellow]SEMI (safe auto-approve on)[/]"
+            else:
+                gate_label = "[bold green]CLOSED (manual 'd' required)[/]"
+            pending_count = len(self.daemon._deploy_gate_pending)
+            pending_suffix = f" | [bold]{pending_count} pending[/]" if pending_count else ""
             self.query_one("#safety-deploy", Static).update(
-                " Deploy gate: [bold magenta]ACTIVE[/]"
+                f" Deploy gate: {gate_label}{pending_suffix}"
             )
         except Exception:
             pass
@@ -747,13 +756,26 @@ class IWOApp(App):
         self.daemon._reconcile_filesystem()
 
     def action_pause_toggle(self) -> None:
-        """Pause/resume state polling and reconciliation."""
+        """Pause/resume ALL dispatch activity.
+
+        When paused:
+        - TUI polling and reconciliation stop
+        - daemon.process_handoff() queues instead of dispatching
+        - No new agents are activated
+
+        On unpause, queued handoffs are drained in FIFO order.
+        """
         self._paused = not self._paused
+        self.daemon._paused = self._paused  # sync to daemon for process_handoff gate
         rich_log = self.query_one("#log-output", RichLog)
         if self._paused:
-            rich_log.write("[bold yellow]⏸ Polling PAUSED[/]")
+            rich_log.write("[bold yellow]⏸ PAUSED — all polling and dispatch stopped[/]")
         else:
-            rich_log.write("[bold green]▶ Polling RESUMED[/]")
+            queued = len(self.daemon._pause_pending)
+            rich_log.write(f"[bold green]▶ RESUMED — polling restarted[/]")
+            if queued:
+                rich_log.write(f"[bold]   Draining {queued} queued handoff(s)...[/]")
+            self.daemon.drain_pause_queue()
 
     def action_auto_continue_toggle(self) -> None:
         """Toggle auto-continue on pipeline completion."""
@@ -813,12 +835,20 @@ class IWOApp(App):
             rich_log.write(f"[bold red]Failed to write resolve-bugs directive: {e}[/]")
 
     def action_auto_deploy_toggle(self) -> None:
-        """Toggle auto-deploy (bypass human gate for ALL deploys)."""
+        """Toggle auto-deploy (bypass human gate for ALL deploys).
+
+        Controls BOTH auto_deploy_all and auto_approve_safe_deploys so
+        that Shift+D fully closes/opens the deploy gate. Previously only
+        auto_deploy_all was toggled, leaving the safe-deploy auto-approve
+        path open — deploys could slip through even with the gate "closed".
+        """
         cfg = self.daemon.config
-        cfg.auto_deploy_all = not cfg.auto_deploy_all
         rich_log = self.query_one("#log-output", RichLog)
-        if cfg.auto_deploy_all:
-            rich_log.write("[bold red]🚀 Auto-deploy ALL ENABLED — deploy gate bypassed for all specs[/]")
+        if not cfg.auto_deploy_all:
+            # Opening the gate — enable both paths
+            cfg.auto_deploy_all = True
+            cfg.auto_approve_safe_deploys = True
+            rich_log.write("[bold red]🚀 Auto-deploy ALL ENABLED — deploy gate fully bypassed[/]")
             # Flush any pending deploys immediately
             if self.daemon._deploy_gate_pending:
                 count = len(self.daemon._deploy_gate_pending)
@@ -827,7 +857,10 @@ class IWOApp(App):
                     handoff, path = self.daemon._deploy_gate_pending.pop(0)
                     self.daemon._activate_agent(handoff, path)
         else:
-            rich_log.write("[bold green]🛡 Auto-deploy ALL DISABLED — deploy gate restored[/]")
+            # Closing the gate — disable both paths
+            cfg.auto_deploy_all = False
+            cfg.auto_approve_safe_deploys = False
+            rich_log.write("[bold green]🛡 Deploy gate CLOSED — all deploys require manual 'd' approval[/]")
 
     def action_quit(self) -> None:
         """Clean shutdown."""
