@@ -443,7 +443,7 @@ class TmuxCommander:
         # 2. cd to project and launch Claude Code
         project_dir = str(self.config.project_root)
         try:
-            pane.send_keys(f"cd {project_dir} && claude", enter=True)
+            pane.send_keys(f"export IWO_SESSION=1 && cd {project_dir} && claude", enter=True)
             log.info(f"Respawn: launched Claude Code for {agent_name}")
         except Exception as e:
             log.error(f"Respawn: failed to launch Claude Code for {agent_name}: {e}")

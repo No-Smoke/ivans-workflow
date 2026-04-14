@@ -58,7 +58,7 @@ IDLE_SHELLS = frozenset(("bash", "zsh", "sh", "fish"))
 # Strip CLAUDECODE env var to avoid "nested session" detection when
 # claude -p is launched from inside an existing Claude Code session.
 # tmux panes inherit the parent env, so we clean it in the command.
-CLEAN_ENV_PREFIX = 'unset CLAUDECODE;'
+CLEAN_ENV_PREFIX = 'unset CLAUDECODE; export IWO_SESSION=1;'
 
 
 class HeadlessCommander:
